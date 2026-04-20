@@ -507,12 +507,15 @@ class TXAntennaProtocol(LineReceiver):
             if len(cols) != 3:
                 raise BadTelemetry()
 
-            k_tuple = ('fec_timeouts', 'incoming', 'incoming_bytes', 'injected', 'injected_bytes', 'dropped', 'truncated', 'frame_closures')
+            k_tuple = ('fec_timeouts', 'incoming', 'incoming_bytes', 'injected', 'injected_bytes',
+                       'dropped', 'truncated', 'frame_padding', 'frame_closes')
             counters = tuple(int(i) for i in cols[2].split(':'))
 
-            # frame_closures was added later; default to 0 for older wfb_tx binaries
-            if len(counters) == len(k_tuple) - 1:
-                counters = counters + (0,)
+            # Back-compat with older wfb_tx binaries: pad missing counters with 0.
+            # - pre-frame-aware: 7 counters (no frame_padding, no frame_closes)
+            # - first frame-aware iteration: 8 counters (frame_padding only; 9th column absent)
+            if len(counters) < len(k_tuple):
+                counters = counters + (0,) * (len(k_tuple) - len(counters))
 
             assert len(counters) == len(k_tuple)
 

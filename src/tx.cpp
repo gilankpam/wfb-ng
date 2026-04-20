@@ -752,7 +752,16 @@ static bool is_rtp_frame_end(const uint8_t *buf, size_t size)
     if ((buf[0] >> 6) != 2) return false;
 
     // Marker bit is the high bit of byte 1
-    return (buf[1] & 0x80) != 0;
+    if (!(buf[1] & 0x80)) return false;
+
+    // Reject RTCP packets muxed on the same port: RTCP types 200-204 (SR, RR,
+    // SDES, BYE, APP) have byte 1 = 0xC8..0xCC, which aliases "RTP M-bit set +
+    // PT in 72-76". Per RFC 3551 those PTs are reserved specifically to make
+    // this disambiguation possible.
+    uint8_t pt = buf[1] & 0x7F;
+    if (pt >= 72 && pt <= 76) return false;
+
+    return true;
 }
 
 void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd, int fec_timeout, bool mirror, int log_interval, int rtp_frame_aware)
@@ -783,7 +792,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
     uint32_t count_b_injected = 0;  // successfully injected bytes (include additional fec packets)
     uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
     uint32_t count_p_truncated = 0; // injected large packets that were truncated
-    uint32_t count_p_frame_closures = 0; // empty packets sent to close fec block due to detected frame end
+    uint32_t count_p_frame_padding = 0; // FEC_ONLY padding packets emitted because of frame-aware close
+    uint32_t count_p_frame_closes = 0;  // blocks actually closed due to detected frame end (≈ frame rate when feature fires)
     int start_fd_idx = 0;
 
     for(;;)
@@ -810,8 +820,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
         {
             t->dump_stats(cur_ts, count_p_injected, count_p_dropped, count_b_injected);
 
-            IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u\n",
-                    cur_ts, count_p_fec_timeouts, count_p_incoming, count_b_incoming, count_p_injected, count_b_injected, count_p_dropped, count_p_truncated, count_p_frame_closures);
+            IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u\n",
+                    cur_ts, count_p_fec_timeouts, count_p_incoming, count_b_incoming, count_p_injected, count_b_injected, count_p_dropped, count_p_truncated, count_p_frame_padding, count_p_frame_closes);
             IPC_MSG_SEND();
 
             if(count_p_dropped)
@@ -831,7 +841,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
             count_b_injected = 0;
             count_p_dropped = 0;
             count_p_truncated = 0;
-            count_p_frame_closures = 0;
+            count_p_frame_padding = 0;
+            count_p_frame_closes = 0;
 
             log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
         }
@@ -1094,9 +1105,20 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                     // next frame to fill the block.
                     if (rtp_frame_aware && is_rtp_frame_end(buf, rsize))
                     {
+                        // If the block had already auto-closed at this frame's
+                        // last data packet (fragment_idx reached fec_k), the
+                        // first FEC_ONLY call returns false and we don't count
+                        // a frame_close — the block was closed without needing
+                        // frame-aware to intervene.
+                        bool closed_by_feature = false;
                         while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY))
                         {
-                            count_p_frame_closures += 1;
+                            count_p_frame_padding += 1;
+                            closed_by_feature = true;
+                        }
+                        if (closed_by_feature)
+                        {
+                            count_p_frame_closes += 1;
                         }
                     }
 

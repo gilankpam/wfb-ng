@@ -1,10 +1,16 @@
 # Bench: frame-aware FEC measurement rig
 
-Loopback measurement rig for deciding whether to ship the `-X rtp_frame_aware`
-feature. Does *not* require a radio — uses `wfb_tx -D` debug-UDP mode and a
-Python bridge that injects controllable packet loss.
+Two rigs live here:
 
-## Files
+- **Layer 1 — synthetic loopback** (`rig.py` + friends). Spawns `wfb_tx`/`wfb_rx`
+  on one machine, injects controllable packet loss via an in-process Python
+  bridge, and measures with a synthetic RTP feeder. Does not require a radio.
+- **Layer 2 — GS-side hardware A/B** (`gs_monitor.py`, `gs_compare.py`). Run on
+  the ground station during a real drone session. Listens on the GS's duplicate
+  RTP output port (5602 by default), captures arrival timestamps, and optionally
+  tails `wfb_rx` / `wfb_tx` stdout logs for IPC metrics.
+
+## Layer 1 files
 
 - `rig.py` — orchestrator. Spawns `wfb_tx`/`wfb_rx` as subprocesses, runs an
   in-process synthetic RTP feeder, a lossy UDP bridge, and an RTP sink. Writes
@@ -18,7 +24,18 @@ Python bridge that injects controllable packet loss.
   5 × loss). Writes a `summary.csv` joining all runs. Configurable via
   `REPS` and `DURATION` env vars.
 
-## Quick run
+## Layer 2 files
+
+- `gs_monitor.py` — runs on the GS for one A/B arm. Listens on UDP `--port`
+  (default 5602), records every RTP packet's seq/rtp_ts/mbit/pt/arrival_ns to
+  `packets.csv`. Optionally tails local `wfb_rx` log and remote `wfb_tx` log
+  via SSH (`--wfb-rx-log`, `--wfb-tx-ssh`, `--wfb-tx-log`). At the end of
+  `--duration` seconds, writes `summary.json` with derived RTP and IPC metrics.
+- `gs_compare.py` — reads two or more off-arm and on-arm `summary.json` files,
+  prints a side-by-side metric table, and checks the 5 plan success criteria.
+  Exits 0 if all pass.
+
+## Layer 1 quick run
 
 ```
 # build binaries first
@@ -34,6 +51,34 @@ REPS=1 DURATION=15 bench/run_matrix.sh /tmp/results
 python3 bench/compare.py /tmp/results
 ```
 
+## Layer 2 quick run (on the GS, during a real session)
+
+Assumes you've already set up drone + GS with wfb-ng and the GS forwards decoded
+RTP to port 5601 (video player) and 5602 (metrics). We consume 5602.
+
+```
+# Arm 1 — OFF. Ensure drone config has rtp_frame_aware=0.
+python3 bench/gs_monitor.py --arm off1 --duration 600 --outdir /tmp/ab/off1 \
+    --port 5602 \
+    --wfb-rx-log /var/log/wfb-ng/wfb_rx.log \
+    --wfb-tx-ssh drone@192.168.1.2 \
+    --wfb-tx-log /var/log/wfb-ng/wfb_tx.log
+
+# Hot-swap config on drone: rtp_frame_aware=1; restart wfb-ng service
+
+# Arm 2 — ON.
+python3 bench/gs_monitor.py --arm on1 --duration 600 --outdir /tmp/ab/on1 ...
+
+# Repeat off/on for ABAB pattern, then compare:
+python3 bench/gs_compare.py \
+    --off /tmp/ab/off1/summary.json /tmp/ab/off2/summary.json \
+    --on  /tmp/ab/on1/summary.json  /tmp/ab/on2/summary.json \
+    --encoder-fps 60
+```
+
+If `gs_compare.py` exits 0 with PASS, proceed to flight test. If FAIL, the
+output identifies which criterion failed and suggests a specific fix.
+
 ## Success criteria (from measurement plan)
 
 The comparison tool checks these automatically:
@@ -46,13 +91,19 @@ The comparison tool checks these automatically:
 
 ## Gotchas
 
-- The rig uses loopback ports 15600-15603; don't run two rigs concurrently.
+- Layer 1 rig uses loopback ports 15600–15603; don't run two rigs concurrently.
 - `wfb_tx` in debug-UDP mode reports `injected=0` in its PKT IPC line — the
-  airtime proxy comes from `bridge.csv` counts instead.
-- The `tx_frame_closures` counter increments once per FEC_ONLY padding packet
-  sent (not once per frame), so with small P-frames it's several times the
-  frame rate. Use it to estimate airtime overhead attributable to the feature;
-  don't treat it as a frame-event count.
+  Layer 1 airtime proxy comes from `bridge.csv` counts instead. On real
+  hardware (Layer 2), `injected_bytes` is populated normally.
+- Two TX IPC counters:
+  - `frame_padding` counts FEC_ONLY padding packets emitted due to frame-aware
+    (quantifies airtime amplification).
+  - `frame_closes` counts blocks closed by M-bit detection (one per frame when
+    the feature fires). Use this for the "feature is firing" sanity check —
+    it should ≈ encoder fps.
 - The synthetic feeder's I/P-frame packet counts (`--iframe-pkts`,
   `--pframe-pkts`) don't model actual encoder output — replace with pcap replay
-  before trusting decision-rule output for production.
+  before trusting Layer 1 decision-rule output for production.
+- `gs_monitor.py` runs with regular user permissions (no root needed) as long
+  as the GS duplicates RTP to a userland port (5602) via socat or the wfb-ng
+  services config.
