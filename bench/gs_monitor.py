@@ -23,8 +23,9 @@ Derived metrics in summary.json:
   frame_assembly_ms   {p50, p95, p99}
   inter_frame_ms      {p50, p95, p99, stdev}
   rfc3550_jitter_ms   final value of the RFC 3550 jitter estimator
-  tx_ipc              {injected_bytes_per_s, incoming_pkts_per_s, frame_padding_per_s,
-                       frame_closes_per_s}  (if wfb_tx log captured)
+  mbit_per_s          rate of M-bit-set packets observed — should ≈ encoder fps;
+                      primary "feature is firing / encoder supports it" signal
+  tx_ipc              {injected_bytes_per_s, incoming_pkts_per_s}  (if wfb_tx log captured)
   rx_ipc              {fec_recovered_per_s, lost_per_s, decrypt_err_rate, outgoing_per_s}
                       (if wfb_rx log captured)
 
@@ -252,6 +253,8 @@ def compute_rtp_metrics(csv_path, clock_hz):
 
     duration_s = (rows[-1][4] - rows[0][4]) / 1e9
 
+    mbit_count = sum(1 for _, _, mbit, _, _ in rows if mbit)
+
     return {
         'duration_s': duration_s,
         'packets': n,
@@ -260,6 +263,7 @@ def compute_rtp_metrics(csv_path, clock_hz):
         'frame_complete_rate': frames_complete / len(by_frame) if by_frame else None,
         'packet_loss_rate': missing / expected if expected else None,
         'reorder_rate': reorder / n if n else None,
+        'mbit_per_s': mbit_count / duration_s if duration_s > 0 else None,
         'frame_assembly_ms_p50': pct(frame_assembly, 50),
         'frame_assembly_ms_p95': pct(frame_assembly, 95),
         'frame_assembly_ms_p99': pct(frame_assembly, 99),
@@ -275,7 +279,7 @@ def compute_rtp_metrics(csv_path, clock_hz):
 # --------------------------------------------------------------------------- #
 
 TX_KEYS = ['fec_timeouts', 'incoming', 'incoming_bytes', 'injected',
-           'injected_bytes', 'dropped', 'truncated', 'frame_padding', 'frame_closes']
+           'injected_bytes', 'dropped', 'truncated']
 
 RX_KEYS = ['all_pkt', 'all_bytes', 'decrypt_err', 'session_pkt', 'data_pkt',
            'unique_pkt', 'fec_recovered', 'lost', 'bad', 'outgoing', 'out_bytes']
@@ -317,8 +321,6 @@ def tx_metrics(path, duration_s):
         'injected_pkts_per_s': t['injected'] / duration_s,
         'injected_bytes_per_s': t['injected_bytes'] / duration_s,
         'dropped_per_s': t['dropped'] / duration_s,
-        'frame_padding_per_s': t['frame_padding'] / duration_s,
-        'frame_closes_per_s': t['frame_closes'] / duration_s,
     }
 
 

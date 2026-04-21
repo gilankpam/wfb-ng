@@ -20,8 +20,8 @@ Metrics:
   bridge_dropped               count from bridge.csv
   rx_fec_recovered             last value from rx_stats.log PKT lines
   rx_lost                      last value from rx_stats.log PKT lines
-  tx_frame_padding             sum (FEC_ONLY padding packets emitted due to frame-aware)
-  tx_frame_closes              sum (blocks closed by frame-aware M-bit detection)
+  (frame-aware activity is derived from bridge.csv wire counts; wfb_tx has no
+   feature-specific IPC counter)
   tx_incoming_pkts             sum
   tx_incoming_bytes            sum
   wire_amplification           bridge_forwarded / packets_sent  (approximate airtime cost)
@@ -54,16 +54,13 @@ def load_csv(path):
 def parse_tx_stats(path):
     """Sum the relevant TX PKT counters across all log lines."""
     totals = dict(fec_timeouts=0, incoming=0, incoming_bytes=0, injected=0,
-                  injected_bytes=0, dropped=0, truncated=0, frame_padding=0, frame_closes=0)
+                  injected_bytes=0, dropped=0, truncated=0)
     keys = list(totals.keys())
     for line in open(path):
         parts = line.rstrip('\n').split('\t')
         if len(parts) != 3 or parts[1] != 'PKT':
             continue
         vals = parts[2].split(':')
-        if len(vals) < len(keys):
-            # older tx may omit trailing counters (back-compat)
-            vals = vals + ['0'] * (len(keys) - len(vals))
         for k, v in zip(keys, vals[:len(keys)]):
             totals[k] += int(v)
     return totals
@@ -173,8 +170,6 @@ def analyze(outdir):
         bridge_forwarded=bridge_fwd,
         bridge_dropped=bridge_drop,
         bridge_drop_rate=(bridge_drop / (bridge_fwd + bridge_drop)) if (bridge_fwd + bridge_drop) else None,
-        tx_frame_padding=tx_stats['frame_padding'],
-        tx_frame_closes=tx_stats['frame_closes'],
         tx_incoming_pkts=tx_stats['incoming'],
         tx_incoming_bytes=tx_stats['incoming_bytes'],
         rx_fec_recovered=rx_stats['fec_recovered'],

@@ -15,7 +15,9 @@ Prints a side-by-side metric table and an all-pass / fail verdict per the plan:
   2. frame_complete_rate on >= off - 0.005  AND  frame_assembly_ms_p50 on <= off + 1
   3. inter_frame_ms_stdev on <= off * 1.25
   4. tx injected_bytes_per_s on <= off * 1.30  (if tx_ipc available in both)
-  5. tx frame_closes_per_s >= encoder_fps * 0.95  (if tx_ipc available)
+  5. mbit_per_s on >= encoder_fps * 0.95  (verifies the stream carries M-bit
+     at frame rate so the feature has something to react to; derived from the
+     RTP stream observed on GS, not from any drone-side counter)
 
 Exit code: 0 if all pass, 1 otherwise.
 """
@@ -106,8 +108,8 @@ def main():
     # IPC metrics
     tx_bytes_off = getavg(off, 'tx_ipc', 'injected_bytes_per_s')
     tx_bytes_on = getavg(on, 'tx_ipc', 'injected_bytes_per_s')
-    tx_padding_on = getavg(on, 'tx_ipc', 'frame_padding_per_s')
-    tx_closes_on = getavg(on, 'tx_ipc', 'frame_closes_per_s')
+    mbit_off = getavg(off, 'mbit_per_s')
+    mbit_on = getavg(on, 'mbit_per_s')
     rx_fec_off = getavg(off, 'rx_ipc', 'fec_recovered_per_s')
     rx_fec_on = getavg(on, 'rx_ipc', 'fec_recovered_per_s')
     rx_lost_off = getavg(off, 'rx_ipc', 'lost_per_s')
@@ -122,8 +124,7 @@ def main():
     row('rfc3550_jitter_ms',     jitter_off, jitter_on, unit='ms')
     row('reorder_rate',          reorder_off, reorder_on, unit='')
     row('tx_injected_bytes/s',   tx_bytes_off, tx_bytes_on, unit='B/s')
-    row('tx_frame_padding/s',    None, tx_padding_on, unit='/s')
-    row('tx_frame_closes/s',     None, tx_closes_on, unit='/s')
+    row('mbit_per_s',            mbit_off, mbit_on, unit='/s')
     row('rx_fec_recovered/s',    rx_fec_off, rx_fec_on, unit='/s')
     row('rx_lost/s',             rx_lost_off, rx_lost_on, unit='/s')
 
@@ -178,12 +179,12 @@ def main():
     else:
         print('(4) skipped: no tx_ipc data (need --wfb-tx-ssh/--wfb-tx-log on gs_monitor)')
 
-    # 5) feature fires: frame_closes/s >= encoder_fps * 0.95
-    if tx_closes_on is not None:
-        if tx_closes_on < args.encoder_fps * 0.95:
-            failures.append(f'(5) frame_closes/s below encoder fps: {tx_closes_on:.1f} vs expected {args.encoder_fps:.0f}')
+    # 5) M-bit seen at encoder fps on the on-arm stream
+    if mbit_on is not None:
+        if mbit_on < args.encoder_fps * 0.95:
+            failures.append(f'(5) mbit_per_s below encoder fps on on-arm: {mbit_on:.1f} vs expected {args.encoder_fps:.0f} (encoder may not be setting M-bit)')
     else:
-        print('(5) skipped: no tx_ipc frame_closes data')
+        print('(5) skipped: no mbit data (empty packets.csv?)')
 
     if failures:
         print('FAIL — do not ship:')

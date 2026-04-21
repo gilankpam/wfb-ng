@@ -23,7 +23,7 @@ echo "Results directory: $OUTROOT"
 echo "Duration per cell: ${DURATION}s, reps: $REPS"
 
 summary="$OUTROOT/summary.csv"
-echo "rtp_frame_aware,fec_k,fec_n,loss,rep,packets_sent,packets_recv,frames_complete_rate,tail_p50_us,tail_p95_us,tail_p99_us,wire_amplification,rx_fec_recovered,rx_lost,tx_frame_padding,tx_frame_closes" > "$summary"
+echo "rtp_frame_aware,fec_k,fec_n,loss,rep,packets_sent,packets_recv,frames_complete_rate,tail_p50_us,tail_p95_us,tail_p99_us,wire_amplification,rx_fec_recovered,rx_lost" > "$summary"
 
 total_cells=0
 for aware in 0 1; do
@@ -67,7 +67,7 @@ row = [aware, k, n, loss, rep,
        f(m['frames_complete_rate']),
        f(m['tail_latency_us_p50']), f(m['tail_latency_us_p95']), f(m['tail_latency_us_p99']),
        f(m['wire_amplification_pkts']),
-       m['rx_fec_recovered'], m['rx_lost'], m['tx_frame_padding'], m['tx_frame_closes']]
+       m['rx_fec_recovered'], m['rx_lost']]
 with open(summary, 'a') as fh:
     fh.write(','.join(str(x) for x in row) + '\n')
 PY

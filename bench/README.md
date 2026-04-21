@@ -95,12 +95,10 @@ The comparison tool checks these automatically:
 - `wfb_tx` in debug-UDP mode reports `injected=0` in its PKT IPC line — the
   Layer 1 airtime proxy comes from `bridge.csv` counts instead. On real
   hardware (Layer 2), `injected_bytes` is populated normally.
-- Two TX IPC counters:
-  - `frame_padding` counts FEC_ONLY padding packets emitted due to frame-aware
-    (quantifies airtime amplification).
-  - `frame_closes` counts blocks closed by M-bit detection (one per frame when
-    the feature fires). Use this for the "feature is firing" sanity check —
-    it should ≈ encoder fps.
+- `wfb_tx` does not emit a feature-specific IPC counter (intentional: keeps the
+  drone binary identical to upstream IPC format). "Did the feature fire?" is
+  answered on the GS by counting M-bit-set packets in the RTP stream via
+  `gs_monitor.py`'s `mbit_per_s` metric.
 - The synthetic feeder's I/P-frame packet counts (`--iframe-pkts`,
   `--pframe-pkts`) don't model actual encoder output — replace with pcap replay
   before trusting Layer 1 decision-rule output for production.

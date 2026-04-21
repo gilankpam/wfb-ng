@@ -21,7 +21,7 @@ def load(path):
     with open(path) as f:
         for row in csv.DictReader(f):
             for k in ('packets_sent', 'packets_recv', 'rx_fec_recovered',
-                     'rx_lost', 'tx_frame_padding', 'tx_frame_closes'):
+                     'rx_lost'):
                 row[k] = int(row[k])
             for k in ('fec_k', 'fec_n', 'rep'):
                 row[k] = int(row[k])
