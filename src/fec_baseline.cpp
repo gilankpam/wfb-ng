@@ -144,6 +144,15 @@ public:
 
     std::vector<std::vector<uint8_t>> delivered;
 
+    // A4 test helpers — reach protected Aggregator internals so we can
+    // drive emit_source with a seq_from_decoder that would require
+    // ≈ 2^29 real TX block sends to reach through the normal pipeline.
+    // Production code does not use these.
+    void test_force_seq(uint64_t s) { seq = s; }
+    void test_emit_source(uint64_t s, const uint8_t* buf, size_t sz) {
+        emit_source(s, buf, sz);
+    }
+
 protected:
     void send_to_socket(const uint8_t* payload, uint16_t packet_size) override {
         delivered.emplace_back(payload, payload + packet_size);
@@ -156,12 +165,12 @@ class LoggingLossListener : public PacketLossListener {
 public:
     struct Event {
         uint32_t lost_count;
-        uint32_t last_seq;
-        uint32_t new_seq;
+        uint64_t last_seq;   // A4: widened with the interface
+        uint64_t new_seq;    // A4: widened with the interface
     };
     std::vector<Event> events;
 
-    void on_packet_loss(uint32_t lost_count, uint32_t last_seq, uint32_t new_seq) override {
+    void on_packet_loss(uint32_t lost_count, uint64_t last_seq, uint64_t new_seq) override {
         events.push_back({lost_count, last_seq, new_seq});
     }
 };
@@ -333,13 +342,13 @@ std::string slurp(const char* path) {
 
 
 // ---------------------------------------------------------------------------
-// C15: PacketLossListener signature is (uint32_t, uint32_t, uint32_t).
-// Design §9.4 — the sliding-window proposal would widen last two to uint64_t.
-// This is a compile-time structural fact; static_assert nails it.
+// C15 (A4-updated): PacketLossListener signature is (uint32_t, uint64_t,
+// uint64_t). A4 widened last_seq / new_seq from uint32_t to uint64_t per
+// design §9.4 because block_idx * fec_k easily overflows 32 bits.
 // ---------------------------------------------------------------------------
 static_assert(std::is_same<
     decltype(&PacketLossListener::on_packet_loss),
-    void (PacketLossListener::*)(uint32_t, uint32_t, uint32_t)
+    void (PacketLossListener::*)(uint32_t, uint64_t, uint64_t)
 >::value, "PacketLossListener::on_packet_loss signature drifted");
 
 // ---------------------------------------------------------------------------
@@ -1153,6 +1162,73 @@ TEST_CASE("A3b BlockFecDecoder::tick is a no-op for block FEC",
     REQUIRE(dec.pop_ready(&s, out.ptr, &sz) == false);
     REQUIRE(fec_recovered == 0);
     REQUIRE(overrides == 0);
+}
+
+TEST_CASE("A4 on_packet_loss preserves last_seq / new_seq above UINT32_MAX",
+          "[A4][packet_loss][overflow]") {
+    // Goal: exercise the widened listener signature with a gap whose
+    // new_seq exceeds UINT32_MAX, and verify no silent truncation.
+    // Fixture establishes a session with k=8, n=12 so Aggregator's
+    // fec_k is set. Then we seed seq = 1000 and drive emit_source
+    // directly with a seq_from_decoder whose packet_seq (block_idx *
+    // fec_k + fragment_idx) exceeds 2^32.
+    Fixture f;
+    LoggingLossListener listener;
+    f.rx.set_packet_loss_listener(&listener);
+
+    f.rx.test_force_seq(1000);
+
+    AlignedBuf buf;
+    std::memset(buf.ptr, 0, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+    wpacket_hdr_t* hdr = (wpacket_hdr_t*)buf.ptr;
+    hdr->flags = 0;
+    hdr->packet_size = htobe16(4);
+    // Keep payload zeroed; content doesn't matter for the listener check.
+
+    // block_idx = 2^30, fragment_idx = 0 → packet_seq = 2^30 * 8 = 2^33.
+    // That's roughly 8.6e9, well above UINT32_MAX (~4.3e9).
+    const uint64_t block_idx    = (uint64_t)1 << 30;
+    const uint64_t decoder_seq  = block_idx << 8;  // frag 0
+    const uint64_t expected_new = block_idx * 8ULL;
+
+    f.rx.test_emit_source(decoder_seq, buf.ptr, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+
+    REQUIRE(listener.events.size() == 1);
+    const auto& ev = listener.events.front();
+    REQUIRE(ev.last_seq == 1000);
+    REQUIRE(ev.new_seq == expected_new);
+    REQUIRE(ev.new_seq > (uint64_t)UINT32_MAX);
+    // lost_count truncates to uint32_t; this matches the interface
+    // contract documented in rx.hpp (single-gap size > 2^32 is
+    // unreachable in practice).
+    const uint64_t gap64 = expected_new - 1000 - 1;
+    REQUIRE(ev.lost_count == (uint32_t)gap64);
+}
+
+TEST_CASE("A4 on_packet_loss within uint32_t range still works after widening",
+          "[A4][packet_loss]") {
+    // Regression check: the common case still delivers correct values
+    // after the widening. Identical to C6 in spirit but explicitly
+    // asserts the 64-bit listener fields for a small gap.
+    Fixture f;
+    LoggingLossListener listener;
+    f.rx.set_packet_loss_listener(&listener);
+
+    f.send_data(48, 128);  // 6 blocks at k=8
+    std::set<std::pair<uint64_t, uint8_t>> drops;
+    for (uint64_t b = 1; b <= 4; b++) {
+        for (uint8_t frag = 0; frag < 12; frag++) drops.insert({b, frag});
+    }
+    DropFragment dropper(std::move(drops));
+    run_pipeline(f.tx, f.rx, dropper);
+
+    REQUIRE(listener.events.size() >= 1);
+    const auto& ev = listener.events.front();
+    // Block 0 delivered 8 packets (seq 0..7), blocks 1..4 dropped,
+    // block 5 first fragment lands at packet_seq = 5 * 8 = 40.
+    REQUIRE(ev.last_seq == 7);
+    REQUIRE(ev.new_seq == 40);
+    REQUIRE(ev.lost_count == 32);
 }
 
 

@@ -44,7 +44,16 @@ class PacketLossListener
 {
 public:
     virtual ~PacketLossListener() = default;
-    virtual void on_packet_loss(uint32_t lost_count, uint32_t last_seq, uint32_t new_seq) = 0;
+    // A4: last_seq / new_seq widened from uint32_t to uint64_t per
+    // design §9.4. Under block FEC, packet_seq = block_idx * fec_k +
+    // fragment_idx; block_idx is 56 bits (max 2^55-1) so packet_seq
+    // easily exceeds uint32_t over a long session. Truncation to 32
+    // bits would wrap roughly every 71 minutes at 1000 pps with k=8.
+    // lost_count stays uint32_t because the caller (Aggregator) still
+    // accumulates into count_p_lost which is uint32_t; a single gap
+    // wider than 2^32 is unreachable in practice (would require
+    // billions of missing packets).
+    virtual void on_packet_loss(uint32_t lost_count, uint64_t last_seq, uint64_t new_seq) = 0;
 };
 
 typedef enum {
@@ -203,12 +212,20 @@ public:
 protected:
     virtual void send_to_socket(const uint8_t *payload, uint16_t packet_size) = 0;
 
+    // emit_source and seq are protected (not private) so the
+    // baseline harness's MockAggregator can drive them directly for
+    // the A4 overflow test (see fec_baseline.cpp [A4] tests).
+    // Reaching a packet_seq > UINT32_MAX in a real pipeline would
+    // require ≈ 2^29 TX block sends, which isn't feasible in a unit
+    // test. Production code must not call these from outside
+    // Aggregator.
+    void emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size_t sz);
+
 private:
     Aggregator(const Aggregator&);
     Aggregator& operator=(const Aggregator&);
 
     void init_fec(const fec_params_t &params);
-    void emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size_t sz);
     void log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi,
                   const int8_t *noise, uint16_t freq, uint8_t mcs_index, uint8_t bandwidth);
     // cppcheck-suppress unusedPrivateFunction
@@ -226,7 +243,14 @@ private:
     int fec_n;
     uint8_t session_hash[crypto_generichash_BYTES];
 
-    uint32_t seq;
+protected:
+    uint64_t seq;  // A4: widened from uint32_t. Tracks the last
+                   // packet_seq emit_source delivered. Block FEC uses
+                   // block_idx * fec_k + fragment_idx, which can
+                   // exceed 2^32 under realistic session lengths.
+                   // Exposed at protected scope for the same reason
+                   // as emit_source (A4 test).
+private:
     uint64_t epoch; // current epoch
     const uint32_t channel_id; // (link_id << 8) + port_number
 

@@ -711,11 +711,16 @@ void Aggregator::emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size
 
     const uint64_t block_idx_from_seq    = (seq_from_decoder >> 8) & BLOCK_IDX_MASK;
     const uint8_t  fragment_idx_from_seq = (uint8_t)(seq_from_decoder & 0xff);
-    const uint32_t packet_seq = (uint32_t)(block_idx_from_seq * fec_k + fragment_idx_from_seq);
+    const uint64_t packet_seq = block_idx_from_seq * (uint64_t)fec_k + fragment_idx_from_seq;
 
     if (packet_seq > seq + 1 && seq > 0)
     {
-        uint32_t lost_count = packet_seq - seq - 1;
+        // Gap size truncates to 32 bits for count_p_lost and the
+        // listener's lost_count parameter. A single gap > 2^32
+        // packets is unreachable in practice (billions of packets)
+        // so saturation here would only hide a bug elsewhere.
+        const uint64_t gap64 = packet_seq - seq - 1;
+        const uint32_t lost_count = (uint32_t)gap64;
         ANDROID_IPC_MSG("PKT_LOST\t%d", lost_count);
         count_p_lost += lost_count;
 
@@ -729,7 +734,7 @@ void Aggregator::emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size
 
     if (packet_size > MAX_PAYLOAD_SIZE)
     {
-        WFB_ERR("Corrupted packet %u\n", seq);
+        WFB_ERR("Corrupted packet %" PRIu64 "\n", seq);
         count_p_bad += 1;
     }
     else if (!(flags & WFB_PACKET_FEC_ONLY))
