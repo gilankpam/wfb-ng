@@ -1009,6 +1009,153 @@ TEST_CASE("A3a BlockFecEncoder max_packet_size tracks the largest source in a bl
 }
 
 
+// Direct unit tests on BlockFecDecoder via its ctor (bypassing the
+// factory; see fec_block.cpp make_fec_decoder for why). These exercise
+// the IFecDecoder interface contract independently of Aggregator.
+
+TEST_CASE("A3b BlockFecDecoder pops sources in seq order for a lossless block",
+          "[A3b][fec_block]") {
+    uint32_t fec_recovered = 0, overrides = 0;
+    BlockFecDecoder dec(4, 7, /*loss_listener=*/nullptr, &fec_recovered, &overrides);
+
+    AlignedBuf src;
+    AlignedBuf out;
+
+    // Frame a recognizable wpacket_hdr_t + payload into src.
+    auto build_source = [&](uint8_t marker) {
+        std::memset(src.ptr, 0, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+        wpacket_hdr_t* hdr = (wpacket_hdr_t*)src.ptr;
+        hdr->flags = 0;
+        hdr->packet_size = htobe16(8);
+        std::memset(src.ptr + sizeof(wpacket_hdr_t), marker, 8);
+    };
+
+    for (int i = 0; i < 4; i++) {
+        build_source((uint8_t)(0xA0 + i));
+        dec.on_source_packet(((uint64_t)5 << 8) | i, src.ptr, sizeof(wpacket_hdr_t) + 8);
+    }
+
+    // Fast path should have queued all 4 sources in order (block 5, frags 0..3).
+    for (int i = 0; i < 4; i++) {
+        uint64_t seq_out = 0;
+        size_t sz_out = 0;
+        REQUIRE(dec.pop_ready(&seq_out, out.ptr, &sz_out) == true);
+        REQUIRE(seq_out == ((uint64_t)5 << 8 | (uint8_t)i));
+        REQUIRE(sz_out == MAX_FEC_PAYLOAD);
+        const wpacket_hdr_t* popped_hdr = (const wpacket_hdr_t*)out.ptr;
+        REQUIRE(be16toh(popped_hdr->packet_size) == 8);
+        const uint8_t* popped_payload = out.ptr + sizeof(wpacket_hdr_t);
+        for (int b = 0; b < 8; b++) {
+            REQUIRE(popped_payload[b] == (uint8_t)(0xA0 + i));
+        }
+    }
+    uint64_t unused_seq = 0;
+    size_t   unused_sz  = 0;
+    REQUIRE(dec.pop_ready(&unused_seq, out.ptr, &unused_sz) == false);
+    REQUIRE(fec_recovered == 0);
+    REQUIRE(overrides == 0);
+}
+
+TEST_CASE("A3b BlockFecDecoder recovers a missing source via on_repair_packet",
+          "[A3b][fec_block]") {
+    // Use a minimal (k=2, n=3) code and build two sources + one parity
+    // via BlockFecEncoder, drop one source in transit, feed the
+    // survivor + parity to BlockFecDecoder, and expect pop_ready to
+    // deliver both sources in order. This is the narrowest possible
+    // end-to-end check of the encoder/decoder handshake without
+    // going through AEAD or the ring machinery.
+    const int k = 2, n = 3;
+    fec_params_t params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
+    auto enc = make_fec_encoder(params);
+
+    uint32_t fec_recovered = 0, overrides = 0;
+    BlockFecDecoder dec(k, n, nullptr, &fec_recovered, &overrides);
+
+    AlignedBuf src0, src1, repair, out;
+
+    // Build two distinct framed sources.
+    auto frame = [](uint8_t* dst, uint8_t marker) {
+        std::memset(dst, 0, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+        wpacket_hdr_t* hdr = (wpacket_hdr_t*)dst;
+        hdr->flags = 0;
+        hdr->packet_size = htobe16(16);
+        std::memset(dst + sizeof(wpacket_hdr_t), marker, 16);
+    };
+    frame(src0.ptr, 0x11);
+    frame(src1.ptr, 0x22);
+
+    // Encoder learns both sources, produces one parity.
+    enc->on_source_packet(0, src0.ptr, sizeof(wpacket_hdr_t) + 16);
+    enc->on_source_packet(1, src1.ptr, sizeof(wpacket_hdr_t) + 16);
+    size_t repair_sz = 0;
+    uint64_t repair_nonce = 0;
+    REQUIRE(enc->next_repair(repair.ptr, &repair_sz, &repair_nonce) == true);
+    REQUIRE(repair_nonce == ((0ULL << 8) | 2));  // block 0, frag k=2
+
+    // Drop source 0: feed source 1 + the parity to the decoder.
+    dec.on_source_packet(1, src1.ptr, sizeof(wpacket_hdr_t) + 16);
+    const uint64_t window_tail = (0ULL << 8) | (uint8_t)(k - 1);
+    dec.on_repair_packet(repair_nonce, window_tail, /*repair_idx=*/0,
+                         repair.ptr, repair_sz);
+
+    // Expect both sources to pop in seq order, with source 0 recovered.
+    uint64_t seq_out = 0;
+    size_t sz_out = 0;
+    REQUIRE(dec.pop_ready(&seq_out, out.ptr, &sz_out) == true);
+    REQUIRE(seq_out == 0);
+    const uint8_t* popped = out.ptr + sizeof(wpacket_hdr_t);
+    REQUIRE(popped[0] == 0x11);  // src0 was recovered
+    REQUIRE(popped[15] == 0x11);
+
+    REQUIRE(dec.pop_ready(&seq_out, out.ptr, &sz_out) == true);
+    REQUIRE(seq_out == 1);
+    popped = out.ptr + sizeof(wpacket_hdr_t);
+    REQUIRE(popped[0] == 0x22);  // src1 delivered as-is
+
+    REQUIRE(dec.pop_ready(&seq_out, out.ptr, &sz_out) == false);
+    REQUIRE(fec_recovered == 1);  // exactly one recovery
+    REQUIRE(overrides == 0);
+}
+
+TEST_CASE("A3b BlockFecDecoder bumps count_p_override when ring overflows",
+          "[A3b][fec_block]") {
+    // Feed (RX_RING_SIZE + 2) distinct block_idx values with only one
+    // fragment each (no block ever completes), forcing the ring to
+    // overflow and the decoder to count overrides.
+    uint32_t fec_recovered = 0, overrides = 0;
+    BlockFecDecoder dec(8, 12, nullptr, &fec_recovered, &overrides);
+    AlignedBuf src, out;
+    std::memset(src.ptr, 0, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+    wpacket_hdr_t* hdr = (wpacket_hdr_t*)src.ptr;
+    hdr->flags = 0;
+    hdr->packet_size = htobe16(4);
+
+    for (uint64_t b = 0; b < RX_RING_SIZE + 2; b++) {
+        dec.on_source_packet((b << 8) | 1,  // frag 1 of each block, leaves gap at 0
+                             src.ptr, sizeof(wpacket_hdr_t) + 4);
+        uint64_t s; size_t sz;
+        while (dec.pop_ready(&s, out.ptr, &sz)) { /* drain each call */ }
+    }
+
+    REQUIRE(overrides >= 2);  // at least 2 blocks had to be force-evicted
+    REQUIRE(fec_recovered == 0);
+}
+
+TEST_CASE("A3b BlockFecDecoder::tick is a no-op for block FEC",
+          "[A3b][fec_block]") {
+    uint32_t fec_recovered = 0, overrides = 0;
+    BlockFecDecoder dec(2, 3, nullptr, &fec_recovered, &overrides);
+    dec.tick(0);
+    dec.tick(10);
+    dec.tick(100000);
+    // State still empty: pop_ready false, no counters moved.
+    uint64_t s; size_t sz; AlignedBuf out;
+    REQUIRE(dec.pop_ready(&s, out.ptr, &sz) == false);
+    REQUIRE(fec_recovered == 0);
+    REQUIRE(overrides == 0);
+}
+
+
 int main(int argc, char* argv[]) {
     if (sodium_init() < 0) {
         fprintf(stderr, "libsodium init failed\n");

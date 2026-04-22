@@ -49,6 +49,7 @@ extern "C"
 
 #include "wifibroadcast.hpp"
 #include "rx.hpp"
+#include "fec_block.hpp"
 
 using namespace std;
 
@@ -270,11 +271,21 @@ void Receiver::loop_iter(void)
 Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-    fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
-    last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
+    decoder(), pop_scratch(nullptr), fec_k(-1), fec_n(-1), seq(0),
+    epoch(epoch), channel_id(channel_id)
 {
     memset(session_key, '\0', sizeof(session_key));
     memset(session_hash, '\0', sizeof(session_hash));
+
+    // Aligned scratch buffer that pop_ready copies recovered/received
+    // source fragments into on every drain call. Symmetric with the
+    // Transmitter's scratch (tx.cpp).
+    int rc_align = posix_memalign((void**)&pop_scratch, ZFEX_SIMD_ALIGNMENT,
+                                  ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+    if (rc_align != 0) {
+        throw runtime_error(string_format("Aggregator: posix_memalign failed: %s",
+                                          strerror(rc_align)));
+    }
 
     FILE *fp;
     if((fp = fopen(keypair.c_str(), "r")) == NULL)
@@ -297,10 +308,10 @@ Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_i
 
 Aggregator::~Aggregator()
 {
-    if (fec_p != NULL)
-    {
-        deinit_fec();
-    }
+    free(pop_scratch);
+    pop_scratch = nullptr;
+    // decoder unique_ptr destroys BlockFecDecoder, which frees
+    // rx_ring fragments and the zfex handle.
 }
 
 void Aggregator::init_fec(const fec_params_t &params)
@@ -308,8 +319,6 @@ void Aggregator::init_fec(const fec_params_t &params)
     // Phase 2a: only block FEC is wired through. Sliding params will
     // light up in Phase 2b once fec_swin is behind the interface.
     assert(params.fec_type == WFB_FEC_VDM_RS);
-
-    assert(fec_p == NULL);
     assert(params.k >= 1);
     assert(params.n >= 1);
     assert(params.n < 256);
@@ -317,52 +326,15 @@ void Aggregator::init_fec(const fec_params_t &params)
 
     fec_k = params.k;
     fec_n = params.n;
-
-    zfex_status_code_t rc = fec_new(fec_k, fec_n, &fec_p);
-    assert(rc == ZFEX_SC_OK);
-
-    rx_ring_front = 0;
-    rx_ring_alloc = 0;
-    last_known_block = (uint64_t)-1;
     seq = 0;
 
-    for(int ring_idx = 0; ring_idx < RX_RING_SIZE; ring_idx++)
-    {
-        rx_ring[ring_idx].block_idx = 0;
-        rx_ring[ring_idx].fragment_to_send_idx = 0;
-        rx_ring[ring_idx].has_fragments = 0;
-        rx_ring[ring_idx].fragments = new uint8_t*[fec_n];
-        for(int i=0; i < fec_n; i++)
-        {
-            int _rc = posix_memalign((void**)&rx_ring[ring_idx].fragments[i], ZFEX_SIMD_ALIGNMENT, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
-            assert(_rc == 0);
-        }
-        rx_ring[ring_idx].fragment_map = new size_t[fec_n];
-        memset(rx_ring[ring_idx].fragment_map, '\0', fec_n * sizeof(size_t));
-    }
-}
-
-void Aggregator::deinit_fec(void)
-{
-    assert(fec_p != NULL);
-
-    for(int ring_idx = 0; ring_idx < RX_RING_SIZE; ring_idx++)
-    {
-        delete[] rx_ring[ring_idx].fragment_map;
-        rx_ring[ring_idx].fragment_map = NULL;
-        for(int i=0; i < fec_n; i++)
-        {
-            free(rx_ring[ring_idx].fragments[i]);
-        }
-        delete[] rx_ring[ring_idx].fragments;
-        rx_ring[ring_idx].fragments = NULL;
-    }
-
-    zfex_status_code_t rc = fec_free(fec_p);
-    assert(rc == ZFEX_SC_OK);
-    fec_p = NULL;
-    fec_k = -1;
-    fec_n = -1;
+    // Bypass make_fec_decoder for the block path so we can pass our
+    // count_p_fec_recovered / count_p_override mirror pointers straight
+    // into BlockFecDecoder's ctor. See fec_block.cpp make_fec_decoder
+    // comment for why.
+    decoder.reset(new BlockFecDecoder(fec_k, fec_n, packet_loss_listener_,
+                                      &count_p_fec_recovered,
+                                      &count_p_override));
 }
 
 
@@ -420,73 +392,6 @@ void Forwarder::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx
 Forwarder::~Forwarder()
 {
     close(sockfd);
-}
-
-int Aggregator::rx_ring_push(void)
-{
-    if(rx_ring_alloc < RX_RING_SIZE)
-    {
-        int idx = modN(rx_ring_front + rx_ring_alloc, RX_RING_SIZE);
-        rx_ring_alloc += 1;
-        return idx;
-    }
-
-    /*
-      Ring overflow. This means that there are more unfinished blocks than ring size
-      Possible solutions:
-      1. Increase ring size. Do this if you have large variance of packet travel time throught WiFi card or network stack.
-         Some cards can do this due to packet reordering inside, diffent chipset and/or firmware or your RX hosts have different CPU power.
-      2. Reduce packet injection speed or try to unify RX hardware.
-    */
-
-    WFB_DBG("AGG: Override block 0x%" PRIx64 " flush %d fragments\n", rx_ring[rx_ring_front].block_idx, rx_ring[rx_ring_front].has_fragments);
-
-    count_p_override += 1;
-
-    for(int f_idx=rx_ring[rx_ring_front].fragment_to_send_idx; f_idx < fec_k; f_idx++)
-    {
-        if(rx_ring[rx_ring_front].fragment_map[f_idx])
-        {
-            send_packet(rx_ring_front, f_idx);
-        }
-    }
-
-    // override last item in ring
-    int ring_idx = rx_ring_front;
-    rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
-    return ring_idx;
-}
-
-
-int Aggregator::get_block_ring_idx(uint64_t block_idx)
-{
-    // check if block is already in the ring
-    for(int i = rx_ring_front, c = rx_ring_alloc; c > 0; i = modN(i + 1, RX_RING_SIZE), c--)
-    {
-        if (rx_ring[i].block_idx == block_idx) return i;
-    }
-
-    // check if block is already known and not in the ring then it is already processed
-    if (last_known_block != (uint64_t)-1 && block_idx <= last_known_block)
-    {
-        return -1;
-    }
-
-    int new_blocks = (int)min(last_known_block != (uint64_t)-1 ? block_idx - last_known_block : 1, (uint64_t)RX_RING_SIZE);
-    assert (new_blocks > 0);
-
-    last_known_block = block_idx;
-    int ring_idx = -1;
-
-    for(int i = 0; i < new_blocks; i++)
-    {
-        ring_idx = rx_ring_push();
-        rx_ring[ring_idx].block_idx = block_idx + i + 1 - new_blocks;
-        rx_ring[ring_idx].fragment_to_send_idx = 0;
-        rx_ring[ring_idx].has_fragments = 0;
-        memset(rx_ring[ring_idx].fragment_map, '\0', fec_n * sizeof(size_t));
-    }
-    return ring_idx;
 }
 
 void Aggregator::dump_stats(void)
@@ -692,15 +597,12 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             epoch = be64toh(new_session_data->epoch);
             memcpy(session_key, new_session_data->session_key, sizeof(session_key));
 
-            if (fec_p != NULL)
-            {
-                deinit_fec();
-            }
-
-            // Phase 2a: fec_type guard at rx.cpp:659-664 already rejected
-            // anything other than WFB_FEC_VDM_RS, so k and n are populated
-            // from the fixed session header. Sliding fields stay zero
-            // until Phase 2b adds the TLV extraction.
+            // Phase 2a: fec_type guard above already rejected anything
+            // other than WFB_FEC_VDM_RS, so k and n are populated from
+            // the fixed session header. Sliding fields stay zero until
+            // Phase 2b adds the TLV extraction. init_fec resets the
+            // decoder unique_ptr, which frees the previous rx_ring and
+            // zfex handle.
             fec_params_t session_params = {WFB_FEC_VDM_RS,
                                            new_session_data->k,
                                            new_session_data->n,
@@ -744,10 +646,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     assert(decrypted_len >= sizeof(wpacket_hdr_t));
     assert(decrypted_len <= MAX_FEC_PAYLOAD);
 
-    uint64_t block_idx = be64toh(block_hdr->data_nonce) >> 8;
-    uint8_t fragment_idx = (uint8_t)(be64toh(block_hdr->data_nonce) & 0xff);
+    const uint64_t data_nonce = be64toh(block_hdr->data_nonce);
+    uint64_t block_idx = data_nonce >> 8;
+    uint8_t fragment_idx = (uint8_t)(data_nonce & 0xff);
 
-    count_p_uniq.insert(be64toh(block_hdr->data_nonce));
+    count_p_uniq.insert(data_nonce);
 
     // Should never happend due to generating new session key on tx side
     if (block_idx > MAX_BLOCK_IDX)
@@ -764,117 +667,51 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         return;
     }
 
-    int ring_idx = get_block_ring_idx(block_idx);
-
-    //ignore already processed blocks
-    if (ring_idx < 0) return;
-
-    rx_ring_item_t *p = &rx_ring[ring_idx];
-
-    //ignore already processed fragments
-    if (p->fragment_map[fragment_idx]) return;
-
-    memset(p->fragments[fragment_idx], '\0', MAX_FEC_PAYLOAD);
-    memcpy(p->fragments[fragment_idx], decrypted, decrypted_len);
-
-    p->fragment_map[fragment_idx] = decrypted_len;
-    p->has_fragments += 1;
-
-    // Check if we use current (oldest) block
-    // then we can optimize and don't wait for all K fragments
-    // and send packets if there are no gaps in fragments from the beginning of this block
-    if(ring_idx == rx_ring_front)
+    // Dispatch to the decoder: source fragments (fragment_idx < fec_k)
+    // go through on_source_packet; parity fragments (fragment_idx >=
+    // fec_k) go through on_repair_packet with the block-FEC-specific
+    // synthetic window_tail_seq and repair_idx. See fec_iface.hpp §9.3
+    // commentary for D2 (the seq mapping used by the block codec).
+    if (fragment_idx < fec_k)
     {
-        // check if there are any packets without gaps
-        // and send them immediately
-        while(p->fragment_to_send_idx < fec_k && p->fragment_map[p->fragment_to_send_idx])
-        {
-            send_packet(ring_idx, p->fragment_to_send_idx);
-            p->fragment_to_send_idx += 1;
-        }
-
-        // remove block if all K elements (without gaps) were sent
-        if(p->fragment_to_send_idx == fec_k)
-        {
-            rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
-            rx_ring_alloc -= 1;
-            assert(rx_ring_alloc >= 0);
-            return;
-        }
+        decoder->on_source_packet(data_nonce, decrypted, decrypted_len);
+    }
+    else
+    {
+        const uint64_t window_tail = ((block_idx & BLOCK_IDX_MASK) << 8) | (uint8_t)(fec_k - 1);
+        const uint8_t  repair_idx  = fragment_idx - (uint8_t)fec_k;
+        decoder->on_repair_packet(data_nonce, window_tail, repair_idx,
+                                  decrypted, decrypted_len);
     }
 
-    // Check that this block has K elements (with gaps) and can be recovered via FEC
-    if(p->fragment_to_send_idx < fec_k && p->has_fragments == fec_k)
+    // Drain every source packet the decoder is ready to emit. pop_ready
+    // returns in increasing seq order; emit_source tracks losses and
+    // writes to the socket.
+    uint64_t out_seq = 0;
+    size_t out_sz = 0;
+    while (decoder->pop_ready(&out_seq, pop_scratch, &out_sz))
     {
-        // send all queued packets in all unfinished blocks before current
-        // and then remove that blocks
-        int nrm = modN(ring_idx - rx_ring_front, RX_RING_SIZE);
-
-        while(nrm > 0)
-        {
-            for(int f_idx=rx_ring[rx_ring_front].fragment_to_send_idx; f_idx < fec_k; f_idx++)
-            {
-                if(rx_ring[rx_ring_front].fragment_map[f_idx])
-                {
-                    send_packet(rx_ring_front, f_idx);
-                }
-            }
-            rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
-            rx_ring_alloc -= 1;
-            nrm -= 1;
-        }
-
-        assert(rx_ring_alloc > 0);
-        assert(ring_idx == rx_ring_front);
-
-        // Search for missed data fragments and apply FEC only if needed
-        for(int f_idx=p->fragment_to_send_idx; f_idx < fec_k; f_idx++)
-        {
-            if(! p->fragment_map[f_idx])
-            {
-                uint32_t fec_count = 0;
-
-                //Recover missed fragments using FEC
-                apply_fec(ring_idx);
-
-                // Count total number of recovered fragments
-                for(; f_idx < fec_k; f_idx++)
-                {
-                    if(! p->fragment_map[f_idx])
-                    {
-                        fec_count += 1;
-                    }
-                }
-
-                if(fec_count)
-                {
-                    count_p_fec_recovered += fec_count;
-                    WFB_DBG("FEC recovered %u packets\n", fec_count);
-                }
-                break;
-            }
-        }
-
-        while(p->fragment_to_send_idx < fec_k)
-        {
-            send_packet(ring_idx, p->fragment_to_send_idx);
-            p->fragment_to_send_idx += 1;
-        }
-
-        // remove block
-        rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
-        rx_ring_alloc -= 1;
-        assert(rx_ring_alloc >= 0);
+        emit_source(out_seq, pop_scratch, out_sz);
     }
 }
 
-void Aggregator::send_packet(int ring_idx, int fragment_idx)
+void Aggregator::emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size_t sz)
 {
-    wpacket_hdr_t* packet_hdr = (wpacket_hdr_t*)(rx_ring[ring_idx].fragments[fragment_idx]);
-    uint8_t *payload = (rx_ring[ring_idx].fragments[fragment_idx]) + sizeof(wpacket_hdr_t);
-    uint8_t flags = packet_hdr->flags;
-    uint16_t packet_size = be16toh(packet_hdr->packet_size);
-    uint32_t packet_seq = rx_ring[ring_idx].block_idx * fec_k + fragment_idx;
+    // pop_ready hands back the full ZFEX-padded fragment; the inner
+    // wpacket_hdr_t's packet_size field tells us the logical payload
+    // length. This mirrors the old Aggregator::send_packet body
+    // (pre-A3b rx.cpp:871) one-for-one.
+    assert(sz >= sizeof(wpacket_hdr_t));
+    (void)sz;
+
+    const wpacket_hdr_t* packet_hdr = (const wpacket_hdr_t*)buf;
+    const uint8_t*       payload    = buf + sizeof(wpacket_hdr_t);
+    const uint8_t        flags      = packet_hdr->flags;
+    const uint16_t       packet_size = be16toh(packet_hdr->packet_size);
+
+    const uint64_t block_idx_from_seq    = (seq_from_decoder >> 8) & BLOCK_IDX_MASK;
+    const uint8_t  fragment_idx_from_seq = (uint8_t)(seq_from_decoder & 0xff);
+    const uint32_t packet_seq = (uint32_t)(block_idx_from_seq * fec_k + fragment_idx_from_seq);
 
     if (packet_seq > seq + 1 && seq > 0)
     {
@@ -882,7 +719,6 @@ void Aggregator::send_packet(int ring_idx, int fragment_idx)
         ANDROID_IPC_MSG("PKT_LOST\t%d", lost_count);
         count_p_lost += lost_count;
 
-        // Immediate packet loss notification
         if (packet_loss_listener_ != NULL)
         {
             packet_loss_listener_->on_packet_loss(lost_count, seq, packet_seq);
@@ -891,61 +727,17 @@ void Aggregator::send_packet(int ring_idx, int fragment_idx)
 
     seq = packet_seq;
 
-    if(packet_size > MAX_PAYLOAD_SIZE)
+    if (packet_size > MAX_PAYLOAD_SIZE)
     {
         WFB_ERR("Corrupted packet %u\n", seq);
         count_p_bad += 1;
     }
-    else if(!(flags & WFB_PACKET_FEC_ONLY))
+    else if (!(flags & WFB_PACKET_FEC_ONLY))
     {
         send_to_socket(payload, packet_size);
         count_p_outgoing += 1;
         count_b_outgoing += packet_size;
     }
-}
-
-void Aggregator::apply_fec(int ring_idx)
-{
-    assert(fec_k >= 1);
-    assert(fec_n >= 1);
-    assert(fec_k <= fec_n);
-    assert(fec_p != NULL);
-
-    unsigned index[fec_k];
-    uint8_t *in_blocks[fec_k];
-    uint8_t *out_blocks[fec_n - fec_k];
-    int j = fec_k;
-    int ob_idx = 0;
-    size_t max_packet_size = 0;
-
-    for(int i=0; i < fec_k; i++)
-    {
-        if(rx_ring[ring_idx].fragment_map[i])
-        {
-            in_blocks[i] = rx_ring[ring_idx].fragments[i];
-            index[i] = i;
-        }
-        else
-        {
-            while(j < fec_n && ! rx_ring[ring_idx].fragment_map[j])
-            {
-                j++;
-            }
-
-            assert(j < fec_n);
-            // FEC packets always have max size between packets in block
-            max_packet_size = max(max_packet_size, rx_ring[ring_idx].fragment_map[j]);
-            in_blocks[i] = rx_ring[ring_idx].fragments[j];
-            out_blocks[ob_idx++] = rx_ring[ring_idx].fragments[i];
-            index[i] = j++;
-        }
-    }
-
-    assert(max_packet_size > 0);
-    assert(max_packet_size <= MAX_FEC_PAYLOAD);
-
-    zfex_status_code_t rc = fec_decode_simd(fec_p, (const uint8_t**)in_blocks, out_blocks, index, ZFEX_ROUND_UP_SIMD(max_packet_size));
-    assert(rc == ZFEX_SC_OK);
 }
 
 AggregatorUDPv4::AggregatorUDPv4(const std::string &client_addr, int client_port, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size) : \
