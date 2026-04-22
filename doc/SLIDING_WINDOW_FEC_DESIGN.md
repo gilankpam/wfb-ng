@@ -321,7 +321,7 @@ Transmitter::send_packet(payload)
 
 Each source packet is emitted the moment it arrives. The encoder maintains
 a ring of the last `W` source payloads (padded to the running max size in
-the window — see §11 on padding amplification). Every slot in the
+the window — see §12.1 on padding amplification). Every slot in the
 encoder's source ring and the decoder's window-and-repair rings MUST be
 allocated via `posix_memalign(ZFEX_SIMD_ALIGNMENT, ZFEX_ROUND_UP_SIMD(P))`
 — zfex checks alignment at
@@ -1382,6 +1382,9 @@ per-profile. Rollback cost is minimal.
 
 ### 12.2 Open questions, deferred to Phase 2+
 
+Items resolved by the revision-2 triage (§9.1, §9.4, §10.1, §10.3, §6,
+§8.2) are no longer listed here. What remains:
+
 - **Benchmark harness spec.** How to drive both codecs over a controlled
   lossy link (netem, or the existing
   [src/fec_test.cpp](../src/fec_test.cpp) rig extended). What metrics to
@@ -1396,11 +1399,18 @@ per-profile. Rollback cost is minimal.
   loss. Phase 3.
 - **GF(2^16) path.** Only needed for `W > 128 ∧ R > 1`. Not in any
   current operating point.
-- **True incremental encode.** Phase 3 optimization; requires a zfex
-  extension.
-- **Python / Twisted orchestrator changes.** CLI display of W/R in
-  [wfb_ng/cli.py](../wfb_ng/cli.py); log parsing of new counters in
-  [wfb_ng/log_parser.py](../wfb_ng/log_parser.py). Phase 2.
+- **True incremental encode** (distinct from the one-row extension
+  committed in §6): maintain running parity accumulators so that
+  admitting a new source costs `O(P / 16)` per parity row rather than
+  `O(W · P / 16)`. Phase 3.
+- **`tlv_hdr_t.len` byte-order fix.** Pre-existing host-order bug
+  at [src/tx.cpp:180](../src/tx.cpp#L180) /
+  [src/rx.cpp:558-562](../src/rx.cpp#L558-L562), inherited by the new
+  TLVs. Separate Phase-2 issue (§5.5).
+- **Config-loader changes in [wfb_ng/conf/master.cfg](../wfb_ng/conf/master.cfg)
+  and [wfb_ng/config_parser.py](../wfb_ng/config_parser.py)** to
+  accept `fec_type`, `swin_w`, `swin_r`. Phase 2 plumbing; out of
+  scope for this design.
 
 ---
 
