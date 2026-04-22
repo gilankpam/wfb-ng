@@ -287,8 +287,12 @@ std::vector<uint8_t> forge_swin_session_packet(const TestKeys& keys,
     sd->epoch = htobe64(epoch);
     sd->channel_id = htobe32(channel_id);
     sd->fec_type = fec_type;
-    sd->k = 0;
-    sd->n = 0;
+    // Use plausible block-FEC k/n so the rx.cpp:659-664 fec_type guard is the
+    // only path that can reject this packet. With k=0 or n=0 the downstream
+    // "Invalid FEC N/K" guards at rx.cpp:666-678 would also reject, masking
+    // the absence of the SWIN guard during mutation testing.
+    sd->k = 8;
+    sd->n = 12;
     randombytes_buf(sd->session_key, sizeof(sd->session_key));
 
     std::vector<uint8_t> packet(sizeof(wsession_hdr_t) + sizeof(plain) + crypto_box_MACBYTES);
@@ -486,18 +490,29 @@ TEST_CASE("C6 seq = block*fec_k + frag; on_packet_loss reports gap correctly",
 TEST_CASE("C7 fail-closed on unknown fec_type (hand-forged SWIN session)",
           "[baseline][C7]") {
     // Before test: rx has already accepted the fixture's block session.
-    // Forge a new session packet with fec_type=WFB_FEC_SWIN_RS (0x2).
-    // RX should reject at rx.cpp:659-664 with count_p_dec_err += 1.
-    Fixture f;
-    const uint32_t dec_err_before = f.rx.count_p_dec_err;
-    const uint32_t session_before = f.rx.count_p_session;
+    // Forge session packets with fec_type values that today's RX does not
+    // recognise. RX should reject at rx.cpp:659-664 with count_p_dec_err += 1
+    // and leave count_p_session unchanged.
+    //
+    // The forged packets carry plausible (k=8, n=12) so that the SWIN guard
+    // is the only path that can reject them — see forge_swin_session_packet.
+    //
+    // Two values are tested: 0x2 (WFB_FEC_SWIN_RS, the live concern) and 0xFE
+    // (an arbitrary other unknown), to confirm the test is keyed on
+    // "fec_type != WFB_FEC_VDM_RS" and not accidentally on the literal 0x2.
+    const uint8_t kForgedTypes[] = { 0x02, 0xFE };
+    for (uint8_t ft : kForgedTypes) {
+        Fixture f;
+        const uint32_t dec_err_before = f.rx.count_p_dec_err;
+        const uint32_t session_before = f.rx.count_p_session;
 
-    auto forged = forge_swin_session_packet(
-        f.keys, kEpoch, kChannelId, /*fec_type=*/0x2);
-    feed_raw(f.rx, forged.data(), forged.size());
+        auto forged = forge_swin_session_packet(
+            f.keys, kEpoch, kChannelId, /*fec_type=*/ft);
+        feed_raw(f.rx, forged.data(), forged.size());
 
-    REQUIRE(f.rx.count_p_dec_err == dec_err_before + 1);
-    REQUIRE(f.rx.count_p_session == session_before);   // not counted as session
+        REQUIRE(f.rx.count_p_dec_err == dec_err_before + 1);
+        REQUIRE(f.rx.count_p_session == session_before);   // not counted as session
+    }
 }
 
 
@@ -738,6 +753,11 @@ TEST_CASE("C17 single-primary-loss recovery on frag 7 with parity present",
 
     REQUIRE(f.rx.delivered.size() == 8);
     REQUIRE(f.rx.count_p_fec_recovered == 1);
+    // Guard against a vacuous byte-content check: if FEC decode is skipped,
+    // fragments[7] stays zeroed, the wpacket_hdr's packet_size is 0, and
+    // delivered[7] becomes a 0-byte vector — the loop below would then
+    // iterate zero times and silently pass.
+    REQUIRE(f.rx.delivered[7].size() == 128);
     // Recovered frag 7 should equal seed byte 7 across its payload.
     for (uint8_t b : f.rx.delivered[7]) REQUIRE(b == 7);
 }

@@ -32,7 +32,7 @@ All claims cite sections of [SLIDING_WINDOW_FEC_DESIGN.md](SLIDING_WINDOW_FEC_DE
 | C4 | §1/§2 fast-path — zero-latency in-order emission | mock TX→RX, no loss | 8 deliveries in single pipeline pass, `count_p_fec_recovered == 0` | PASS |
 | C5 | §1 ring eviction → `count_p_override++` (rx.cpp:440) | mock TX→RX, 41 incomplete blocks | `count_p_override >= 1` | PASS |
 | C6 | §2.2/§10.3 `packet_seq = block*fec_k + frag` (rx.cpp:865) | mock TX→RX + PacketLossListener | skip blocks 1-4 → listener gets `(lost=32, last=7, new=40)` | PASS |
-| C7 | §2.3/§5.7 fail-closed on unknown `fec_type` (rx.cpp:659-664) | mock RX + **hand-forged** SWIN session packet | forged `fec_type=0x2` → `count_p_dec_err++`, `count_p_session` unchanged | PASS |
+| C7 | §2.3/§5.7 fail-closed on unknown `fec_type` (rx.cpp:659-664) | mock RX + **hand-forged** session packets, two `fec_type` values (`0x2`, `0xFE`), plausible `(k=8, n=12)` so the SWIN guard is the only path that can reject | each forge → `count_p_dec_err++`, `count_p_session` unchanged | PASS |
 | C8 | §5.6 block-FEC nonce layout `(block<<8 \| frag)` unique | mock TX capture | parsed nonces are unique; `block<3, frag<12` after 3 blocks | PASS |
 | C9 | §7.4 no `T_flush` / `count_w_flush` in block path | grep `src/rx.cpp` | both absent | PASS |
 | C10 | §8.1 RX ring memory `= RX_RING_SIZE · fec_n · MAX_FEC_PAYLOAD` | `static_assert`/arithmetic | `40 · 12 · 3996 = 1,918,080 ≈ 1.83 MiB` | PASS |
@@ -42,12 +42,12 @@ All claims cite sections of [SLIDING_WINDOW_FEC_DESIGN.md](SLIDING_WINDOW_FEC_DE
 | C14 | §10.3.1 SESSION IPC hardcodes `WFB_FEC_VDM_RS` at rx.cpp:698 | grep `src/rx.cpp` | `WFB_FEC_VDM_RS` appears inside the SESSION IPC line | PASS |
 | C15 | §9.4 `PacketLossListener::on_packet_loss` is `(uint32_t,uint32_t,uint32_t)` | `static_assert` | signature unchanged | PASS (compile) |
 | C16 | §11.2 K-sized padding — one outlier inflates all n−k parity | mock TX capture, 7 small + 1 big | parity packets = 1428 B (matches 9 + 3 + 1400 + 16) | PASS |
-| C17 | §11.3 single-packet-loss recovery within a block | mock TX→RX, drop frag 7 | `count_p_fec_recovered == 1`; frag 7 reconstructed | PASS |
+| C17 | §11.3 single-packet-loss recovery within a block | mock TX→RX, drop frag 7 | `count_p_fec_recovered == 1`; `delivered[7].size() == 128` (size guard against vacuous byte check); each recovered byte equals seed `7` | PASS |
 | C18 | §12.1 partial-block close primitive (tx.cpp:986-992) | mock TX, `WFB_PACKET_FEC_ONLY` loop | 1 real frag + 7 close-calls (last one injects 5 frags) → n=12 data packets | PASS |
 | C19 | §5.7 direction-2 — new RX decodes new TX | mock TX→RX smoke | 8 delivered, `count_p_dec_err == 0` | PASS |
 | C20 | robustness (not in design, protects harness) | mock RX fed malformed input | `count_p_bad >= 3`; subsequent valid packets still delivered | PASS |
 
-Total at last run: **20 test cases passed, 275,706 assertions.**
+Total at last run: **20 test cases passed, 275,717 assertions.**
 
 ## Measured baselines (x86_64 host)
 
