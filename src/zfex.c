@@ -829,6 +829,59 @@ zfex_status_code_t fec_encode_simd(
     return ZFEX_SC_OK;
 }
 
+/*
+ * fec_encode_row_simd — single-parity-row variant of fec_encode_simd.
+ * Inner loop is the i-th iteration of fec_encode_simd's outer loop
+ * with i = fecnum - code->k, so the output byte-equals row
+ * (fecnum - code->k) of the bulk output. See §6 of the
+ * sliding-window FEC design doc and the B1 unit tests in
+ * src/fec_baseline.cpp that assert row-vs-bulk equality.
+ */
+zfex_status_code_t fec_encode_row_simd(
+    fec_t const *code,
+    gf const * ZFEX_RESTRICT const * ZFEX_RESTRICT const inpkts,
+    gf * ZFEX_RESTRICT out,
+    size_t const sz,
+    unsigned int const fecnum)
+{
+    /* Parity-row index must sit strictly in [k, n). */
+    if (fecnum < code->k || fecnum >= code->n)
+    {
+        return ZFEX_SC_BAD_FECNUM;
+    }
+
+    /* Verify input blocks addresses */
+    for (size_t ix = 0; ix < code->k; ++ix)
+    {
+        if (((uintptr_t)inpkts[ix] % ZFEX_SIMD_ALIGNMENT) != 0)
+        {
+            return ZFEX_SC_BAD_INPUT_BLOCK_ALIGNMENT;
+        }
+    }
+
+    /* Verify output block address */
+    if (((uintptr_t)out % ZFEX_SIMD_ALIGNMENT) != 0)
+    {
+        return ZFEX_SC_BAD_OUTPUT_BLOCK_ALIGNMENT;
+    }
+
+    for (size_t k = 0; k < sz; k += ZFEX_STRIDE)
+    {
+        size_t const stride = ((sz - k) < ZFEX_STRIDE) ? (sz - k) : ZFEX_STRIDE;
+
+        memset(out + k, 0, stride);
+
+        gf const *p = &(code->enc_matrix[fecnum * code->k]);
+
+        for (unsigned int j = 0; j < code->k; ++j)
+        {
+            addmul_simd(out + k, inpkts[j] + k, p[j], stride);
+        }
+    }
+
+    return ZFEX_SC_OK;
+}
+
 static zfex_status_code_t
 shuffle(gf const **pkt, unsigned int *index, unsigned int k)
 {

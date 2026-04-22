@@ -1284,6 +1284,197 @@ TEST_CASE("A4 on_packet_loss within uint32_t range still works after widening",
 }
 
 
+// ============================================================================
+// B1 tests — fec_encode_row_simd
+// ============================================================================
+//
+// Phase 2b commit B1 adds a single-parity-row zfex extension so the
+// sliding-window encoder can emit repairs one at a time without the
+// (n - k - 1) rows of wasted work that fec_encode_simd bulk emission
+// would impose. The row API must be byte-for-byte output-equivalent
+// to the bulk API restricted to one row — no caller yet (SwinFecEncoder
+// in B2 is the first user), so these tests are the first and only
+// verification of correctness until B2 lands.
+
+namespace {
+
+// RAII helper sized for zfex-aligned packet buffers. Separate from
+// AlignedBuf (which is sized for MAX_FEC_PAYLOAD) because some of
+// these tests want arbitrary block sizes.
+struct ZfexBuf {
+    uint8_t* ptr;
+    size_t sz;
+    ZfexBuf(size_t n) : ptr(nullptr), sz(n) {
+        int rc = posix_memalign((void**)&ptr, ZFEX_SIMD_ALIGNMENT,
+                                ZFEX_ROUND_UP_SIMD(n));
+        REQUIRE(rc == 0);
+    }
+    ~ZfexBuf() { free(ptr); }
+    ZfexBuf(const ZfexBuf&) = delete;
+    ZfexBuf& operator=(const ZfexBuf&) = delete;
+};
+
+// For each (k, n) in the test matrix, encode via both APIs and assert
+// byte-equality row-by-row.
+void verify_row_equals_bulk(int k, int n, size_t packet_sz) {
+    INFO("k=" << k << " n=" << n << " sz=" << packet_sz);
+
+    fec_t* code = nullptr;
+    REQUIRE(fec_new(k, n, &code) == ZFEX_SC_OK);
+
+    // Build k input packets with deterministic-but-varied content.
+    // Using non-uniform bytes so the parity rows aren't degenerate.
+    std::vector<std::unique_ptr<ZfexBuf>> inputs;
+    for (int i = 0; i < k; i++) {
+        inputs.emplace_back(new ZfexBuf(packet_sz));
+        for (size_t b = 0; b < packet_sz; b++) {
+            inputs[i]->ptr[b] = (uint8_t)((i * 31 + b * 7 + 13) & 0xff);
+        }
+    }
+    std::vector<const uint8_t*> input_ptrs;
+    for (auto& b : inputs) input_ptrs.push_back(b->ptr);
+
+    // Bulk output: n - k parity rows.
+    std::vector<std::unique_ptr<ZfexBuf>> bulk_outs;
+    for (int i = 0; i < n - k; i++) bulk_outs.emplace_back(new ZfexBuf(packet_sz));
+    std::vector<uint8_t*> bulk_ptrs;
+    for (auto& b : bulk_outs) bulk_ptrs.push_back(b->ptr);
+
+    REQUIRE(fec_encode_simd(code,
+                            (const gf* const*)input_ptrs.data(),
+                            (gf* const*)bulk_ptrs.data(),
+                            packet_sz) == ZFEX_SC_OK);
+
+    // Row output: one at a time for each fecnum in [k, n).
+    ZfexBuf row_out(packet_sz);
+    for (int fecnum = k; fecnum < n; fecnum++) {
+        std::memset(row_out.ptr, 0xcc, ZFEX_ROUND_UP_SIMD(packet_sz));
+        REQUIRE(fec_encode_row_simd(code,
+                                    (const gf* const*)input_ptrs.data(),
+                                    (gf*)row_out.ptr,
+                                    packet_sz,
+                                    (unsigned)fecnum) == ZFEX_SC_OK);
+        // Row fecnum corresponds to bulk index fecnum - k.
+        const uint8_t* bulk_row = bulk_outs[fecnum - k]->ptr;
+        for (size_t b = 0; b < packet_sz; b++) {
+            REQUIRE(row_out.ptr[b] == bulk_row[b]);
+        }
+    }
+
+    REQUIRE(fec_free(code) == ZFEX_SC_OK);
+}
+
+}  // namespace
+
+TEST_CASE("B1 fec_encode_row_simd byte-equals bulk row across (k, n, sz)",
+          "[B1][zfex]") {
+    // Matrix per the B1 plan: video (8,12), near-minimum (2,3),
+    // moderate (4,8), and trivial (1,2). Packet sizes span small
+    // MTU-shy and large near-MAX_FEC_PAYLOAD.
+    const size_t sizes[] = {64, 1400, 3996};
+    struct KN { int k, n; };
+    const KN kns[] = { {8, 12}, {2, 3}, {4, 8}, {1, 2} };
+
+    for (auto kn : kns) {
+        for (size_t sz : sizes) {
+            verify_row_equals_bulk(kn.k, kn.n, sz);
+        }
+    }
+}
+
+TEST_CASE("B1 fec_encode_row_simd rejects fecnum out of [k, n)",
+          "[B1][zfex][bad-input]") {
+    fec_t* code = nullptr;
+    REQUIRE(fec_new(8, 12, &code) == ZFEX_SC_OK);
+
+    std::vector<std::unique_ptr<ZfexBuf>> inputs;
+    for (int i = 0; i < 8; i++) {
+        inputs.emplace_back(new ZfexBuf(256));
+        std::memset(inputs[i]->ptr, (uint8_t)i, 256);
+    }
+    std::vector<const uint8_t*> input_ptrs;
+    for (auto& b : inputs) input_ptrs.push_back(b->ptr);
+
+    ZfexBuf out(256);
+
+    // fecnum below k (should reject)
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)input_ptrs.data(),
+                                (gf*)out.ptr, 256, 0)
+            == ZFEX_SC_BAD_FECNUM);
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)input_ptrs.data(),
+                                (gf*)out.ptr, 256, 7)
+            == ZFEX_SC_BAD_FECNUM);
+
+    // fecnum at n (boundary, reject — valid range is [k, n))
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)input_ptrs.data(),
+                                (gf*)out.ptr, 256, 12)
+            == ZFEX_SC_BAD_FECNUM);
+
+    // fecnum well above n
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)input_ptrs.data(),
+                                (gf*)out.ptr, 256, 99)
+            == ZFEX_SC_BAD_FECNUM);
+
+    // Valid boundary fecnum = k should succeed.
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)input_ptrs.data(),
+                                (gf*)out.ptr, 256, 8)
+            == ZFEX_SC_OK);
+
+    // Valid boundary fecnum = n - 1 should succeed.
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)input_ptrs.data(),
+                                (gf*)out.ptr, 256, 11)
+            == ZFEX_SC_OK);
+
+    REQUIRE(fec_free(code) == ZFEX_SC_OK);
+}
+
+TEST_CASE("B1 fec_encode_row_simd rejects misaligned input / output",
+          "[B1][zfex][bad-input]") {
+    fec_t* code = nullptr;
+    REQUIRE(fec_new(4, 8, &code) == ZFEX_SC_OK);
+
+    std::vector<std::unique_ptr<ZfexBuf>> inputs;
+    for (int i = 0; i < 4; i++) {
+        inputs.emplace_back(new ZfexBuf(128));
+        std::memset(inputs[i]->ptr, (uint8_t)(i + 1), 128);
+    }
+    std::vector<const uint8_t*> input_ptrs;
+    for (auto& b : inputs) input_ptrs.push_back(b->ptr);
+
+    ZfexBuf out(128);
+
+    // Valid baseline succeeds first.
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)input_ptrs.data(),
+                                (gf*)out.ptr, 128, 4)
+            == ZFEX_SC_OK);
+
+    // Misaligned input: shift one input pointer by 1 byte.
+    // The aligned buffers are ZFEX_ROUND_UP_SIMD(128) = 128 bytes,
+    // so ptr+1 is within the allocation but unaligned.
+    std::vector<const uint8_t*> bad_input_ptrs(input_ptrs);
+    bad_input_ptrs[2] = bad_input_ptrs[2] + 1;
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)bad_input_ptrs.data(),
+                                (gf*)out.ptr, 128, 4)
+            == ZFEX_SC_BAD_INPUT_BLOCK_ALIGNMENT);
+
+    // Misaligned output.
+    REQUIRE(fec_encode_row_simd(code,
+                                (const gf* const*)input_ptrs.data(),
+                                (gf*)(out.ptr + 1), 128, 4)
+            == ZFEX_SC_BAD_OUTPUT_BLOCK_ALIGNMENT);
+
+    REQUIRE(fec_free(code) == ZFEX_SC_OK);
+}
+
+
 int main(int argc, char* argv[]) {
     if (sodium_init() < 0) {
         fprintf(stderr, "libsodium init failed\n");

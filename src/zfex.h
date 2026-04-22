@@ -59,6 +59,30 @@ zfex_status_code_t fec_encode_simd(
     size_t sz);
 
 /**
+ * Single-parity-row variant of fec_encode_simd, introduced in
+ * Phase 2b commit B1 for the sliding-window FEC encoder (which emits
+ * repairs incrementally, one row per on-air packet, rather than all
+ * n-k rows at once). Byte-for-byte output-equivalent to fec_encode_simd
+ * restricted to one parity row — see §6 of the sliding-window design.
+ *
+ * @param code          fec state from fec_new
+ * @param inpkts        k primary blocks, each ZFEX_SIMD_ALIGNMENT-aligned
+ * @param out           one output block, ZFEX_SIMD_ALIGNMENT-aligned
+ * @param sz            size of a packet in bytes
+ * @param fecnum        parity row index, must be in [k, n)
+ *
+ * @return ZFEX_SC_OK on success; ZFEX_SC_BAD_FECNUM if fecnum is out
+ *         of range; ZFEX_SC_BAD_INPUT_BLOCK_ALIGNMENT /
+ *         ZFEX_SC_BAD_OUTPUT_BLOCK_ALIGNMENT on alignment failure.
+ */
+zfex_status_code_t fec_encode_row_simd(
+    const fec_t* code,
+    const gf* ZFEX_RESTRICT const* ZFEX_RESTRICT const inpkts,
+    gf* ZFEX_RESTRICT out,
+    size_t sz,
+    unsigned int fecnum);
+
+/**
  * @param inpkts an array of packets (size k); If a primary block, i, is present then it must be at index i. Secondary blocks can appear anywhere.
  * @param outpkts an array of buffers into which the reconstructed output packets will be written (only packets which are not present in the inpkts input will be reconstructed and written to outpkts)
  * @param index an array of the blocknums of the packets in inpkts
