@@ -3,7 +3,91 @@
 **Status:** draft for review — Phase 1 (design only, no code)
 **Applies to:** `wfb_tx`, `wfb_rx`, `wfb_rx --agg` (aggregator)
 **Authors:** design proposal
-**Date:** 2026-04-22
+**Date:** 2026-04-22 (revision 2, post external-review triage)
+
+---
+
+## Changes in this revision
+
+Triage of external review findings is at
+`doc/SLIDING_WINDOW_FEC_DESIGN_REVIEW.md`. All changes below trace back to
+an accepted issue in that review.
+
+**API corrections**
+- §2.2 diagram: replaced `rx_ring_push(block_idx)` (no such signature)
+  with `get_block_ring_idx(block_idx)` at [src/rx.cpp:457](../src/rx.cpp#L457)
+  (M1).
+- §6: replaced hand-wavy `fec_encode_simd(code, inpkts[k], fecs[m-k], size)`
+  with the real prototype from
+  [src/zfex.h:55-59](../src/zfex.h#L55-L59); noted stale Doxygen
+  `block_nums`/`num_block_nums` reference does not match the function's
+  signature (M2).
+- §9: widened codec init to take `fec_params_t` carrying
+  `(fec_type, k, n, swin_w, swin_r_num, swin_r_den)` instead of the
+  `(int k, int n)` pair at [src/tx.hpp:79](../src/tx.hpp#L79) /
+  [src/rx.hpp:221](../src/rx.hpp#L221) (H3).
+- §10.1: renamed codec selector from `-C` (collides with `control_port`
+  at [src/tx.cpp:1805-1807](../src/tx.cpp#L1805-L1807)) to long options
+  `--codec`, `--swin-w`, `--swin-r` (H1).
+
+**CPU/memory estimate corrections**
+- §6, §8.2, §8.4: `fec_encode_simd` computes all `(n-k)` parity rows per
+  call ([src/zfex.c:811-827](../src/zfex.c#L811-L827)), not one. Original
+  per-repair cost understated by `(n-k) = ⌈R·W⌉`× (up to 64×). Revised
+  numbers include both the bulk-API fallback cost and the cost with a
+  proposed narrow `fec_encode_row_simd` zfex extension committed to
+  Phase 2a (H2, H4).
+
+**Added integration points**
+- §5.5 / §9: reference the existing `Aggregator::get_tag` helper at
+  [src/rx.cpp:549](../src/rx.cpp#L549) and `tags_item_t` / tag-writer
+  loop at [src/tx.hpp:38-41](../src/tx.hpp#L38-L41) /
+  [src/tx.cpp:173-182](../src/tx.cpp#L173-L182). Design adds two TLV IDs
+  only, not TLV infrastructure (M3).
+- §9: enumerated RX session-parse ordering — `get_tag` must read
+  `TLV_SWIN_WINDOW` / `TLV_SWIN_REPAIR_RATIO` before decoder init at
+  [src/rx.cpp:696](../src/rx.cpp#L696).
+- §10.3: listed [src/rx.cpp:698](../src/rx.cpp#L698) `IPC_MSG`,
+  [wfb_ng/cli.py](../wfb_ng/cli.py), and
+  [wfb_ng/log_parser.py](../wfb_ng/log_parser.py) as update sites —
+  hardcoded `WFB_FEC_VDM_RS` in the SESSION log line must become
+  session-dependent, and W/R fields must be added (M5).
+- §9, §10.3: widened `PacketLossListener::on_packet_loss` at
+  [src/rx.hpp:42](../src/rx.hpp#L42) from `uint32_t` to `uint64_t` to
+  carry 56-bit SWIN `seq_num`; called out as an ABI break (M4).
+- §4, §9: explicit requirement that window/repair ring buffers use
+  `posix_memalign(ZFEX_SIMD_ALIGNMENT, ZFEX_ROUND_UP_SIMD(P))` to
+  satisfy zfex's alignment check at
+  [src/zfex.c:794-809](../src/zfex.c#L794-L809) (M7).
+
+**Clarified error handling / semantics**
+- §5.2: split "56 bits, max 2^55 − 1" into field-width vs. value-bound
+  statements (L5).
+- §5.3, §7.3: one rule for `repair_idx` — counts from 0 per window,
+  independent across windows; removed conflicting wording (M8, M9).
+- §5.5: `fec_k`, `fec_n` in the fixed session header are set to 0
+  (reserved) under SWIN — no "advisory hints" fiction. `W` and `R` live
+  in TLVs only (L7).
+- §10.2: row 4 reframed as `fec_type != configured_codec` reject at
+  [src/rx.cpp:659-664](../src/rx.cpp#L659-L664), not "impl not loaded"
+  (M6).
+- §10.3: `count_p_override`
+  ([src/rx.hpp:210](../src/rx.hpp#L210)) documented as stays-at-zero
+  under SWIN; `count_w_flush` is its SWIN-analogue (L6).
+
+**Wording corrections**
+- §1: fixed "rx_ring of 40 in-flight blocks" citation to point at both
+  [src/rx.hpp:87](../src/rx.hpp#L87) (constant) and
+  [src/rx.hpp:238](../src/rx.hpp#L238) (array) (L2); reworded "non-front
+  side" in failure mode 2 (L3).
+- §2.1: corrected field line range to
+  [src/tx.hpp:95-97](../src/tx.hpp#L95-L97) (L1).
+
+**Scope notes**
+- §5.5: existing host-byte-order `tlv_hdr_t.len` at
+  [src/tx.cpp:180](../src/tx.cpp#L180) /
+  [src/rx.cpp:558-562](../src/rx.cpp#L558-L562) is a pre-existing
+  portability hazard unrelated to SWIN — scoped out, not fixed here (L4).
 
 ---
 
@@ -12,9 +96,12 @@
 wfb-ng currently uses a block-based Reed-Solomon (RS) FEC: the transmitter
 groups `K` source packets into a block, generates `N - K` parity packets with
 `fec_encode_simd`, and emits all `N` on-air before opening the next block.
-The receiver holds an `rx_ring` of 40 in-flight blocks
-([src/rx.hpp:87](../src/rx.hpp#L87)) and decodes each one only after at least
-`K` of its `N` fragments have arrived
+The receiver holds an `rx_ring` of 40 in-flight blocks — see
+`RX_RING_SIZE` constant at
+[src/rx.hpp:87](../src/rx.hpp#L87) and the array declaration
+`rx_ring_item_t rx_ring[RX_RING_SIZE]` at
+[src/rx.hpp:238](../src/rx.hpp#L238) — and decodes each one only after at
+least `K` of its `N` fragments have arrived
 ([src/rx.cpp:795-826](../src/rx.cpp#L795-L826),
 [src/rx.cpp:895](../src/rx.cpp#L895)).
 
@@ -38,11 +125,14 @@ Three failure modes follow directly from the block-and-ring design:
    missing one ([src/rx.cpp:795-856](../src/rx.cpp#L795-L856)).
 2. **Non-front blocks are always held.** A fully-received in-order block
    behind a stalled front block cannot release any fragments until it
-   becomes the front, no matter how long the front is stuck
-   ([src/rx.cpp:795](../src/rx.cpp#L795) condition checks `has_fragments
-   == fec_k` only on the non-front side, and the `send_packet` call at
-   [src/rx.cpp:780](../src/rx.cpp#L780) is gated on `ring_idx ==
-   rx_ring_front`).
+   becomes the front, no matter how long the front is stuck. The
+   `send_packet` call at [src/rx.cpp:780](../src/rx.cpp#L780) is gated on
+   `ring_idx == rx_ring_front`. The `has_fragments == fec_k` branch at
+   [src/rx.cpp:795](../src/rx.cpp#L795) does run for both front and
+   non-front blocks, but on the front block it only fires when the
+   no-gap fast path at [src/rx.cpp:771-791](../src/rx.cpp#L771-L791)
+   could not drain `K` fragments in-order — i.e. exactly when a gap is
+   present.
 3. **Block-boundary burst is structurally unrecoverable.** A loss burst
    that straddles two blocks — leaving each with fewer than `fec_k` good
    fragments — cannot be decoded on either block, because RS decode
@@ -106,7 +196,7 @@ blocks are closed by `fec_timeout`-driven padding packets emitted with flag
 ([src/tx.cpp:694-705](../src/tx.cpp#L694-L705)).
 
 `fec_p`, `fec_k`, `fec_n` are held as private members of `Transmitter`
-([src/tx.hpp:72-95](../src/tx.hpp#L72-L95)); there is no virtual encoder
+([src/tx.hpp:95-97](../src/tx.hpp#L95-L97)); there is no virtual encoder
 abstraction.
 
 ### 2.2 RX path
@@ -120,7 +210,8 @@ pcap frame ─▶ Receiver::loop_iter()          src/rx.cpp:112
                      └─ WFB_PACKET_DATA:
                           │
                           ├─ decrypt, parse nonce        src/rx.cpp:735-753
-                          ├─ rx_ring_push(block_idx)     src/rx.cpp:421
+                          ├─ get_block_ring_idx(block_idx)  src/rx.cpp:457
+                          │     (calls rx_ring_push() at :421 internally)
                           ├─ store fragment              src/rx.cpp:768
                           └─ try release / decode:
                                 ├─ front-block, no-gap:  immediate emit
@@ -230,7 +321,17 @@ Transmitter::send_packet(payload)
 
 Each source packet is emitted the moment it arrives. The encoder maintains
 a ring of the last `W` source payloads (padded to the running max size in
-the window — see §10 on padding amplification). When `repair_due_in`
+the window — see §11 on padding amplification). Every slot in the
+encoder's source ring and the decoder's window-and-repair rings MUST be
+allocated via `posix_memalign(ZFEX_SIMD_ALIGNMENT, ZFEX_ROUND_UP_SIMD(P))`
+— zfex checks alignment at
+[src/zfex.c:794-809](../src/zfex.c#L794-L809) and returns
+`ZFEX_SC_BAD_INPUT_BLOCK_ALIGNMENT` / `ZFEX_SC_BAD_OUTPUT_BLOCK_ALIGNMENT`
+on mismatch, which will trip the existing `assert(rc == ZFEX_SC_OK)`
+pattern at [src/tx.cpp:687](../src/tx.cpp#L687) /
+[src/rx.cpp](../src/rx.cpp) apply_fec. Today's block FEC meets this via
+`posix_memalign` at [src/tx.cpp:135](../src/tx.cpp#L135); the SWIN
+implementation must do the same for every window and repair slot. When `repair_due_in`
 reaches zero, the encoder produces one repair packet by calling
 `fec_encode_simd` over the current window and emits it, then resets the
 counter to `⌈1 / R⌉`. For `R < 1` this naturally spreads repairs across
@@ -322,14 +423,18 @@ data_nonce (big-endian 64-bit):
 ```
 
 - For a **source packet**: `is_repair = 0`, `repair_idx = 0`,
-  `seq_num` = monotonic 56-bit source sequence number. Session
-  rekeys when `seq_num > 2^55 - 1` (same bound as today).
-- For a **repair packet**: `is_repair = 1`, `repair_idx` = the
-  Vandermonde parity-row index used by zfex for this repair
-  (i.e. the i-th parity for the window has `repair_idx = i`;
-  see §5.3). `seq_num` = monotonic 56-bit repair sequence number,
-  in its own namespace independent of the source stream.
-  Session rekeys when either stream's `seq_num` exceeds `2^55 - 1`.
+  `seq_num` is a monotonic source sequence number. The `seq_num` field
+  is 56 bits wide; its value is bounded to `2^55 − 1` by the session-
+  rekey policy (same bound as today at
+  [src/wifibroadcast.hpp:186](../src/wifibroadcast.hpp#L186) /
+  [src/tx.cpp:715-721](../src/tx.cpp#L715-L721), which reserves the top
+  bit for signed-arithmetic safety).
+- For a **repair packet**: `is_repair = 1`, `repair_idx` selects the
+  Vandermonde parity row used by zfex for this repair (see §5.3 for the
+  allocation rule and §6 for the required zfex one-row-encode
+  extension). `seq_num` is a monotonic repair sequence number in its
+  own namespace, bounded identically to `2^55 − 1`. Session rekey fires
+  when either stream's `seq_num` exceeds the bound.
 
 `wblock_hdr_t.packet_type` stays `WFB_PACKET_DATA = 0x1` for both source
 and repair: the RX decoder dispatches by `is_repair`, not by packet type.
@@ -343,12 +448,32 @@ the receiver to know `tail`, the repair packet carries it in the
 `wpacket_hdr_t` header inside the encrypted payload (see §5.4). `W`
 itself is session-scoped and advertised in the session TLV.
 
-The `repair_idx` field selects which Vandermonde parity row zfex uses for
-this repair. Concretely, if the encoder maintains an effective
-systematic RS code of rate `(W, W + ⌈R · W⌉)`, the i-th repair emitted
-for window ending at `tail` uses parity row `W + i (mod ⌈R · W⌉)`. Since
-`R · W ≤ 128` must hold (7-bit `repair_idx` cap), all defaults in §7
-satisfy this.
+`repair_idx` identifies which Vandermonde parity row was used to compute
+this repair. The encoder maintains one logical systematic RS code per
+window of rate `(W, W + ⌈R · W⌉)`; zfex row `W + repair_idx` is the
+coefficient vector.
+
+**Allocation rule (one rule, applies uniformly):** `repair_idx` counts
+from 0 within each window (keyed by `window_tail_seq`). The first repair
+emitted for a given window gets `repair_idx = 0`; the second gets `1`;
+the N-th gets `N - 1`. Two distinct windows allocate `repair_idx`
+independently — window A's `repair_idx = 0` and window B's
+`repair_idx = 0` are unrelated, because their parity rows are computed
+over different source inputs. The decoder therefore keys repair storage
+on `(window_tail_seq, repair_idx)`.
+
+For `R ≤ 1`, only `repair_idx = 0` is emitted per window. For `R > 1`,
+successive repairs for the same window use `0, 1, …, ⌈R⌉ − 1`. The 7-bit
+field bounds the per-window repair count at 128, so `⌈R · W⌉ ≤ 128`
+must hold — all §7 defaults satisfy this.
+
+**Encoder API note:** the existing zfex `fec_encode_simd`
+([src/zfex.h:55-59](../src/zfex.h#L55-L59),
+[src/zfex.c:811-827](../src/zfex.c#L811-L827)) computes *all* `n - k`
+parity rows in one call. Using it as-is to emit a single row wastes
+`(n - k - 1)` rows of work per repair. Phase 2a commits to a narrow
+zfex extension `fec_encode_row_simd(code, inpkts, out, sz, fecnum)`
+that produces one row at a time (see §6 and §8.2 for the cost delta).
 
 ### 5.4 Inner header under `WFB_FEC_SWIN_RS`
 
@@ -381,20 +506,50 @@ for compatibility; bit `0x2` is only set on repair packets.
 ### 5.5 Session TLV for window/ratio negotiation
 
 `wsession_data_t.tags[]` already supports TLV extensions
-([src/wifibroadcast.hpp:229-237](../src/wifibroadcast.hpp#L229-L237)). Two
-new tag IDs:
+([src/wifibroadcast.hpp:229-237](../src/wifibroadcast.hpp#L229-L237)).
+The on-wire TLV infrastructure already exists in both directions:
+
+- TX writes tags via the `std::vector<tags_item_t> tags` constructor
+  argument ([src/tx.hpp:38-41](../src/tx.hpp#L38-L41) defines
+  `tags_item_t`, [src/tx.hpp:112](../src/tx.hpp#L112) holds the member)
+  and the tag-writer loop in `Transmitter::init_session` at
+  [src/tx.cpp:173-182](../src/tx.cpp#L173-L182).
+- RX reads tags via the general helper
+  `Aggregator::get_tag(buf, size, tag_id, value, value_size)` at
+  [src/rx.cpp:549-568](../src/rx.cpp#L549-L568). It is currently marked
+  `cppcheck: unusedFunction` — SWIN is its first consumer.
+
+This design only adds two tag IDs; it does **not** add TLV
+infrastructure.
 
 ```
 TLV_SWIN_WINDOW        0x10   value = uint16 (big-endian) W
 TLV_SWIN_REPAIR_RATIO  0x11   value = uint8 num, uint8 den  (R = num/den)
 ```
 
-- When `fec_type == WFB_FEC_SWIN_RS`, both TLVs are REQUIRED.
-- `fec_k` and `fec_n` in the fixed session header become advisory hints
-  under `WFB_FEC_SWIN_RS`: set `fec_k = W_min_advisory` (e.g. 1) and
-  `fec_n = W + ⌈R · W⌉` so old-format consumers get reasonable buffer
-  sizes before they realize they can't decode. Pragmatically, old RX
-  rejects the session anyway.
+- When `fec_type == WFB_FEC_SWIN_RS`, both TLVs are REQUIRED. If either
+  is absent or malformed, the session is rejected (new
+  `count_p_dec_err++` at the SESSION handler) with the same behavior as
+  today's "Invalid FEC N/K" path at
+  [src/rx.cpp:666-678](../src/rx.cpp#L666-L678).
+- `fec_k` and `fec_n` in the fixed session header are **reserved under
+  SWIN** and MUST be set to `0`. The advisory-hint interpretation in a
+  prior draft was fiction — no consumer actually used it (old RX
+  rejects on `fec_type` at
+  [src/rx.cpp:659-664](../src/rx.cpp#L659-L664) before reading `k`/`n`;
+  new RX reads W/R from TLVs, not from the fixed header).
+
+**Out of scope — pre-existing `tlv_hdr_t.len` portability hazard.** The
+existing TX path writes `tlv->len = it->value.size()` in *host* byte
+order at [src/tx.cpp:180](../src/tx.cpp#L180), and the existing RX path
+reads `p->len` without byteswap at
+[src/rx.cpp:558-562](../src/rx.cpp#L558-L562). On all current targets
+(arm32v7, arm64v8, amd64) the host is little-endian, so this works
+accidentally. SWIN inherits this hazard for the new TLV `len` field;
+fixing it would change the session packet wire format for *all* TLV
+users and is outside this design. Filed as a separate issue for Phase 2
+plumbing. The *value* payloads of both new TLVs are defined in big
+(network) byte order as stated above.
 
 ### 5.6 Nonce-uniqueness proof
 
@@ -436,23 +591,59 @@ is the AEAD nonce-uniqueness requirement.
 
 ## 6. Coding scheme choice
 
-**Selected: Reed-Solomon over a sliding window, reusing zfex.**
+**Selected: Reed-Solomon over a sliding window, reusing zfex with a
+narrow encode-one-row extension.**
 
 zfex provides a systematic MDS RS code over GF(2^8) via Vandermonde
-matrix ([src/zfex.h](../src/zfex.h)). `fec_encode_simd(code, inpkts[k],
-fecs[m-k], size)` encodes all `m - k` parities in one bulk call; it is
-SIMD-accelerated via NEON (ARM, `vqtbl1q_u8`) and SSSE3 (x86,
-`_mm_shuffle_epi8`) in [src/zfex.c:196-265](../src/zfex.c#L196-L265).
+matrix ([src/zfex.h](../src/zfex.h)). The real encode prototype is:
+
+```c
+// src/zfex.h:55-59
+zfex_status_code_t fec_encode_simd(
+    const fec_t* code,
+    const gf* ZFEX_RESTRICT const* ZFEX_RESTRICT const inpkts,
+    gf* ZFEX_RESTRICT const* ZFEX_RESTRICT const fecs,
+    size_t sz);
+```
+
+Note that the Doxygen block at
+[src/zfex.h:46-53](../src/zfex.h#L46-L53) refers to `block_nums` and
+`num_block_nums` parameters — these do **not** exist on this function
+and the comment is stale. Sizes come from `code->k` and `code->n`. The
+implementation body at
+[src/zfex.c:811-827](../src/zfex.c#L811-L827) loops over all
+`(code->n - code->k)` parity rows unconditionally and writes each into
+`fecs[i]`. Kernels are SIMD-accelerated via NEON (`vqtbl1q_u8`) and
+SSSE3 (`_mm_shuffle_epi8`) at
+[src/zfex.c:196-265](../src/zfex.c#L196-L265).
+
 `fec_decode_simd` performs a `k × k` Vandermonde-submatrix inversion and
 back-substitution to recover missing positions.
 
-Under the sliding-window design, *each repair packet is a single row of a
-systematic `(W, W + ⌈R · W⌉)` RS encoding*. zfex is called once per
-repair with `k = W` source pointers and writes `m - k = ⌈R · W⌉` parity
-packets — of which the TX uses only the one corresponding to the current
-`repair_idx`. (For implementations that only ever need one parity at a
-time, a future optimization can narrow the zfex call; Phase 1 uses the
-bulk API and discards unused rows.)
+Under the sliding-window design, each repair packet corresponds to a
+single Vandermonde parity row of a systematic `(W, W + ⌈R · W⌉)` code.
+The bulk API as it stands forces the encoder either to call
+`fec_encode_simd` once per repair and discard `⌈R · W⌉ − 1` unused rows
+(wasteful — see §8.2 for the cost), or to amortize one call across
+`⌈R · W⌉` repairs of the *same* window (which clusters repairs in time
+and loses the spread-in-time property that makes sliding window work).
+
+**Phase 2a scope commits to adding a narrow zfex extension:**
+
+```c
+// Proposed addition in src/zfex.h
+zfex_status_code_t fec_encode_row_simd(
+    const fec_t* code,
+    const gf* ZFEX_RESTRICT const* ZFEX_RESTRICT const inpkts,
+    gf* ZFEX_RESTRICT out,
+    size_t sz,
+    unsigned int fecnum);   // which parity row; must be in [k, n)
+```
+
+Body is ~15 lines — a trimmed version of the inner loop at
+[src/zfex.c:815-826](../src/zfex.c#L815-L826) with `i` fixed to
+`fecnum - code->k`. This brings per-repair encode cost down by a factor
+of `(n - k) = ⌈R · W⌉` vs the bulk-discard fallback. §8.2 reports both.
 
 ### Rejected alternatives
 
@@ -521,14 +712,27 @@ defaults satisfy this with headroom.
 
 ### 7.3 Emission schedule (Phase 1: proactive only)
 
-- Maintain a counter `repair_due_in` initialized to `⌈1 / R⌉` (ceiling
-  for `R < 1`; for `R ≥ 1`, emit `⌈R⌉` repairs per source, see below).
+For `R ≤ 1`:
+
+- Maintain a counter `repair_due_in` initialized to `⌈1 / R⌉`.
 - On every source packet: decrement.
-- On reaching 0: emit one repair over the current window, set counter
-  back to `⌈1 / R⌉`.
-- For `R ≥ 1`: on every source packet, emit `⌈R⌉` repairs
-  (repair_idx = 0, 1, ...). For `R = 1.0` (mavlink, tunnel), that's
-  exactly one repair per source.
+- On reaching 0: emit one repair (with `repair_idx = 0`, per the §5.3
+  allocation rule) covering the current window, reset counter to
+  `⌈1 / R⌉`.
+
+For `R > 1`:
+
+- On every source packet, emit `⌈R⌉` repairs covering the current
+  window. The first uses `repair_idx = 0`, the second `repair_idx = 1`,
+  up to `repair_idx = ⌈R⌉ − 1`. Each successive source advances the
+  window (i.e. the next source's repairs cover a new window with its
+  own `window_tail_seq` and its own `repair_idx` starting again at 0).
+- At the recommended defaults `R = 1.0` (mavlink, tunnel), this reduces
+  to exactly one repair per source with `repair_idx = 0`.
+
+Per §5.3: each window allocates `repair_idx` independently from zero.
+The stream-wide "mod `⌈R · W⌉`" rotation that an earlier draft
+proposed is not used.
 
 No RX→TX feedback. A feedback-driven policy is out of scope for Phase 1
 because it requires a back channel that asymmetric drone links don't
@@ -602,8 +806,9 @@ large payloads.
 ### 8.2 Encode CPU (per repair)
 
 zfex's inner loop processes 16 bytes per vector iteration: one 16-byte
-GF(2^8) table lookup (split-nibble) + XOR into destination + load/store.
-Per-platform cost per vector iteration `t_vec`:
+GF(2^8) table lookup (split-nibble) + XOR into destination + load/store
+([src/zfex.c:196-265](../src/zfex.c#L196-L265)). Per-platform cost per
+vector iteration `t_vec`:
 
 | Platform                         | `t_vec` (est.) |
 |----------------------------------|:--------------:|
@@ -611,7 +816,11 @@ Per-platform cost per vector iteration `t_vec`:
 | NanoPi NEO-class (Cortex-A7 @ 1 GHz, 64-bit NEON) | ~5–6 ns |
 | amd64 GCS (Skylake+ @ 3 GHz, SSSE3)            | ~0.4 ns |
 
-Per-repair cost ≈ `W · ⌈P / 16⌉ · t_vec`. Examples:
+**Two numbers matter**, depending on whether the Phase-2a zfex extension
+lands or not.
+
+**With `fec_encode_row_simd` (§6, recommended path).** One parity row
+only: cost per repair ≈ `W · ⌈P / 16⌉ · t_vec`.
 
 | Platform       | W=64, P=1400 | W=64, P=3996 | W=128, P=1400 | W=128, P=3996 |
 |----------------|:------------:|:------------:|:-------------:|:-------------:|
@@ -619,18 +828,41 @@ Per-repair cost ≈ `W · ⌈P / 16⌉ · t_vec`. Examples:
 | NanoPi NEO A7  | ~30 µs       | ~85 µs       | ~60 µs        | ~170 µs       |
 | amd64 GCS      | ~2.2 µs      | ~6.4 µs      | ~4.5 µs       | ~13 µs        |
 
-As a percentage of one core at 1080p30 video load (source 300 pps, repair
-100 pps at R=1/3):
+**Without the extension — bulk `fec_encode_simd`, discard
+`(n - k - 1)` rows.** The inner loop at
+[src/zfex.c:815-826](../src/zfex.c#L815-L826) runs `(n - k) = ⌈R · W⌉`
+times per call. Cost per repair ≈ `⌈R · W⌉ · W · ⌈P / 16⌉ · t_vec`:
+
+| Platform       | W=64 R=0.5, P=1400 | W=64 R=0.5, P=3996 | W=128 R=0.5, P=1400 | W=128 R=0.5, P=3996 |
+|----------------|:------------------:|:------------------:|:-------------------:|:-------------------:|
+| RPi Zero 2W    | ~450 µs            | ~1.3 ms            | ~1.8 ms             | ~5.2 ms             |
+| NanoPi NEO A7  | ~960 µs            | ~2.7 ms            | ~3.8 ms             | ~11 ms              |
+| amd64 GCS      | ~70 µs             | ~205 µs            | ~290 µs             | ~830 µs             |
+
+As a percentage of one core at 1080p30 video load (source 300 pps,
+repair 150 pps at R=0.5), **with the extension**:
 
 | Platform       | W=32   | W=64   | W=128  |
 |----------------|:------:|:------:|:------:|
-| RPi Zero 2W    | 0.07%  | 0.14%  | 0.28%  |
-| NanoPi NEO A7  | 0.15%  | 0.30%  | 0.60%  |
-| amd64 GCS      | 0.011% | 0.022% | 0.045% |
+| RPi Zero 2W    | 0.10%  | 0.21%  | 0.42%  |
+| NanoPi NEO A7  | 0.22%  | 0.45%  | 0.90%  |
+| amd64 GCS      | 0.016% | 0.033% | 0.067% |
 
-At R=0.5 (150 pps repair), multiply by 1.5. Worst-case 3996 B payload:
-multiply by ~2.85. Even the worst corner (RPi Zero 2W, W=128, P=3996,
-R=0.5) is **< 1.2% of one core**. Encode is not the binding cost.
+Same workload **without the extension** (bulk-discard path):
+
+| Platform       | W=32   | W=64   | W=128  |
+|----------------|:------:|:------:|:------:|
+| RPi Zero 2W    | 1.7%   | 6.8%   | 27%    |
+| NanoPi NEO A7  | 3.6%   | 14%    | 58%    |
+| amd64 GCS      | 0.26%  | 1.0%   | 4.3%   |
+
+The bulk-discard path is **unacceptable at W=128 R=0.5 on RPi Zero 2W**
+and tight at W=64. This is why Phase 2a commits to the zfex extension
+rather than deferring it. Until the extension lands, W must stay ≤ 64
+for RPi Zero 2W and the encode path is the single largest incremental
+CPU cost of SWIN.
+
+Worst-case 3996 B payload: multiply column values by ~2.85.
 
 ### 8.3 Decode CPU (per gap-recovery event)
 
@@ -657,20 +889,26 @@ aggregate.
 
 ### 8.4 RPi Zero 2W sanity check
 
-Budget for 1080p30 @ ~3 Mbps video, W=64, R=1/3:
+Budget for 1080p30 @ ~3 Mbps video, W=64, R=1/3, **assuming Phase-2a
+`fec_encode_row_simd` extension is in place**:
 
 | Cost                                          | Value                 |
 |-----------------------------------------------|:---------------------:|
 | Source pps                                    | ~300                  |
 | Repair pps                                    | ~100                  |
-| Encode: 100 repairs/s × 14 µs                 | 1.4 ms/s = **0.14%** |
+| Encode: 100 repairs/s × 14 µs (one-row API)   | 1.4 ms/s = **0.14%** |
 | Decode: 5% loss → g≈3, 4 events/s × 42 µs     | 0.17 ms/s = **0.02%** |
 | AEAD (chacha20poly1305, +100 pps × 1400 B)    | ~0.12 ms/s = **0.12%** |
 | **Total extra vs today**                      | **< 0.5% one A53 core** |
 
+Without the extension (bulk-discard fallback) the encode line becomes
+`100 · ⌈R·W⌉ · 14 µs = 100 · 22 · 14 µs ≈ 31 ms/s = 3.1%` at R=1/3. Still
+affordable at this R, but it becomes the dominant FEC cost and
+motivates the extension.
+
 The Zero 2W has 4 A53 cores. The existing wfb-rx process pins to one.
 Binding bottleneck today is pcap capture and kernel packet handling —
-sliding-window FEC does not make that worse.
+sliding-window FEC does not make that worse under either API.
 
 ---
 
@@ -678,27 +916,102 @@ sliding-window FEC does not make that worse.
 
 Today `Transmitter` ([src/tx.hpp:72](../src/tx.hpp#L72)) and `Aggregator`
 ([src/rx.hpp:169](../src/rx.hpp#L169)) both hold `fec_p`, `fec_k`,
-`fec_n` as direct members and inline the FEC calls. The block-FEC
-implementation is tightly coupled to these classes. Adding a second
-codec behind an `if (fec_type == …)` branch scattered across tx.cpp and
-rx.cpp would degrade both paths and ruin reviewability.
+`fec_n` as direct members
+([src/tx.hpp:95-97](../src/tx.hpp#L95-L97),
+[src/rx.hpp:232-234](../src/rx.hpp#L232-L234)) and inline the FEC calls
+at [src/tx.cpp:686](../src/tx.cpp#L686) and
+[src/rx.cpp:895](../src/rx.cpp#L895). The block-FEC implementation is
+tightly coupled to these classes. Adding a second codec behind an
+`if (fec_type == …)` branch scattered across tx.cpp and rx.cpp would
+degrade both paths and ruin reviewability.
 
-**Recommended minimal interface** (to be implemented in Phase 2):
+### 9.1 Parameter carrier
+
+The current init signatures
+`Transmitter::init_session(int k, int n)`
+([src/tx.hpp:79](../src/tx.hpp#L79),
+[src/tx.cpp:113](../src/tx.cpp#L113)) and
+`Aggregator::init_fec(int k, int n)`
+([src/rx.hpp:221](../src/rx.hpp#L221),
+[src/rx.cpp:306](../src/rx.cpp#L306), called at
+[src/rx.cpp:696](../src/rx.cpp#L696)) carry only `(k, n)`. Constructors
+for all three `Transmitter` subclasses
+([src/tx.hpp:159](../src/tx.hpp#L159),
+[src/tx.hpp:208](../src/tx.hpp#L208),
+[src/tx.hpp:312](../src/tx.hpp#L312)) likewise thread `(k, n)` down to
+the base. To carry W, R cleanly, introduce:
 
 ```c++
 // src/fec_iface.hpp (new)
 
+struct fec_params_t {
+    uint8_t  fec_type;      // WFB_FEC_VDM_RS or WFB_FEC_SWIN_RS
+    // VDM_RS only (0 under SWIN):
+    int      k;
+    int      n;
+    // SWIN_RS only (0 under VDM):
+    uint16_t swin_w;        // W, from TLV_SWIN_WINDOW
+    uint8_t  swin_r_num;    // R numerator, from TLV_SWIN_REPAIR_RATIO
+    uint8_t  swin_r_den;    // R denominator, from TLV_SWIN_REPAIR_RATIO
+};
+```
+
+Widen the init entry points to take `const fec_params_t&`:
+
+```c++
+void Transmitter::init_session(const fec_params_t& params);
+void Aggregator::init_fec(const fec_params_t& params);
+```
+
+The three `Transmitter` subclass constructors and the
+`wfb_tx`/`wfb_rx` `getopt` plumbing in
+[wfb_ng/services.py:106](../wfb_ng/services.py#L106) take the same
+struct (populated from either `-k/-n` under block, or
+`--swin-w/--swin-r` under SWIN — see §10.1).
+
+### 9.2 RX session-parse ordering
+
+Under the new scheme, the RX path at
+[src/rx.cpp:645-700](../src/rx.cpp#L645-L700) must extract W, R from the
+session packet TLVs **before** calling `init_fec`. The helper
+`Aggregator::get_tag` at
+[src/rx.cpp:549-568](../src/rx.cpp#L549-L568) is reused. Revised
+order:
+
+1. Decrypt session packet (existing
+   [src/rx.cpp:632-641](../src/rx.cpp#L632-L641)).
+2. Validate `epoch`, `channel_id` (existing
+   [src/rx.cpp:645-657](../src/rx.cpp#L645-L657)).
+3. Validate `fec_type` against `configured_codec` (§10.2; moved check
+   still at [src/rx.cpp:659-664](../src/rx.cpp#L659-L664)).
+4. If `fec_type == WFB_FEC_VDM_RS`: validate `k, n` bounds (existing
+   [src/rx.cpp:666-678](../src/rx.cpp#L666-L678)), populate
+   `fec_params_t` from fixed header.
+5. If `fec_type == WFB_FEC_SWIN_RS`: validate `k == 0 && n == 0`
+   (reserved, §5.5); call `get_tag(tag_region, size, TLV_SWIN_WINDOW,
+   &w_be, 2)` and `get_tag(..., TLV_SWIN_REPAIR_RATIO, &r_bytes, 2)`;
+   validate `W, R` bounds (`W ≥ 1`, `R · W ≤ 128`); populate
+   `fec_params_t`.
+6. If `memcmp(session_key, new_session_data->session_key) != 0`
+   ([src/rx.cpp:686](../src/rx.cpp#L686)), call the decoder-factory
+   (§9.3) with `fec_params_t`.
+
+### 9.3 Encoder / decoder interfaces
+
+```c++
 class IFecEncoder {
 public:
     virtual ~IFecEncoder() = default;
 
     // Called for every source packet from the app. Updates window state.
     // The encoder does NOT emit the source packet — Transmitter does that.
+    // payload buffer must be ZFEX_SIMD_ALIGNMENT-aligned.
     virtual void on_source_packet(uint64_t seq, const uint8_t* payload, size_t sz) = 0;
 
     // Emit the next repair packet if one is due. Returns false if not due.
-    // If true: out buffer holds repair payload of size *sz_out;
-    // nonce_out holds the 64-bit big-endian nonce to put into wblock_hdr_t.
+    // If true: out buffer (caller-provided, ZFEX_SIMD_ALIGNMENT-aligned,
+    // ZFEX_ROUND_UP_SIMD-padded) holds repair payload of size *sz_out;
+    // nonce_out holds the 64-bit big-endian data_nonce per §5.2.
     virtual bool next_repair(uint8_t* out, size_t* sz_out, uint64_t* nonce_out) = 0;
 };
 
@@ -707,7 +1020,9 @@ public:
     virtual ~IFecDecoder() = default;
 
     virtual void on_source_packet(uint64_t seq, const uint8_t* payload, size_t sz) = 0;
-    virtual void on_repair_packet(uint64_t repair_nonce, uint64_t window_tail_seq,
+    virtual void on_repair_packet(uint64_t repair_nonce,
+                                  uint64_t window_tail_seq,
+                                  uint8_t repair_idx,
                                   const uint8_t* payload, size_t sz) = 0;
 
     // Drain any source packets (received or recovered) ready for the socket,
@@ -717,18 +1032,48 @@ public:
     // Called every ~10 ms from the event loop to advance wall-clock flush.
     virtual void tick(uint64_t now_ms) = 0;
 };
+
+std::unique_ptr<IFecEncoder> make_encoder(const fec_params_t&);
+std::unique_ptr<IFecDecoder> make_decoder(const fec_params_t&,
+                                          PacketLossListener* loss_listener);
 ```
 
 Two implementations under `src/fec_block.{cpp,hpp}` and
 `src/fec_swin.{cpp,hpp}`. `Transmitter` owns `std::unique_ptr<IFecEncoder>`,
-`Aggregator` owns `std::unique_ptr<IFecDecoder>`, each initialized in the
-existing `init_session` / `init_fec` call sites based on `fec_type`.
+`Aggregator` owns `std::unique_ptr<IFecDecoder>`. Every buffer exchanged
+across these interfaces MUST satisfy zfex's alignment contract at
+[src/zfex.c:794-809](../src/zfex.c#L794-L809) —
+`posix_memalign(ZFEX_SIMD_ALIGNMENT, ZFEX_ROUND_UP_SIMD(max_size))` as
+today's block path does at [src/tx.cpp:135](../src/tx.cpp#L135).
 
 This keeps the tx / rx pipelines fec-type-agnostic: `Transmitter`
 always emits each source immediately and then drains `next_repair()`
 until it returns false; `Aggregator` always routes each data packet
 based on `is_repair` and then drains `pop_ready()`. The two codecs never
 share state.
+
+### 9.4 `PacketLossListener` widening (ABI break)
+
+The current listener signature at
+[src/rx.hpp:42](../src/rx.hpp#L42) is:
+
+```c++
+virtual void on_packet_loss(uint32_t lost_count,
+                            uint32_t last_seq, uint32_t new_seq) = 0;
+```
+
+Under block FEC today, `packet_seq = block_idx * fec_k + fragment_idx`
+is computed and cast to `uint32_t` at
+[src/rx.cpp:865](../src/rx.cpp#L865). Under SWIN, `seq_num` is
+56 bits — truncation to `uint32_t` wraps every ~71 minutes at 1000 pps
+and silently corrupts gap counts.
+
+**Fix**: widen the signature to
+`on_packet_loss(uint32_t lost_count, uint64_t last_seq, uint64_t new_seq)`.
+This is a source-compat break for any external binding (Python wfb_ng,
+cluster-mode consumers). Phase 2a must walk all implementers — the
+only in-tree implementer is the Python-bound listener path through
+`AggregatorUDPv4` / `AggregatorUNIX` — and update them.
 
 ---
 
@@ -749,33 +1094,59 @@ swin_r   = 0.5     # sliding only; ignored under 'block'
 ```
 
 Wired through [wfb_ng/services.py:106](../wfb_ng/services.py#L106) to new
-flags on the C++ binaries:
+flags on the C++ binaries.
 
-- `wfb_tx -C block` (default) or `-C sliding -W 64 -R 0.5`
-- `wfb_rx -C block` (default) or `-C sliding` (W and R are learned from
-  the session TLV).
+**Short flag `-C` is already taken** by `wfb_tx` for `control_port` at
+[src/tx.cpp:1805-1807](../src/tx.cpp#L1805-L1807), and
+`services.py:107` already passes it. The codec selector and SWIN
+parameters are added as **long options only** to sidestep the collision
+and to avoid competing for the few remaining short letters in the
+`wfb_tx` getopt string at
+[src/tx.cpp:1700](../src/tx.cpp#L1700):
 
-Block remains the default; `fec_type = sliding` is opt-in.
+- `wfb_tx --codec=block` (default) or
+  `wfb_tx --codec=sliding --swin-w=64 --swin-r=1/2`
+- `wfb_rx --codec=block` (default) or
+  `wfb_rx --codec=sliding` (W and R are learned from the session
+  TLV, so the RX side does not need `--swin-w`/`--swin-r`, but they
+  may be accepted as overrides for diagnostic use).
+
+Implementation note: `wfb_tx`'s current `getopt(…)` call would extend
+to `getopt_long(…)`; `wfb_rx`'s `getopt(…)` at
+[src/rx.cpp:1151](../src/rx.cpp#L1151) does the same. All existing
+short options stay byte-for-byte identical.
+
+Block remains the default; `fec_type = sliding` is opt-in per stream
+profile.
 
 ### 10.2 Mixed-version fleet behavior
 
-| TX           | RX           | Behavior                                      |
-|--------------|--------------|-----------------------------------------------|
-| block (old)  | block (new)  | Works (new RX handles old fec_type)           |
-| block (new)  | block (old)  | Works (wire-compatible, no change)            |
-| sliding (new)| block (old)  | Fail-closed: old RX drops session at [src/rx.cpp:659-664](../src/rx.cpp#L659-L664) |
-| sliding (new)| block (new)  | Fail-closed same way (new RX configured for block decoder doesn't have sliding impl loaded) |
-| sliding (new)| sliding (new)| Works                                         |
-| block (new)  | sliding (new)| Fail-closed (sliding RX rejects `fec_type=VDM_RS` — SAME guard, mirrored) |
+Under the §9 refactor both codecs are compiled into every binary. The
+reject at [src/rx.cpp:659-664](../src/rx.cpp#L659-L664) therefore
+changes from a hardcoded `fec_type != WFB_FEC_VDM_RS` check to a
+**configured-codec mismatch** check: `fec_type != configured_codec`,
+where `configured_codec` comes from `--codec=` at RX startup. Same
+file:line, same fail-closed behavior, but it is a policy decision, not
+a compile-time capability.
 
-The last row is new: a sliding-configured RX should apply the same
-fail-closed guard against `fec_type != WFB_FEC_SWIN_RS` for safety
-symmetry. An operator who selects sliding on RX and block on TX sees
-their mistake via climbing `count_p_dec_err`.
+| TX           | RX config | Behavior                                      |
+|--------------|-----------|-----------------------------------------------|
+| block (old)  | block     | Works (new RX handles old `fec_type=VDM_RS`)  |
+| block (new)  | block     | Works (wire-compatible, no change)            |
+| sliding (new)| block     | **Fail-closed**: RX rejects session at `fec_type != configured_codec` |
+| sliding (new)| sliding   | Works                                         |
+| block (new)  | sliding   | **Fail-closed**: same guard, symmetric        |
+| sliding (new)| old RX    | **Fail-closed**: old RX hardcodes `fec_type != WFB_FEC_VDM_RS` → same path |
+
+In all fail-closed cases the session is never accepted, the session key
+is never updated, and subsequent data packets fail AEAD — operator
+visibility is via rising `count_p_dec_err`. No corruption, no partial
+delivery.
 
 ### 10.3 Stat compatibility
 
-Existing RX counters keep their semantics:
+Existing RX counters keep their semantics where they make sense;
+three need explicit attention under SWIN.
 
 - `count_p_uniq` ([src/rx.hpp:206](../src/rx.hpp#L206),
   [src/rx.cpp:738](../src/rx.cpp#L738)) keys off the full 8-byte
@@ -788,18 +1159,192 @@ Existing RX counters keep their semantics:
 - `count_p_lost` is inferred from gaps in the delivered `seq_num`
   sequence at socket output. With sliding window, losses are counted
   when `T_flush` expires on an unrecovered window slot.
-- A new counter `count_w_flush` tallies windows flushed with ≥ 1
-  unrecovered gap, useful for link-quality estimation.
+- **`count_p_override`** ([src/rx.hpp:210](../src/rx.hpp#L210),
+  incremented at [src/rx.cpp:440](../src/rx.cpp#L440)) counts block-FEC
+  ring overflows. Under SWIN there is no ring overflow by construction
+  (the window is fixed-size and slots are retired by age, not by
+  pressure). `count_p_override` therefore stays at 0 under SWIN and
+  `log_parser.py` consumers must treat 0 under SWIN as "N/A", not "no
+  overflow". `count_w_flush` (new, per below) is the SWIN analogue.
+- **New counter `count_w_flush`** tallies windows retired with ≥ 1
+  unrecovered gap at `T_flush` expiry. Useful for link-quality
+  estimation. Added to `dump_stats` at
+  [src/rx.cpp:501-509](../src/rx.cpp#L501-L509) alongside existing
+  counters.
 
-`log_parser.py` ([wfb_ng/log_parser.py](../wfb_ng/log_parser.py))
-continues to work; only new fields are added, existing fields keep
-semantics.
+### 10.3.1 SESSION log line and its downstream parsers
+
+The existing SESSION log emission at
+[src/rx.cpp:698](../src/rx.cpp#L698):
+
+```c
+IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n",
+        get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
+```
+
+hardcodes `WFB_FEC_VDM_RS`. Under SWIN this must become:
+
+```c
+IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u/%u\n",
+        get_time_ms(), epoch, params.fec_type,
+        params.k, params.n,
+        params.swin_w, params.swin_r_num, params.swin_r_den);
+```
+
+The two extra fields are always emitted (written as `0:0/0` under
+block), so the log format is forward-compatible for parsers that
+expect a fixed field count.
+
+**Downstream update sites**:
+
+- [wfb_ng/cli.py](../wfb_ng/cli.py): currently formats the SESSION line
+  as `'{FEC:} %(fec_k)d/%(fec_n)d'`. Update to branch on `fec_type` and
+  render `SWIN W=%d R=%d/%d` under `WFB_FEC_SWIN_RS`.
+- [wfb_ng/log_parser.py](../wfb_ng/log_parser.py): extend the SESSION
+  line parser to read the two new trailing fields. Existing fixed-field
+  consumers (e.g. mavlink log parsing) are unaffected — only the
+  SESSION record grows.
+
+Both files are in-tree; no external parser ABI is broken by adding
+fields at the tail. The only break is the IPC_MSG format string growth
+itself; any out-of-tree log consumer that parses the SESSION line
+strictly will need to tolerate the extra fields.
+
+### 10.3.2 PacketLossListener ABI break
+
+See §9.4. The `on_packet_loss` signature widens from three `uint32_t`
+args to `(uint32_t, uint64_t, uint64_t)`. In-tree implementers in
+`wfb_ng/` are updated in Phase 2a.
 
 ---
 
-## 11. Risks and open questions
+## 11. Migration trade-offs
 
-### 11.1 Known risks (must be surfaced in implementation PRs)
+This section is the one-page answer to "should we flip the switch?" It
+summarizes what an operator gains, what it costs, and when block FEC is
+still the right choice.
+
+### 11.1 Pros (reasons to migrate)
+
+- **Gap-handling decouples from block boundaries.** A missing packet at
+  `seq N` stalls only `N` until it is recovered or `T_flush` expires; it
+  does not hold `N + 1`, `N + 2`, or any later-block packets already
+  received. Block FEC stalls all of them until the gap fills or FEC
+  decodes (§1 failure modes 1 and 2). On a noisy link this is the visible
+  win.
+- **Burst loss straddling a block boundary is recoverable.** A burst of
+  length `B` that leaves two adjacent blocks each with `≥ fec_k - B/2 + 1`
+  fragments missing is unrecoverable under block FEC but recoverable
+  under a single window as long as `W ≥ B` and `⌈R · W⌉ ≥ B` (§1 failure
+  mode 3, §7.2).
+- **Lower RX memory footprint** at recommended defaults: ~750 KiB worst
+  case for video vs ~1.83 MiB today (§8.1).
+- **Wire format unchanged byte-for-byte.** Same 9-byte `wblock_hdr_t`,
+  same crypto primitive, same MTU, same session-key protocol. Only the
+  `fec_type` byte in the session packet and the internal interpretation
+  of `data_nonce` change (§5).
+- **Fail-closed rollout.** Mixed-version fleets never corrupt or
+  mis-decode: old RX drops new-TX sessions at
+  [src/rx.cpp:659-664](../src/rx.cpp#L659-L664), new RX configured for a
+  different codec applies the same guard symmetrically (§5.7, §10.2).
+  Rollback is a config flip.
+- **Reuses existing zfex.** No new dependency, no license review, no new
+  SIMD tuning work; NEON and SSSE3 kernels are already in place.
+- **Deterministic MDS recovery.** Any `W` of `W + ⌈R · W⌉` packets
+  reconstructs the window. No probability tables, no failure-rate tails.
+- **CPU budget is not a constraint.** < 1% of one A53 core on the binding
+  platform (RPi Zero 2W) at 1080p30 video (§8.4).
+- **Per-profile, per-session opt-in.** Video can go sliding while mavlink
+  stays block, or vice versa. No all-or-nothing switchover.
+
+### 11.2 Cons (reasons to hold or stay on block)
+
+- **Padding amplification is larger.** Block FEC pads within `K`;
+  sliding window pads within `W`, which is ~8× larger at recommended
+  defaults. A single 1400-B outlier in a window of 64 small packets
+  produces `⌈R · W⌉` repair packets sized to the outlier. For streams
+  with highly bursty packet sizes (some tunnel workloads), this can
+  *waste on-air bandwidth* compared to block FEC. Mitigation exists
+  (`repair_max_payload`, §12.1) but costs recovery coverage of those
+  large packets.
+- **Higher per-decode CPU cost.** ~56 µs per decode event at W=64 g=4 vs
+  ~7 µs per block decode at `(k=8, n=12)` (§8.3). Events are rarer, so
+  aggregate is similar, but a bursty loss pattern can produce decode
+  spikes.
+- **Recovery latency is window-scoped, not block-scoped.** Under block
+  FEC a small gap might be decoded as soon as the current block closes
+  (`N / pps` ms worst case). Under sliding window the same gap waits
+  for enough in-window repairs to arrive, bounded by `T_flush` (100 ms
+  video). For isolated single-packet loss on a low-jitter link, block
+  FEC's recovery can be faster in absolute ms. The sliding win shows up
+  only once losses are bursty or back-to-back — which is exactly when
+  you care.
+- **More decoder state to reason about.** `W`-slot window + repair store
+  + background flush ticker + per-window tail tracking vs today's
+  ring-of-blocks. Debugging traces and log semantics change.
+- **`fec_delay` and the `fec_timeout` padding path become vestigial**
+  under sliding (§12.1, §11.3). Operators who inherit tuned configs
+  must know which knobs still apply; support surface grows.
+- **Late repairs are discarded silently** after `T_flush` (§12.1). This
+  is a policy choice, not a bug, but it surprises operators the first
+  time they see it in a trace.
+- **Implementation debt: the abstraction refactor.** Introducing
+  `IFecEncoder` / `IFecDecoder` (§9) touches the hot path in
+  [src/tx.cpp](../src/tx.cpp) and [src/rx.cpp](../src/rx.cpp). Even
+  though the block path is semantically preserved, any refactor through
+  the hot path carries regression risk on the codec operators already
+  rely on.
+- **zfex has no incremental encode**, so every repair re-encodes its
+  full `W`-source window. CPU is fine (§8.2), but this is wasteful on
+  paper and makes a bad impression on hardcore network-coding reviewers.
+  Lifting it is a Phase-3 zfex extension, not in scope here.
+- **Wire-trace interpretation branches on `fec_type`.** Packet-capture
+  tooling that decodes `wblock_hdr_t` must know the session's
+  `fec_type` to interpret `data_nonce` correctly. Existing tooling
+  assumes block semantics.
+
+### 11.3 When to stay on block FEC
+
+Even once the sliding codec is shipped and validated, block FEC is the
+right default for:
+
+- **Isolated single-packet loss on otherwise clean links** where small
+  `N` gives tight recovery latency and sliding's `T_flush` feels
+  pessimistic.
+- **Streams with highly variable packet sizes** and no sensible
+  `repair_max_payload` cap (tunnel with mixed small-ACK / large-payload
+  TCP). Padding amplification dominates the FEC overhead.
+- **Interop with older fleets** that cannot be upgraded in lockstep.
+  Block remains the wire-compatible choice until the fleet is on new
+  binaries.
+- **Minimal-resource receivers** where the ~750 KiB vs ~1.83 MiB memory
+  comparison flips the other way (e.g. very small `fec_k`, `fec_n`
+  profiles where the block ring is smaller than a reasonable window).
+
+### 11.4 Suggested migration path
+
+1. **Phase 2a** (after this doc is signed off): implement the
+   `IFecEncoder` / `IFecDecoder` refactor, keeping block-FEC semantics
+   byte-identical. Ship. Validate that the block codec is unchanged.
+2. **Phase 2b**: implement `fec_swin.{cpp,hpp}` behind the
+   interface, with `fec_type = sliding` opt-in per profile. Default
+   stays block. Validate in-tree tests.
+3. **Phase 2c**: run side-by-side benchmarks (Phase-2 doc: harness) on
+   representative links (lab netem, field traces). Publish results.
+4. **Phase 2d**: flip the default for `[video]` profile to sliding if
+   bench results warrant; hold `[mavlink]` and `[tunnel]` on block
+   unless benches say otherwise.
+5. **Phase 3+**: optional — incremental-encode zfex extension,
+   feedback-driven `R`, adaptive `W`.
+
+No step is reversible-on-a-config-flip until step 4, and that step is
+per-profile. Rollback cost is minimal.
+
+---
+
+## 12. Risks and open questions
+
+### 12.1 Known risks (must be surfaced in implementation PRs)
 
 - **Padding amplification.** RS requires all window inputs padded to the
   max payload length in the window. A window with one 1400-B packet and
@@ -835,7 +1380,7 @@ semantics.
   either invariant can silently double-count — guard with an assertion
   in the decoder.
 
-### 11.2 Open questions, deferred to Phase 2+
+### 12.2 Open questions, deferred to Phase 2+
 
 - **Benchmark harness spec.** How to drive both codecs over a controlled
   lossy link (netem, or the existing
