@@ -152,8 +152,8 @@ public:
     // A source packet arrived from the wire. Aggregator has already
     // decrypted + authenticated it and parsed the data_nonce; it
     // dispatches to on_source_packet or on_repair_packet based on
-    // the per-codec rule (block: fragment_idx < k; sliding:
-    // is_repair == 0).
+    // decoder->is_repair_fragment(data_nonce) — a unified, codec-
+    // agnostic signal (see below).
     //
     //   seq     : 64-bit "full data_nonce" view. Block: encodes
     //             (block_idx, fragment_idx); sliding: 56-bit
@@ -213,8 +213,12 @@ public:
     // sliding FEC, each source packet pops immediately on arrival;
     // recovered packets pop as the decoder solves their window.
     //
-    //   seq_out : the 64-bit data_nonce view for this source
-    //             packet.
+    //   seq_out : the FLAT packet_seq for loss-listener tracking.
+    //             Block returns block_idx * fec_k + fragment_idx.
+    //             Sliding returns the 56-bit seq_num (low bits of
+    //             data_nonce). Aggregator uses this directly for
+    //             its `packet_seq > seq + 1` gap-detection check;
+    //             it does NOT need to reparse data_nonce.
     //   out     : caller-provided, ZFEX_SIMD_ALIGNMENT-aligned,
     //             ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD)-sized
     //             buffer. Decoder copies the recovered/received
@@ -228,6 +232,33 @@ public:
     // event loop. Block FEC ignores it; sliding FEC uses it to
     // fire T_flush (§7.3) on stalled windows.
     virtual void tick(uint64_t now_ms) = 0;
+
+    // ----- Codec-aware query accessors ---------------------------
+    // These three methods let Aggregator stay codec-agnostic. Added
+    // in B0 to resolve the Gate G2 findings: before B0, rx.cpp used
+    // fragment_idx < fec_k (block-only rule) to dispatch, and read
+    // counter values via out-of-band pointers. Now the decoder
+    // owns both pieces of codec-specific knowledge and exposes them
+    // via virtual accessors.
+
+    // True if data_nonce names a repair fragment. Block returns
+    // (data_nonce & 0xff) >= fec_k_; sliding returns the high bit
+    // of data_nonce (is_repair per §5.2).
+    virtual bool is_repair_fragment(uint64_t data_nonce) const = 0;
+
+    // Running count of source fragments recovered via FEC, since
+    // construction. Aggregator mirrors into its public
+    // count_p_fec_recovered member after every drain.
+    virtual uint32_t count_p_fec_recovered() const = 0;
+
+    // Running count of ring override-evictions (block-specific).
+    // SWIN has no ring; SWIN implementations always return 0.
+    virtual uint32_t count_p_override() const = 0;
+
+    // Running count of windows retired at T_flush with at least one
+    // unrecovered gap (SWIN-specific, §10.3). Block has no T_flush;
+    // block implementations always return 0.
+    virtual uint32_t count_w_flush() const = 0;
 };
 
 // ----- Factory ------------------------------------------------------------

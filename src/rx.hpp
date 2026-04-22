@@ -193,6 +193,17 @@ public:
         count_p_override = 0;
         count_p_outgoing = 0;
         count_b_outgoing = 0;
+        // B0: decoder counters are monotone cumulative; Aggregator's
+        // public counters are per-interval. Rebase the per-interval
+        // baseline to the decoder's current cumulative so the next
+        // mirror yields delta-since-now.
+        if (decoder) {
+            mirror_baseline_fec_recovered = decoder->count_p_fec_recovered();
+            mirror_baseline_override      = decoder->count_p_override();
+        } else {
+            mirror_baseline_fec_recovered = 0;
+            mirror_baseline_override      = 0;
+        }
     }
 
     rx_antenna_stat_t antenna_stat;
@@ -232,11 +243,18 @@ private:
     static int get_tag(const void *buf, size_t size, uint8_t tag_id, void *value, size_t value_size);
 
     std::unique_ptr<IFecDecoder> decoder; // nullptr until init_fec;
-                                          // BlockFecDecoder instance
-                                          // constructed directly (see
-                                          // fec_block.cpp comment).
+                                          // created via make_fec_decoder
+                                          // (B0 — factory now dispatches
+                                          // on fec_type).
     uint8_t *pop_scratch;                 // SIMD-aligned buffer for the
                                           // pop_ready drain loop.
+    // B0: Aggregator's public count_p_fec_recovered / count_p_override
+    // are per-interval (zeroed by clear_stats). The decoder's
+    // equivalents are monotone cumulative. These two baselines hold
+    // "decoder cumulative at last clear_stats" so each mirror gives
+    // the delta since then.
+    uint32_t mirror_baseline_fec_recovered;
+    uint32_t mirror_baseline_override;
     fec_params_t current_params;   // codec parameters of the active
                                    // session. Used for the SESSION log,
                                    // the process_packet fragment_idx

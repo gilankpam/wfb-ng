@@ -271,7 +271,9 @@ void Receiver::loop_iter(void)
 Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-    decoder(), pop_scratch(nullptr), current_params{}, seq(0),
+    decoder(), pop_scratch(nullptr),
+    mirror_baseline_fec_recovered(0), mirror_baseline_override(0),
+    current_params{}, seq(0),
     epoch(epoch), channel_id(channel_id)
 {
     memset(session_key, '\0', sizeof(session_key));
@@ -327,14 +329,15 @@ void Aggregator::init_fec(const fec_params_t &params)
     current_params = params;
     seq = 0;
 
-    // Bypass make_fec_decoder for the block path so we can pass our
-    // count_p_fec_recovered / count_p_override mirror pointers straight
-    // into BlockFecDecoder's ctor. See fec_block.cpp make_fec_decoder
-    // comment for why.
-    decoder.reset(new BlockFecDecoder(current_params.k, current_params.n,
-                                      packet_loss_listener_,
-                                      &count_p_fec_recovered,
-                                      &count_p_override));
+    // B0: factory now dispatches on fec_type. Aggregator no longer
+    // bypasses it — counters are exposed via IFecDecoder accessors
+    // (count_p_fec_recovered(), count_p_override(), count_w_flush())
+    // and mirrored into our public members after every drain.
+    decoder = make_fec_decoder(current_params, packet_loss_listener_);
+
+    // Fresh decoder: cumulative counters are 0, so baseline is 0.
+    mirror_baseline_fec_recovered = 0;
+    mirror_baseline_override = 0;
 }
 
 
@@ -667,17 +670,22 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         return;
     }
 
-    // Dispatch to the decoder: source fragments (fragment_idx < k) go
-    // through on_source_packet; parity fragments (fragment_idx >= k)
-    // go through on_repair_packet with the block-FEC-specific
-    // synthetic window_tail_seq and repair_idx. See fec_iface.hpp §9.3
-    // commentary for D2 (the seq mapping used by the block codec).
-    if (fragment_idx < current_params.k)
+    // B0: unified dispatch via decoder->is_repair_fragment(data_nonce).
+    // Block returns (nonce & 0xff) >= fec_k_; sliding returns bit 63.
+    // Aggregator stays codec-agnostic; the codec-specific rule is
+    // inside the decoder.
+    if (!decoder->is_repair_fragment(data_nonce))
     {
         decoder->on_source_packet(data_nonce, decrypted, decrypted_len);
     }
     else
     {
+        // For the block path, synthesize window_tail_seq and repair_idx
+        // from the wire nonce. The sliding codec (Phase 2b) will ignore
+        // these and read window_tail_seq from the inner
+        // wpacket_hdr_repair_t header instead — process_packet would
+        // then look inside the decrypted payload. Left as a TODO for
+        // B4 where SWIN wire parsing lands.
         const uint64_t window_tail = ((block_idx & BLOCK_IDX_MASK) << 8) | (uint8_t)(current_params.k - 1);
         const uint8_t  repair_idx  = fragment_idx - (uint8_t)current_params.k;
         decoder->on_repair_packet(data_nonce, window_tail, repair_idx,
@@ -685,22 +693,32 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     }
 
     // Drain every source packet the decoder is ready to emit. pop_ready
-    // returns in increasing seq order; emit_source tracks losses and
-    // writes to the socket.
+    // returns in increasing seq order (now flat packet_seq per B0);
+    // emit_source tracks losses and writes to the socket.
     uint64_t out_seq = 0;
     size_t out_sz = 0;
     while (decoder->pop_ready(&out_seq, pop_scratch, &out_sz))
     {
         emit_source(out_seq, pop_scratch, out_sz);
     }
+
+    // Mirror decoder-owned counters into Aggregator's public members,
+    // delta-since-last-clear (see rx.hpp mirror_baseline_* doc).
+    // Cheap virtual-call pulls; cost is per-packet but well under
+    // memcpy overhead.
+    count_p_fec_recovered = decoder->count_p_fec_recovered() - mirror_baseline_fec_recovered;
+    count_p_override      = decoder->count_p_override()      - mirror_baseline_override;
 }
 
 void Aggregator::emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size_t sz)
 {
     // pop_ready hands back the full ZFEX-padded fragment; the inner
     // wpacket_hdr_t's packet_size field tells us the logical payload
-    // length. This mirrors the old Aggregator::send_packet body
-    // (pre-A3b rx.cpp:871) one-for-one.
+    // length.
+    //
+    // B0: seq_from_decoder IS the flat packet_seq suitable for
+    // loss-listener tracking. Block returned block_idx * fec_k +
+    // fragment_idx; sliding returns seq_num. No conversion here.
     assert(sz >= sizeof(wpacket_hdr_t));
     (void)sz;
 
@@ -709,9 +727,7 @@ void Aggregator::emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size
     const uint8_t        flags      = packet_hdr->flags;
     const uint16_t       packet_size = be16toh(packet_hdr->packet_size);
 
-    const uint64_t block_idx_from_seq    = (seq_from_decoder >> 8) & BLOCK_IDX_MASK;
-    const uint8_t  fragment_idx_from_seq = (uint8_t)(seq_from_decoder & 0xff);
-    const uint64_t packet_seq = block_idx_from_seq * (uint64_t)current_params.k + fragment_idx_from_seq;
+    const uint64_t packet_seq = seq_from_decoder;
 
     if (packet_seq > seq + 1 && seq > 0)
     {

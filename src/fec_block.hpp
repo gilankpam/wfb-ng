@@ -95,20 +95,15 @@ private:
 // Ownership: one instance per Aggregator, held as unique_ptr. No
 // thread-safety.
 //
-// The two uint32_t* counter pointers are internal bookkeeping that
-// Aggregator uses to mirror block-FEC events into its public
-// count_p_fec_recovered / count_p_override members (for the SESSION
-// log and stats dump). The factory make_fec_decoder does NOT receive
-// these — Aggregator constructs BlockFecDecoder directly via this
-// ctor for Phase 2a. When SWIN lands in Phase 2b and the factory
-// dispatches between codecs, we will either widen the factory or
-// expose equivalent accessors on IFecDecoder.
+// Counters (count_p_fec_recovered_, count_p_override_) are internal
+// members exposed via the IFecDecoder accessors from B0. Aggregator
+// polls those accessors after every drain and mirrors into its
+// public count_p_* fields. count_w_flush() always returns 0 on the
+// block path (window-flush is a SWIN concept, §10.3).
 class BlockFecDecoder : public IFecDecoder {
 public:
     BlockFecDecoder(int k, int n,
-                    PacketLossListener* loss_listener,
-                    uint32_t* count_p_fec_recovered_ptr,
-                    uint32_t* count_p_override_ptr);
+                    PacketLossListener* loss_listener);
     ~BlockFecDecoder() override;
 
     void on_source_packet(uint64_t seq,
@@ -126,6 +121,14 @@ public:
                    size_t* sz_out) override;
 
     void tick(uint64_t now_ms) override;
+
+    // IFecDecoder B0 accessors — see fec_iface.hpp for contract.
+    bool is_repair_fragment(uint64_t data_nonce) const override {
+        return (data_nonce & 0xff) >= (uint64_t)fec_k_;
+    }
+    uint32_t count_p_fec_recovered() const override { return count_p_fec_recovered_; }
+    uint32_t count_p_override() const override { return count_p_override_; }
+    uint32_t count_w_flush() const override { return 0; }  // block has no T_flush
 
 private:
     BlockFecDecoder(const BlockFecDecoder&) = delete;
@@ -145,9 +148,9 @@ private:
                                           // Aggregator handles block-
                                           // FEC loss tracking because
                                           // packet_seq uses its own
-                                          // flat uint32_t counter.
-    uint32_t* count_p_fec_recovered_ptr_; // non-null; Aggregator's
-    uint32_t* count_p_override_ptr_;      // counters, bumped on events.
+                                          // flat uint64_t counter.
+    uint32_t count_p_fec_recovered_;      // bumped by apply_fec.
+    uint32_t count_p_override_;           // bumped by rx_ring_push on overflow.
 
     rx_ring_item_t rx_ring_[RX_RING_SIZE];
     int rx_ring_front_;
@@ -164,7 +167,8 @@ private:
     // 1 Kpps / MAX_FEC_PAYLOAD ≈ 4 KB this is well under 1 ms/sec of
     // CPU on any target.
     struct QueuedReady {
-        uint64_t seq;
+        uint64_t seq;                 // flat packet_seq per B0 contract:
+                                      // block_idx * fec_k_ + fragment_idx.
         std::vector<uint8_t> payload; // full fragment buffer,
                                       // size == MAX_FEC_PAYLOAD.
     };

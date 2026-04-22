@@ -144,19 +144,22 @@ std::unique_ptr<IFecEncoder> make_fec_encoder(const fec_params_t& params) {
     return std::unique_ptr<IFecEncoder>(new BlockFecEncoder(params.k, params.n));
 }
 
-std::unique_ptr<IFecDecoder> make_fec_decoder(const fec_params_t& /*params*/,
-                                              PacketLossListener* /*loss_listener*/) {
-    // A3b note: Aggregator constructs BlockFecDecoder directly via its
-    // private ctor (which takes the two uint32_t* stat counters that
-    // Aggregator mirrors into its public count_p_* members). The
-    // generic factory declared in fec_iface.hpp therefore has no
-    // block-FEC caller in Phase 2a. Phase 2b will revisit: when SWIN
-    // arrives we'll either widen make_fec_decoder's signature to
-    // accept a services struct with counter pointers, or expose
-    // counter accessors on IFecDecoder. For now, keep a throwing stub
-    // so any accidental call is caught loudly.
-    throw std::runtime_error("make_fec_decoder: Aggregator constructs BlockFecDecoder directly in Phase 2a; "
-                             "this factory path lights up in Phase 2b when SWIN lands");
+std::unique_ptr<IFecDecoder> make_fec_decoder(const fec_params_t& params,
+                                              PacketLossListener* loss_listener) {
+    switch (params.fec_type) {
+        case WFB_FEC_VDM_RS:
+            return std::unique_ptr<IFecDecoder>(
+                new BlockFecDecoder(params.k, params.n, loss_listener));
+        case WFB_FEC_SWIN_RS:
+            // Phase 2b commit B3 lands SwinFecDecoder and replaces this
+            // branch.
+            throw std::runtime_error(
+                "make_fec_decoder: SWIN decoder not yet implemented "
+                "(Phase 2b commit B3 pending)");
+        default:
+            throw std::runtime_error(
+                "make_fec_decoder: unknown fec_type");
+    }
 }
 
 
@@ -165,15 +168,13 @@ std::unique_ptr<IFecDecoder> make_fec_decoder(const fec_params_t& /*params*/,
 // ========================================================================
 
 BlockFecDecoder::BlockFecDecoder(int k, int n,
-                                 PacketLossListener* loss_listener,
-                                 uint32_t* count_p_fec_recovered_ptr,
-                                 uint32_t* count_p_override_ptr)
+                                 PacketLossListener* loss_listener)
     : fec_p_(nullptr),
       fec_k_(k),
       fec_n_(n),
       loss_listener_(loss_listener),
-      count_p_fec_recovered_ptr_(count_p_fec_recovered_ptr),
-      count_p_override_ptr_(count_p_override_ptr),
+      count_p_fec_recovered_(0),
+      count_p_override_(0),
       rx_ring_{},
       rx_ring_front_(0),
       rx_ring_alloc_(0),
@@ -184,8 +185,6 @@ BlockFecDecoder::BlockFecDecoder(int k, int n,
     assert(n >= 1);
     assert(n < 256);
     assert(k <= n);
-    assert(count_p_fec_recovered_ptr != nullptr);
-    assert(count_p_override_ptr != nullptr);
 
     zfex_status_code_t rc = fec_new(fec_k_, fec_n_, &fec_p_);
     assert(rc == ZFEX_SC_OK);
@@ -286,7 +285,9 @@ void BlockFecDecoder::queue_fragment(int ring_idx, int fragment_idx) {
     // Copy the full ZFEX-padded fragment buffer (MAX_FEC_PAYLOAD
     // bytes) into a queue entry. The caller unwraps wpacket_hdr_t.
     QueuedReady q;
-    q.seq = ((p.block_idx & BLOCK_IDX_MASK) << 8) | (uint8_t)fragment_idx;
+    // B0: seq is now the flat packet_seq for loss-listener tracking
+    // (block_idx * fec_k_ + fragment_idx), not the data_nonce view.
+    q.seq = p.block_idx * (uint64_t)fec_k_ + (uint64_t)fragment_idx;
     q.payload.assign(p.fragments[fragment_idx],
                      p.fragments[fragment_idx] + MAX_FEC_PAYLOAD);
     ready_queue_.push_back(std::move(q));
@@ -311,7 +312,7 @@ int BlockFecDecoder::rx_ring_push() {
     WFB_DBG("AGG: Override block 0x%" PRIx64 " flush %d fragments\n",
             rx_ring_[rx_ring_front_].block_idx,
             rx_ring_[rx_ring_front_].has_fragments);
-    *count_p_override_ptr_ += 1;
+    count_p_override_ += 1;
 
     for (int f_idx = rx_ring_[rx_ring_front_].fragment_to_send_idx;
          f_idx < fec_k_; f_idx++) {
@@ -454,7 +455,7 @@ void BlockFecDecoder::ingest_fragment(uint64_t block_idx, uint8_t fragment_idx,
                     if (!p.fragment_map[f_idx]) fec_count += 1;
                 }
                 if (fec_count) {
-                    *count_p_fec_recovered_ptr_ += fec_count;
+                    count_p_fec_recovered_ += fec_count;
                     WFB_DBG("FEC recovered %u packets\n", fec_count);
                 }
                 break;

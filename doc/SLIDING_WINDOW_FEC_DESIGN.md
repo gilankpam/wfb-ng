@@ -1013,6 +1013,10 @@ public:
     // ZFEX_ROUND_UP_SIMD-padded) holds repair payload of size *sz_out;
     // nonce_out holds the 64-bit big-endian data_nonce per §5.2.
     virtual bool next_repair(uint8_t* out, size_t* sz_out, uint64_t* nonce_out) = 0;
+
+    // Wall-clock advance. Called every ~10 ms from the TX event loop.
+    // Block FEC ignores it; sliding FEC uses it for pacing.
+    virtual void tick(uint64_t now_ms) = 0;
 };
 
 class IFecDecoder {
@@ -1027,15 +1031,47 @@ public:
 
     // Drain any source packets (received or recovered) ready for the socket,
     // in increasing seq order. Returns false when no more are ready.
+    //
+    // seq_out: the FLAT packet_seq for loss-listener tracking (Phase 2b
+    // B0 commit; was previously "data_nonce view" in the original
+    // Phase 1 draft). Block returns block_idx * fec_k + fragment_idx.
+    // Sliding returns the 56-bit seq_num (low bits of data_nonce).
+    // Aggregator uses seq_out directly for its `packet_seq > seq + 1`
+    // gap-detection check; no codec-aware decoding in Aggregator.
     virtual bool pop_ready(uint64_t* seq_out, uint8_t* out, size_t* sz_out) = 0;
 
     // Called every ~10 ms from the event loop to advance wall-clock flush.
     virtual void tick(uint64_t now_ms) = 0;
+
+    // ----- Codec-aware query accessors (Phase 2b B0) -----
+    // These keep rx.cpp fully codec-agnostic: Aggregator neither reads
+    // fec_k / fragment_idx to decide is_repair, nor computes flat
+    // packet_seq from (block_idx, fragment_idx).
+
+    // True if data_nonce names a repair fragment. Block returns
+    // (data_nonce & 0xff) >= fec_k_; sliding returns bit 63 of
+    // data_nonce (is_repair per §5.2).
+    virtual bool is_repair_fragment(uint64_t data_nonce) const = 0;
+
+    // Running count of source fragments recovered via FEC since
+    // construction (monotone cumulative). Aggregator mirrors to its
+    // per-interval public count_p_fec_recovered using a baseline
+    // captured at clear_stats time.
+    virtual uint32_t count_p_fec_recovered() const = 0;
+
+    // Running count of ring override-evictions (block-specific).
+    // SWIN has no ring; SWIN returns 0 unconditionally.
+    virtual uint32_t count_p_override() const = 0;
+
+    // Running count of windows retired at T_flush with at least one
+    // unrecovered gap (SWIN-specific, §10.3). Block has no T_flush;
+    // block returns 0 unconditionally.
+    virtual uint32_t count_w_flush() const = 0;
 };
 
-std::unique_ptr<IFecEncoder> make_encoder(const fec_params_t&);
-std::unique_ptr<IFecDecoder> make_decoder(const fec_params_t&,
-                                          PacketLossListener* loss_listener);
+std::unique_ptr<IFecEncoder> make_fec_encoder(const fec_params_t&);
+std::unique_ptr<IFecDecoder> make_fec_decoder(const fec_params_t&,
+                                              PacketLossListener* loss_listener);
 ```
 
 Two implementations under `src/fec_block.{cpp,hpp}` and
@@ -1049,8 +1085,17 @@ today's block path does at [src/tx.cpp:135](../src/tx.cpp#L135).
 This keeps the tx / rx pipelines fec-type-agnostic: `Transmitter`
 always emits each source immediately and then drains `next_repair()`
 until it returns false; `Aggregator` always routes each data packet
-based on `is_repair` and then drains `pop_ready()`. The two codecs never
-share state.
+via `decoder->is_repair_fragment(data_nonce)` and then drains
+`pop_ready()`. The two codecs never share state.
+
+**Note (Phase 2b B0 revision history):** the original §9.3 draft
+said Aggregator "routes based on `is_repair`" without specifying how
+Aggregator would compute it, and left pop_ready's `seq_out` as the
+data_nonce composite. Phase 2a's implementation used the block-only
+rule `fragment_idx < fec_k` directly in Aggregator, which did not
+generalize to SWIN. B0 adds the four virtual accessors above so
+that both rx.cpp and codec internals can be written without
+`if (fec_type == ...)` branches anywhere in the hot path.
 
 ### 9.4 `PacketLossListener` widening (ABI break)
 
@@ -1074,6 +1119,14 @@ This is a source-compat break for any external binding (Python wfb_ng,
 cluster-mode consumers). Phase 2a must walk all implementers — the
 only in-tree implementer is the Python-bound listener path through
 `AggregatorUDPv4` / `AggregatorUNIX` — and update them.
+
+**B0 clarification on seq semantics:** `last_seq` and `new_seq` are
+the **flat packet_seq** — the same value `pop_ready` returns in its
+`seq_out`. Aggregator passes them through without transformation.
+Block decoder computes `block_idx * fec_k + fragment_idx` internally;
+sliding decoder uses `seq_num`. Listener implementers do not need
+to know which codec is active — the seq space is already canonicalized
+by the decoder.
 
 ---
 

@@ -561,9 +561,30 @@ TEST_CASE("C8 block-FEC nonce layout: (block<<8|frag) unique per session",
 
 
 TEST_CASE("C9 block path has no T_flush / count_w_flush", "[baseline][C9]") {
+    // B0 update: the original Phase 1.5 version of this test was a
+    // source-text sentinel — it asserted rx.cpp did not contain the
+    // string "count_w_flush" or "T_flush". B0 added the accessor
+    // count_w_flush() to IFecDecoder, so rx.cpp now mentions it in a
+    // comment. The SEMANTIC invariant the test is asserting — "block
+    // FEC has no window-flush concept" — is unchanged, so the check
+    // is rewritten behaviorally.
+    //
+    // 1) rx.cpp must not contain the string "T_flush" anywhere.
+    //    T_flush is strictly a sliding-FEC concept (§7.4) and must
+    //    not leak into the block RX path.
+    // 2) BlockFecDecoder::count_w_flush() returns 0 unconditionally,
+    //    at construction and after arbitrary packet ingestion.
     std::string rx_src = slurp("src/rx.cpp");
-    REQUIRE(rx_src.find("count_w_flush") == std::string::npos);
     REQUIRE(rx_src.find("T_flush") == std::string::npos);
+
+    BlockFecDecoder dec(8, 12, nullptr);
+    REQUIRE(dec.count_w_flush() == 0);
+    // Advance tick arbitrarily — block's tick is a no-op, so count_w_flush
+    // never bumps regardless of elapsed wall-clock time.
+    dec.tick(0);
+    dec.tick(1000);
+    dec.tick(60000);
+    REQUIRE(dec.count_w_flush() == 0);
 }
 
 
@@ -1018,14 +1039,14 @@ TEST_CASE("A3a BlockFecEncoder max_packet_size tracks the largest source in a bl
 }
 
 
-// Direct unit tests on BlockFecDecoder via its ctor (bypassing the
-// factory; see fec_block.cpp make_fec_decoder for why). These exercise
-// the IFecDecoder interface contract independently of Aggregator.
+// Direct unit tests on BlockFecDecoder. B0 simplified the ctor
+// (no more counter pointers — decoder owns its counters and exposes
+// them via IFecDecoder accessors) and changed pop_ready's seq_out
+// from data_nonce view to flat packet_seq (block_idx*k+frag).
 
 TEST_CASE("A3b BlockFecDecoder pops sources in seq order for a lossless block",
           "[A3b][fec_block]") {
-    uint32_t fec_recovered = 0, overrides = 0;
-    BlockFecDecoder dec(4, 7, /*loss_listener=*/nullptr, &fec_recovered, &overrides);
+    BlockFecDecoder dec(4, 7, /*loss_listener=*/nullptr);
 
     AlignedBuf src;
     AlignedBuf out;
@@ -1045,11 +1066,13 @@ TEST_CASE("A3b BlockFecDecoder pops sources in seq order for a lossless block",
     }
 
     // Fast path should have queued all 4 sources in order (block 5, frags 0..3).
+    // B0: seq_out is the flat packet_seq = block_idx * fec_k + fragment_idx.
+    // block_idx=5, fec_k=4 → 20, 21, 22, 23.
     for (int i = 0; i < 4; i++) {
         uint64_t seq_out = 0;
         size_t sz_out = 0;
         REQUIRE(dec.pop_ready(&seq_out, out.ptr, &sz_out) == true);
-        REQUIRE(seq_out == ((uint64_t)5 << 8 | (uint8_t)i));
+        REQUIRE(seq_out == 5ULL * 4 + (uint64_t)i);
         REQUIRE(sz_out == MAX_FEC_PAYLOAD);
         const wpacket_hdr_t* popped_hdr = (const wpacket_hdr_t*)out.ptr;
         REQUIRE(be16toh(popped_hdr->packet_size) == 8);
@@ -1061,8 +1084,9 @@ TEST_CASE("A3b BlockFecDecoder pops sources in seq order for a lossless block",
     uint64_t unused_seq = 0;
     size_t   unused_sz  = 0;
     REQUIRE(dec.pop_ready(&unused_seq, out.ptr, &unused_sz) == false);
-    REQUIRE(fec_recovered == 0);
-    REQUIRE(overrides == 0);
+    REQUIRE(dec.count_p_fec_recovered() == 0);
+    REQUIRE(dec.count_p_override() == 0);
+    REQUIRE(dec.count_w_flush() == 0);   // block always returns 0
 }
 
 TEST_CASE("A3b BlockFecDecoder recovers a missing source via on_repair_packet",
@@ -1077,8 +1101,7 @@ TEST_CASE("A3b BlockFecDecoder recovers a missing source via on_repair_packet",
     fec_params_t params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
     auto enc = make_fec_encoder(params);
 
-    uint32_t fec_recovered = 0, overrides = 0;
-    BlockFecDecoder dec(k, n, nullptr, &fec_recovered, &overrides);
+    BlockFecDecoder dec(k, n, nullptr);
 
     AlignedBuf src0, src1, repair, out;
 
@@ -1107,7 +1130,10 @@ TEST_CASE("A3b BlockFecDecoder recovers a missing source via on_repair_packet",
     dec.on_repair_packet(repair_nonce, window_tail, /*repair_idx=*/0,
                          repair.ptr, repair_sz);
 
-    // Expect both sources to pop in seq order, with source 0 recovered.
+    // B0: seq_out is flat packet_seq = block*k + frag. Block 0, k=2:
+    // frag 0 → 0, frag 1 → 1. (Same numeric values as the pre-B0 test
+    // for this specific (k=2, block=0) case; the contract change is
+    // real but numerically invisible here.)
     uint64_t seq_out = 0;
     size_t sz_out = 0;
     REQUIRE(dec.pop_ready(&seq_out, out.ptr, &sz_out) == true);
@@ -1122,8 +1148,8 @@ TEST_CASE("A3b BlockFecDecoder recovers a missing source via on_repair_packet",
     REQUIRE(popped[0] == 0x22);  // src1 delivered as-is
 
     REQUIRE(dec.pop_ready(&seq_out, out.ptr, &sz_out) == false);
-    REQUIRE(fec_recovered == 1);  // exactly one recovery
-    REQUIRE(overrides == 0);
+    REQUIRE(dec.count_p_fec_recovered() == 1);   // exactly one recovery
+    REQUIRE(dec.count_p_override() == 0);
 }
 
 TEST_CASE("A3b BlockFecDecoder bumps count_p_override when ring overflows",
@@ -1131,8 +1157,7 @@ TEST_CASE("A3b BlockFecDecoder bumps count_p_override when ring overflows",
     // Feed (RX_RING_SIZE + 2) distinct block_idx values with only one
     // fragment each (no block ever completes), forcing the ring to
     // overflow and the decoder to count overrides.
-    uint32_t fec_recovered = 0, overrides = 0;
-    BlockFecDecoder dec(8, 12, nullptr, &fec_recovered, &overrides);
+    BlockFecDecoder dec(8, 12, nullptr);
     AlignedBuf src, out;
     std::memset(src.ptr, 0, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
     wpacket_hdr_t* hdr = (wpacket_hdr_t*)src.ptr;
@@ -1146,22 +1171,49 @@ TEST_CASE("A3b BlockFecDecoder bumps count_p_override when ring overflows",
         while (dec.pop_ready(&s, out.ptr, &sz)) { /* drain each call */ }
     }
 
-    REQUIRE(overrides >= 2);  // at least 2 blocks had to be force-evicted
-    REQUIRE(fec_recovered == 0);
+    REQUIRE(dec.count_p_override() >= 2);  // ≥ 2 blocks force-evicted
+    REQUIRE(dec.count_p_fec_recovered() == 0);
 }
 
 TEST_CASE("A3b BlockFecDecoder::tick is a no-op for block FEC",
           "[A3b][fec_block]") {
-    uint32_t fec_recovered = 0, overrides = 0;
-    BlockFecDecoder dec(2, 3, nullptr, &fec_recovered, &overrides);
+    BlockFecDecoder dec(2, 3, nullptr);
     dec.tick(0);
     dec.tick(10);
     dec.tick(100000);
     // State still empty: pop_ready false, no counters moved.
     uint64_t s; size_t sz; AlignedBuf out;
     REQUIRE(dec.pop_ready(&s, out.ptr, &sz) == false);
-    REQUIRE(fec_recovered == 0);
-    REQUIRE(overrides == 0);
+    REQUIRE(dec.count_p_fec_recovered() == 0);
+    REQUIRE(dec.count_p_override() == 0);
+    REQUIRE(dec.count_w_flush() == 0);
+}
+
+TEST_CASE("B0 IFecDecoder accessors return expected values on block path",
+          "[B0][fec_block][iface]") {
+    // Directly verify the four virtual accessors added in B0. Uses the
+    // base-class (IFecDecoder) view to confirm the overrides are
+    // reachable via the abstract interface.
+    BlockFecDecoder dec(8, 12, nullptr);
+    IFecDecoder& iface = dec;
+
+    // is_repair_fragment: block rule is (nonce & 0xff) >= fec_k.
+    REQUIRE(iface.is_repair_fragment((5ULL << 8) | 0) == false);  // frag 0
+    REQUIRE(iface.is_repair_fragment((5ULL << 8) | 7) == false);  // frag k-1
+    REQUIRE(iface.is_repair_fragment((5ULL << 8) | 8) == true);   // frag k
+    REQUIRE(iface.is_repair_fragment((5ULL << 8) | 11) == true);  // frag n-1
+
+    // Fresh decoder: all counters zero.
+    REQUIRE(iface.count_p_fec_recovered() == 0);
+    REQUIRE(iface.count_p_override() == 0);
+    REQUIRE(iface.count_w_flush() == 0);   // block always 0
+
+    // Make-factory also dispatches correctly for VDM_RS.
+    fec_params_t p = {WFB_FEC_VDM_RS, 4, 8, 0, 0, 0};
+    auto dec_via_factory = make_fec_decoder(p, nullptr);
+    REQUIRE(dec_via_factory != nullptr);
+    REQUIRE(dec_via_factory->count_p_fec_recovered() == 0);
+    REQUIRE(dec_via_factory->count_w_flush() == 0);
 }
 
 TEST_CASE("A4 on_packet_loss preserves last_seq / new_seq above UINT32_MAX",
@@ -1169,9 +1221,12 @@ TEST_CASE("A4 on_packet_loss preserves last_seq / new_seq above UINT32_MAX",
     // Goal: exercise the widened listener signature with a gap whose
     // new_seq exceeds UINT32_MAX, and verify no silent truncation.
     // Fixture establishes a session with k=8, n=12 so Aggregator's
-    // fec_k is set. Then we seed seq = 1000 and drive emit_source
-    // directly with a seq_from_decoder whose packet_seq (block_idx *
-    // fec_k + fragment_idx) exceeds 2^32.
+    // current_params is set. Then we seed seq = 1000 and drive
+    // emit_source with a flat packet_seq > 2^32.
+    //
+    // B0 update: emit_source now takes the flat packet_seq directly
+    // (no data_nonce parsing inside). We pass the target packet_seq
+    // directly — no more (block_idx << 8) composite.
     Fixture f;
     LoggingLossListener listener;
     f.rx.set_packet_loss_listener(&listener);
@@ -1185,13 +1240,10 @@ TEST_CASE("A4 on_packet_loss preserves last_seq / new_seq above UINT32_MAX",
     hdr->packet_size = htobe16(4);
     // Keep payload zeroed; content doesn't matter for the listener check.
 
-    // block_idx = 2^30, fragment_idx = 0 → packet_seq = 2^30 * 8 = 2^33.
-    // That's roughly 8.6e9, well above UINT32_MAX (~4.3e9).
-    const uint64_t block_idx    = (uint64_t)1 << 30;
-    const uint64_t decoder_seq  = block_idx << 8;  // frag 0
-    const uint64_t expected_new = block_idx * 8ULL;
+    // Target packet_seq = 2^33 (≈ 8.6e9, well above UINT32_MAX ≈ 4.3e9).
+    const uint64_t expected_new = (uint64_t)1 << 33;
 
-    f.rx.test_emit_source(decoder_seq, buf.ptr, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+    f.rx.test_emit_source(expected_new, buf.ptr, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
 
     REQUIRE(listener.events.size() == 1);
     const auto& ev = listener.events.front();
