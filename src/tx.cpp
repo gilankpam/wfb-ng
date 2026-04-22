@@ -767,6 +767,15 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
     uint32_t count_b_injected = 0;  // successfully injected bytes (include additional fec packets)
     uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
     uint32_t count_p_truncated = 0; // injected large packets that were truncated
+
+    // Cumulative totals (never reset) — exposed via CMD_GET_STATS for out-of-band monitoring.
+    uint64_t total_p_fec_timeouts = 0;
+    uint64_t total_p_incoming = 0;
+    uint64_t total_p_injected = 0;
+    uint64_t total_b_injected = 0;
+    uint64_t total_p_dropped = 0;
+    uint64_t total_p_truncated = 0;
+
     int start_fd_idx = 0;
 
     for(;;)
@@ -806,6 +815,15 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
             {
                 WFB_ERR("%u packets truncated\n", count_p_truncated);
             }
+
+            // Fold the per-interval counters into the cumulative totals before
+            // resetting them. CMD_GET_STATS reads the totals.
+            total_p_fec_timeouts += count_p_fec_timeouts;
+            total_p_incoming += count_p_incoming;
+            total_p_injected += count_p_injected;
+            total_b_injected += count_b_injected;
+            total_p_dropped += count_p_dropped;
+            total_p_truncated += count_p_truncated;
 
             count_p_fec_timeouts = 0;
             count_p_incoming = 0;
@@ -966,6 +984,28 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                     resp.u.cmd_get_radio.vht_nss = hdr.vht_nss;
 
                     sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_radio), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                }
+                break;
+
+                case CMD_GET_STATS:
+                {
+                    if (rsize != offsetof(cmd_req_t, u))
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        continue;
+                    }
+
+                    // Totals are updated on the log_interval tick; worst case
+                    // the value read here is <log_interval ms stale.
+                    resp.u.cmd_get_stats.p_fec_timeouts = total_p_fec_timeouts;
+                    resp.u.cmd_get_stats.p_incoming = total_p_incoming;
+                    resp.u.cmd_get_stats.p_injected = total_p_injected;
+                    resp.u.cmd_get_stats.b_injected = total_b_injected;
+                    resp.u.cmd_get_stats.p_dropped = total_p_dropped;
+                    resp.u.cmd_get_stats.p_truncated = total_p_truncated;
+
+                    sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_stats), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
                 }
                 break;
 
