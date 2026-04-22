@@ -51,7 +51,7 @@ using namespace std;
 
 Transmitter::Transmitter(const fec_params_t &params, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
     encoder(),
-    fec_k(-1), fec_n(-1),
+    current_params{},
     block_idx(0), fragment_idx(0),
     scratch(nullptr),
     epoch(epoch),
@@ -106,8 +106,7 @@ Transmitter::~Transmitter()
 void Transmitter::deinit_session(void)
 {
     encoder.reset();
-    fec_k = -1;
-    fec_n = -1;
+    current_params = fec_params_t{};
 }
 
 void Transmitter::init_session(const fec_params_t &params)
@@ -123,8 +122,7 @@ void Transmitter::init_session(const fec_params_t &params)
     assert(params.k <= params.n);
 
     encoder = make_fec_encoder(params);
-    fec_k = params.k;
-    fec_n = params.n;
+    current_params = params;
 
     block_idx = 0;
     fragment_idx = 0;
@@ -150,8 +148,8 @@ void Transmitter::init_session(const fec_params_t &params)
         session_data->epoch = htobe64(epoch);
         session_data->channel_id = htobe32(channel_id);
         session_data->fec_type = WFB_FEC_VDM_RS;
-        session_data->k = (uint8_t)fec_k;
-        session_data->n = (uint8_t)fec_n;
+        session_data->k = (uint8_t)current_params.k;
+        session_data->n = (uint8_t)current_params.n;
 
         assert(sizeof(session_data->session_key) == sizeof(session_key));
         memcpy(session_data->session_key, session_key, sizeof(session_key));
@@ -681,7 +679,7 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
     send_block_fragment(scratch, framed_size, source_nonce);
     fragment_idx += 1;
 
-    if (fragment_idx < fec_k)  return true;
+    if (fragment_idx < current_params.k)  return true;
 
     // mark fec packets with fwmark + 1
     set_mark(1);
@@ -708,7 +706,7 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
         send_block_fragment(scratch, repair_size, repair_nonce);
         fragment_idx += 1;
     }
-    assert(fragment_idx == fec_n);
+    assert(fragment_idx == current_params.n);
 
     block_idx += 1;
     fragment_idx = 0;
@@ -716,9 +714,12 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
     // Generate new session key after MAX_BLOCK_IDX blocks
     if (block_idx > MAX_BLOCK_IDX)
     {
-        fec_params_t rekey_params = {WFB_FEC_VDM_RS, fec_k, fec_n, 0, 0, 0};
+        // init_session captures current_params before the reset, so
+        // we can hand the SAME struct back to it — the rekey keeps
+        // the same codec / k / n but rolls a new session key.
+        const fec_params_t rekey_params = current_params;
         init_session(rekey_params);
-        for(int i = 0; i < fec_n - fec_k + 1; i++)
+        for(int i = 0; i < current_params.n - current_params.k + 1; i++)
         {
             send_session_key();
         }

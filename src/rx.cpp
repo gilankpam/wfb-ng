@@ -271,7 +271,7 @@ void Receiver::loop_iter(void)
 Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-    decoder(), pop_scratch(nullptr), fec_k(-1), fec_n(-1), seq(0),
+    decoder(), pop_scratch(nullptr), current_params{}, seq(0),
     epoch(epoch), channel_id(channel_id)
 {
     memset(session_key, '\0', sizeof(session_key));
@@ -324,15 +324,15 @@ void Aggregator::init_fec(const fec_params_t &params)
     assert(params.n < 256);
     assert(params.k <= params.n);
 
-    fec_k = params.k;
-    fec_n = params.n;
+    current_params = params;
     seq = 0;
 
     // Bypass make_fec_decoder for the block path so we can pass our
     // count_p_fec_recovered / count_p_override mirror pointers straight
     // into BlockFecDecoder's ctor. See fec_block.cpp make_fec_decoder
     // comment for why.
-    decoder.reset(new BlockFecDecoder(fec_k, fec_n, packet_loss_listener_,
+    decoder.reset(new BlockFecDecoder(current_params.k, current_params.n,
+                                      packet_loss_listener_,
                                       &count_p_fec_recovered,
                                       &count_p_override));
 }
@@ -609,7 +609,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                                            0, 0, 0};
             init_fec(session_params);
 
-            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
+            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, current_params.k, current_params.n);
             IPC_MSG_SEND();
         }
 
@@ -660,26 +660,26 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         return;
     }
 
-    if (fragment_idx >= fec_n)
+    if (fragment_idx >= current_params.n)
     {
         WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
         count_p_bad += 1;
         return;
     }
 
-    // Dispatch to the decoder: source fragments (fragment_idx < fec_k)
-    // go through on_source_packet; parity fragments (fragment_idx >=
-    // fec_k) go through on_repair_packet with the block-FEC-specific
+    // Dispatch to the decoder: source fragments (fragment_idx < k) go
+    // through on_source_packet; parity fragments (fragment_idx >= k)
+    // go through on_repair_packet with the block-FEC-specific
     // synthetic window_tail_seq and repair_idx. See fec_iface.hpp §9.3
     // commentary for D2 (the seq mapping used by the block codec).
-    if (fragment_idx < fec_k)
+    if (fragment_idx < current_params.k)
     {
         decoder->on_source_packet(data_nonce, decrypted, decrypted_len);
     }
     else
     {
-        const uint64_t window_tail = ((block_idx & BLOCK_IDX_MASK) << 8) | (uint8_t)(fec_k - 1);
-        const uint8_t  repair_idx  = fragment_idx - (uint8_t)fec_k;
+        const uint64_t window_tail = ((block_idx & BLOCK_IDX_MASK) << 8) | (uint8_t)(current_params.k - 1);
+        const uint8_t  repair_idx  = fragment_idx - (uint8_t)current_params.k;
         decoder->on_repair_packet(data_nonce, window_tail, repair_idx,
                                   decrypted, decrypted_len);
     }
@@ -711,7 +711,7 @@ void Aggregator::emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size
 
     const uint64_t block_idx_from_seq    = (seq_from_decoder >> 8) & BLOCK_IDX_MASK;
     const uint8_t  fragment_idx_from_seq = (uint8_t)(seq_from_decoder & 0xff);
-    const uint64_t packet_seq = block_idx_from_seq * (uint64_t)fec_k + fragment_idx_from_seq;
+    const uint64_t packet_seq = block_idx_from_seq * (uint64_t)current_params.k + fragment_idx_from_seq;
 
     if (packet_seq > seq + 1 && seq > 0)
     {

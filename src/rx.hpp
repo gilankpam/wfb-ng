@@ -237,10 +237,13 @@ private:
                                           // fec_block.cpp comment).
     uint8_t *pop_scratch;                 // SIMD-aligned buffer for the
                                           // pop_ready drain loop.
-    int fec_k;  // cached from fec_params_t for the SESSION log,
-                // the process_packet fragment_idx bounds check, and the
-                // block-FEC flat packet_seq computation.
-    int fec_n;
+    fec_params_t current_params;   // codec parameters of the active
+                                   // session. Used for the SESSION log,
+                                   // the process_packet fragment_idx
+                                   // bounds check, source-vs-repair
+                                   // dispatch, and the block-FEC flat
+                                   // packet_seq computation. Decoder
+                                   // owns the codec-side copy.
     uint8_t session_hash[crypto_generichash_BYTES];
 
 protected:

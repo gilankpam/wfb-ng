@@ -78,7 +78,7 @@ public:
     bool send_packet(const uint8_t *buf, size_t size, uint8_t flags);
     void send_session_key(void);
     void init_session(const fec_params_t &params);
-    void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
+    void get_fec(int &k, int &n) { k = current_params.k; n = current_params.n; }
     virtual void select_output(int idx) = 0;
     virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
     virtual void update_radiotap_header(radiotap_header_t &radiotap_header) = 0;
@@ -94,12 +94,12 @@ private:
     void deinit_session(void);
 
     std::unique_ptr<IFecEncoder> encoder;
-    int fec_k;  // RS number of primary fragments in block — cached
-                // from fec_params_t for session_data filling, get_fec,
-                // and rekey. Encoder owns the codec-side copy.
-    int fec_n;  // RS total number of fragments in block — cached.
+    fec_params_t current_params; // codec parameters of the in-progress
+                                 // session. Read wherever we used to
+                                 // read fec_k / fec_n. Encoder owns the
+                                 // codec-side copy via make_fec_encoder.
     uint64_t block_idx; // wire-level counter: (block_idx << 8) | frag = nonce
-    uint8_t fragment_idx; // wire-level counter, 0..fec_n
+    uint8_t fragment_idx; // wire-level counter, 0..current_params.n
     uint8_t *scratch;   // SIMD-aligned staging buffer (MAX_FEC_PAYLOAD
                         // padded to ZFEX_ROUND_UP_SIMD). Source packets
                         // are framed here before encoder->on_source_packet
