@@ -51,7 +51,7 @@ src/%.o: src/%.cpp src/*.hpp src/*.h
 wfb_rx: src/rx.o src/radiotap.o src/zfex.o src/wifibroadcast.o
 	$(CXX) -o $@ $^ $(_LDFLAGS) -lpcap
 
-wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o
+wfb_tx: src/tx.o src/fec_block.o src/zfex.o src/wifibroadcast.o
 	$(CXX) -o $@ $^ $(_LDFLAGS)
 
 fec_test: src/fec_test.cpp src/zfex.o
@@ -69,7 +69,7 @@ src/rx_lib.o: src/rx.o
 src/tx_lib.o: src/tx.o
 	objcopy --redefine-sym main=wfb_tx_main $< $@
 
-fec_baseline: src/fec_baseline.cpp src/rx_lib.o src/tx_lib.o src/zfex.o src/wifibroadcast.o src/radiotap.o
+fec_baseline: src/fec_baseline.cpp src/rx_lib.o src/tx_lib.o src/fec_block.o src/zfex.o src/wifibroadcast.o src/radiotap.o
 	$(CXX) $(_CFLAGS) -o $@ $^ $(_LDFLAGS) -lpcap $(shell pkg-config --libs catch2-with-main)
 
 wfb_keygen: src/keygen.o

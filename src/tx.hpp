@@ -90,16 +90,21 @@ protected:
 private:
     Transmitter(const Transmitter&);
     Transmitter& operator=(const Transmitter&);
-    void send_block_fragment(size_t packet_size);
+    void send_block_fragment(const uint8_t *buf, size_t packet_size, uint64_t data_nonce);
     void deinit_session(void);
 
-    fec_t* fec_p;
-    int fec_k;  // RS number of primary fragments in block
-    int fec_n;  // RS total number of fragments in block
-    uint64_t block_idx; // (block_idx << 8) + fragment_idx = nonce (64bit)
-    uint8_t fragment_idx;
-    uint8_t** block;
-    size_t max_packet_size;
+    std::unique_ptr<IFecEncoder> encoder;
+    int fec_k;  // RS number of primary fragments in block — cached
+                // from fec_params_t for session_data filling, get_fec,
+                // and rekey. Encoder owns the codec-side copy.
+    int fec_n;  // RS total number of fragments in block — cached.
+    uint64_t block_idx; // wire-level counter: (block_idx << 8) | frag = nonce
+    uint8_t fragment_idx; // wire-level counter, 0..fec_n
+    uint8_t *scratch;   // SIMD-aligned staging buffer (MAX_FEC_PAYLOAD
+                        // padded to ZFEX_ROUND_UP_SIMD). Source packets
+                        // are framed here before encoder->on_source_packet
+                        // copies into its internal block; repair bytes
+                        // are drained here before send_block_fragment.
     const uint64_t epoch; // Packets from old epoch will be discarded
     const uint32_t channel_id; // (link_id << 8) + port_number
     const uint32_t fec_delay; // fec packet delay [us]

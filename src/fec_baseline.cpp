@@ -838,6 +838,28 @@ TEST_CASE("pipeline end-to-end benchmark (encode + AEAD + ring + decode, 1-erasu
 // behavior change vs pre-A2. The existing C1-C20 baseline cases are the
 // byte-identity check; these three are direct struct-round-trip checks.
 
+// Phase 2a, commit A3a: direct unit tests on BlockFecEncoder via the
+// make_fec_encoder factory. Pairs with the C1-C20 baseline byte-identity
+// check; these are narrower white-box tests of the encoder state machine
+// that don't go through the Transmitter / AEAD path.
+
+namespace {
+// RAII helper for posix_memalign'd buffers used by the A3a tests.
+struct AlignedBuf {
+    uint8_t* ptr;
+    AlignedBuf() : ptr(nullptr) {
+        int rc = posix_memalign((void**)&ptr, ZFEX_SIMD_ALIGNMENT,
+                                ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+        REQUIRE(rc == 0);
+        std::memset(ptr, 0, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+    }
+    ~AlignedBuf() { free(ptr); }
+    AlignedBuf(const AlignedBuf&) = delete;
+    AlignedBuf& operator=(const AlignedBuf&) = delete;
+};
+}  // namespace
+
+
 TEST_CASE("A2 fec_params_t populates block-FEC k/n via Transmitter ctor",
           "[A2][fec_params]") {
     TestKeys keys;
@@ -879,6 +901,111 @@ TEST_CASE("A2 fec_params_t threaded end-to-end for non-default k/n",
     PassThrough pt;
     run_pipeline(f.tx, f.rx, pt);
     REQUIRE(f.rx.delivered.size() == 6);
+}
+
+TEST_CASE("A3a BlockFecEncoder holds repairs until the k-th source",
+          "[A3a][fec_block]") {
+    fec_params_t params = {WFB_FEC_VDM_RS, 4, 7, 0, 0, 0};
+    auto enc = make_fec_encoder(params);
+    AlignedBuf src;
+    AlignedBuf repair;
+
+    // Fake wpacket_hdr_t header (3 bytes) + payload. The encoder does
+    // not introspect the bytes; it just needs a stable aligned buffer.
+    std::memset(src.ptr, 0x42, 200);
+
+    size_t sz = 0;
+    uint64_t nonce = 0;
+
+    // First (k - 1) sources: next_repair always returns false.
+    for (int frag = 0; frag < params.k - 1; frag++) {
+        enc->on_source_packet((uint64_t)frag, src.ptr, 200);
+        REQUIRE(enc->next_repair(repair.ptr, &sz, &nonce) == false);
+    }
+
+    // k-th source completes the block and parity rows become available.
+    enc->on_source_packet((uint64_t)(params.k - 1), src.ptr, 200);
+
+    int drained = 0;
+    while (enc->next_repair(repair.ptr, &sz, &nonce)) {
+        // Repair nonces for block 0 live at fragment_idx k..n-1.
+        REQUIRE((nonce >> 8) == 0ULL);
+        REQUIRE((nonce & 0xff) == (uint64_t)(params.k + drained));
+        REQUIRE(sz == 200);
+        drained++;
+    }
+    REQUIRE(drained == params.n - params.k);
+}
+
+TEST_CASE("A3a BlockFecEncoder advances block_idx after draining all repairs",
+          "[A3a][fec_block]") {
+    fec_params_t params = {WFB_FEC_VDM_RS, 2, 3, 0, 0, 0};
+    auto enc = make_fec_encoder(params);
+    AlignedBuf src;
+    AlignedBuf repair;
+    std::memset(src.ptr, 0xa5, 100);
+
+    size_t sz = 0;
+    uint64_t nonce = 0;
+
+    // Block 0: two sources, drain the single parity (n - k = 1).
+    enc->on_source_packet((0ULL << 8) | 0, src.ptr, 100);
+    enc->on_source_packet((0ULL << 8) | 1, src.ptr, 100);
+    REQUIRE(enc->next_repair(repair.ptr, &sz, &nonce) == true);
+    REQUIRE(nonce == ((0ULL << 8) | 2ULL));
+    REQUIRE(enc->next_repair(repair.ptr, &sz, &nonce) == false);
+
+    // Block 1: same pattern. Block_idx advance is encoder-internal, but
+    // the next_repair nonce confirms it: fragment_idx 2, block_idx 1.
+    enc->on_source_packet((1ULL << 8) | 0, src.ptr, 100);
+    enc->on_source_packet((1ULL << 8) | 1, src.ptr, 100);
+    REQUIRE(enc->next_repair(repair.ptr, &sz, &nonce) == true);
+    REQUIRE(nonce == ((1ULL << 8) | 2ULL));
+}
+
+TEST_CASE("A3a BlockFecEncoder handles block_idx near MAX_BLOCK_IDX boundary",
+          "[A3a][fec_block][overflow]") {
+    // MAX_BLOCK_IDX = 2^55 - 1 per wifibroadcast.hpp. Sanity-check that
+    // the encoder emits the full 56-bit block_idx without truncation.
+    fec_params_t params = {WFB_FEC_VDM_RS, 2, 3, 0, 0, 0};
+    auto enc = make_fec_encoder(params);
+    AlignedBuf src;
+    AlignedBuf repair;
+    std::memset(src.ptr, 0x5a, 50);
+
+    const uint64_t big_block = MAX_BLOCK_IDX - 1;
+    enc->on_source_packet((big_block << 8) | 0, src.ptr, 50);
+    enc->on_source_packet((big_block << 8) | 1, src.ptr, 50);
+
+    size_t sz = 0;
+    uint64_t nonce = 0;
+    REQUIRE(enc->next_repair(repair.ptr, &sz, &nonce) == true);
+    REQUIRE((nonce >> 8) == big_block);
+    REQUIRE((nonce & 0xff) == 2);
+}
+
+TEST_CASE("A3a BlockFecEncoder max_packet_size tracks the largest source in a block",
+          "[A3a][fec_block]") {
+    fec_params_t params = {WFB_FEC_VDM_RS, 3, 5, 0, 0, 0};
+    auto enc = make_fec_encoder(params);
+    AlignedBuf src;
+    AlignedBuf repair;
+    std::memset(src.ptr, 0x77, MAX_FEC_PAYLOAD);
+
+    // Three sources of varying size. The repair's reported sz_out must
+    // equal the largest of them — Transmitter relies on this to set the
+    // ciphertext length for parity fragments on the wire.
+    enc->on_source_packet(0, src.ptr, 100);
+    enc->on_source_packet(1, src.ptr, 1400);
+    enc->on_source_packet(2, src.ptr, 500);
+
+    size_t sz = 0;
+    uint64_t nonce = 0;
+    REQUIRE(enc->next_repair(repair.ptr, &sz, &nonce) == true);
+    REQUIRE(sz == 1400);
+    REQUIRE(enc->next_repair(repair.ptr, &sz, &nonce) == true);
+    REQUIRE(sz == 1400);
+    REQUIRE(enc->next_repair(repair.ptr, &sz, &nonce) == false);
 }
 
 

@@ -47,11 +47,13 @@ using namespace std;
 
 #include "wifibroadcast.hpp"
 #include "tx.hpp"
+#include "fec_block.hpp"
 
 Transmitter::Transmitter(const fec_params_t &params, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
-    fec_p(NULL), fec_k(-1), fec_n(-1),
+    encoder(),
+    fec_k(-1), fec_n(-1),
     block_idx(0), fragment_idx(0),
-    max_packet_size(0),
+    scratch(nullptr),
     epoch(epoch),
     channel_id(channel_id),
     fec_delay(fec_delay),
@@ -62,6 +64,16 @@ Transmitter::Transmitter(const fec_params_t &params, const string &keypair, uint
     session_packet_size(0),
     tags(tags)
 {
+    // Staging buffer for source framing (wpacket_hdr_t + payload + pad)
+    // and for draining repair payloads from the encoder. One aligned
+    // MAX_FEC_PAYLOAD-sized slot is enough because TX serializes every
+    // on_source_packet → send_block_fragment → next_repair step.
+    int rc_align = posix_memalign((void**)&scratch, ZFEX_SIMD_ALIGNMENT,
+                                  ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+    if (rc_align != 0) {
+        throw runtime_error(string_format("Transmitter: posix_memalign failed: %s",
+                                          strerror(rc_align)));
+    }
 
     FILE *fp;
     if ((fp = fopen(keypair.c_str(), "r")) == NULL)
@@ -85,60 +97,34 @@ Transmitter::Transmitter(const fec_params_t &params, const string &keypair, uint
 
 Transmitter::~Transmitter()
 {
-    if (fec_p != NULL)
-    {
-        deinit_session();
-    }
+    deinit_session();
+    free(scratch);
+    scratch = nullptr;
 }
 
 
 void Transmitter::deinit_session(void)
 {
-    for(int i=0; i < fec_n; i++)
-    {
-        free(block[i]);
-    }
-
-    delete[] block;
-
-    zfex_status_code_t rc = fec_free(fec_p);
-    assert(rc == ZFEX_SC_OK);
-
-    block = NULL;
-    fec_p = NULL;
+    encoder.reset();
     fec_k = -1;
     fec_n = -1;
 }
 
 void Transmitter::init_session(const fec_params_t &params)
 {
-    if (fec_p != NULL)
-    {
-        deinit_session();
-    }
+    deinit_session();
 
     // Phase 2a: only block FEC is wired through. Sliding params will
     // light up in Phase 2b once fec_swin is behind the interface.
     assert(params.fec_type == WFB_FEC_VDM_RS);
-
-    assert(fec_p == NULL);
     assert(params.k >= 1);
     assert(params.n >= 1);
     assert(params.n < 256);
     assert(params.k <= params.n);
 
+    encoder = make_fec_encoder(params);
     fec_k = params.k;
     fec_n = params.n;
-
-    zfex_status_code_t rc = fec_new(fec_k, fec_n, &fec_p);
-    assert(rc == ZFEX_SC_OK);
-
-    block = new uint8_t*[fec_n];
-    for(int i=0; i < fec_n; i++)
-    {
-        int _rc = posix_memalign((void**)&block[i], ZFEX_SIMD_ALIGNMENT, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
-        assert(_rc == 0);
-    }
 
     block_idx = 0;
     fragment_idx = 0;
@@ -623,7 +609,7 @@ void RemoteTransmitter::dump_stats(uint64_t ts, uint32_t &injected_packets, uint
 
 
 
-void Transmitter::send_block_fragment(size_t packet_size)
+void Transmitter::send_block_fragment(const uint8_t *buf, size_t packet_size, uint64_t data_nonce)
 {
     uint8_t ciphertext[MAX_FORWARDER_PACKET_SIZE];
     wblock_hdr_t *block_hdr = (wblock_hdr_t*)ciphertext;
@@ -632,11 +618,11 @@ void Transmitter::send_block_fragment(size_t packet_size)
     assert(packet_size <= MAX_FEC_PAYLOAD);
 
     block_hdr->packet_type = WFB_PACKET_DATA;
-    block_hdr->data_nonce = htobe64(((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx);
+    block_hdr->data_nonce = htobe64(data_nonce);
 
     // encrypted payload
     if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
-                                             block[fragment_idx], packet_size,
+                                             buf, packet_size,
                                              (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
                                              NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
     {
@@ -655,6 +641,7 @@ void Transmitter::send_session_key(void)
 bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
 {
     assert(size <= MAX_PAYLOAD_SIZE);
+    assert(encoder);
 
     // FEC-only packets are only for closing already opened blocks
     if (fragment_idx == 0 && (flags & WFB_PACKET_FEC_ONLY))
@@ -662,58 +649,69 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
         return false;
     }
 
-    wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)block[fragment_idx];
-
+    // Frame the source payload into our SIMD-aligned scratch buffer:
+    // wpacket_hdr_t (3 bytes) + user data + zero pad to MAX_FEC_PAYLOAD.
+    // This is the inner, AEAD-protected representation that the encoder
+    // copies into its parity-input block and that send_block_fragment
+    // encrypts as the source packet on the wire.
+    const size_t framed_size = sizeof(wpacket_hdr_t) + size;
+    wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)scratch;
     packet_hdr->flags = flags;
     packet_hdr->packet_size = htobe16(size);
 
-    if(size > 0)
+    if (size > 0)
     {
         assert(buf != NULL);
-        memcpy(block[fragment_idx] + sizeof(wpacket_hdr_t), buf, size);
+        memcpy(scratch + sizeof(wpacket_hdr_t), buf, size);
     }
 
-    memset(block[fragment_idx] + sizeof(wpacket_hdr_t) + size, '\0', MAX_FEC_PAYLOAD - (sizeof(wpacket_hdr_t) + size));
+    memset(scratch + framed_size, '\0', MAX_FEC_PAYLOAD - framed_size);
 
     // mark data packets with fwmark
-    if(fragment_idx == 0)
+    if (fragment_idx == 0)
     {
         set_mark(0);
     }
 
-    send_block_fragment(sizeof(wpacket_hdr_t) + size);
-    max_packet_size = max(max_packet_size, sizeof(wpacket_hdr_t) + size);
+    // Hand the framed source to the encoder (which copies it into its
+    // internal block slot and computes parities when it reaches k) and
+    // emit the source on the wire.
+    const uint64_t source_nonce = ((block_idx & BLOCK_IDX_MASK) << 8) | fragment_idx;
+    encoder->on_source_packet(source_nonce, scratch, framed_size);
+    send_block_fragment(scratch, framed_size, source_nonce);
     fragment_idx += 1;
 
     if (fragment_idx < fec_k)  return true;
 
-    zfex_status_code_t _rc = fec_encode_simd(fec_p, (const uint8_t**)block, block + fec_k, ZFEX_ROUND_UP_SIMD(max_packet_size));
-    assert(_rc == ZFEX_SC_OK);
-
     // mark fec packets with fwmark + 1
     set_mark(1);
 
-    while (fragment_idx < fec_n)
+    // Drain all repairs the encoder has ready for this block. For block
+    // FEC that's exactly (n - k) of them.
+    size_t repair_size = 0;
+    uint64_t repair_nonce = 0;
+    while (encoder->next_repair(scratch, &repair_size, &repair_nonce))
     {
-        if(fec_delay > 0)
+        if (fec_delay > 0)
         {
             struct timespec t = { .tv_sec = (time_t)(fec_delay / 1000000),
                                   .tv_nsec = (suseconds_t)(fec_delay % 1000000) * 1000 };
 
             int rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &t, NULL);
 
-            if(rc != 0 && rc != EINTR)
+            if (rc != 0 && rc != EINTR)
             {
                 throw runtime_error(string_format("clock_nanosleep: %s", strerror(rc)));
             }
         }
 
-        send_block_fragment(max_packet_size);
+        send_block_fragment(scratch, repair_size, repair_nonce);
         fragment_idx += 1;
     }
+    assert(fragment_idx == fec_n);
+
     block_idx += 1;
     fragment_idx = 0;
-    max_packet_size = 0;
 
     // Generate new session key after MAX_BLOCK_IDX blocks
     if (block_idx > MAX_BLOCK_IDX)
