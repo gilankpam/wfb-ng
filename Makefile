@@ -60,6 +60,13 @@ fec_test: src/fec_test.cpp src/zfex.o
 libsodium_test: src/libsodium_test.cpp
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) -lsodium $(shell pkg-config --libs catch2-with-main)
 
+# Gate G2 structural wire-diff tool. Drives a Transmitter with a
+# deterministic payload sequence and dumps (packet_type, data_nonce,
+# frame_size) per injected frame — everything about the wire format
+# that does NOT depend on random session_key / session_nonce.
+wire_capture: src/wire_capture.cpp src/tx_lib.o src/fec_block.o src/zfex.o src/wifibroadcast.o src/radiotap.o
+	$(CXX) $(_CFLAGS) -o $@ $^ $(_LDFLAGS) -lpcap
+
 # rx.cpp and tx.cpp each define their own main() for the wfb_rx / wfb_tx
 # CLI binaries. For the fec_baseline harness we link their object code but
 # need to keep OUR main() — rename theirs so they become regular symbols.
