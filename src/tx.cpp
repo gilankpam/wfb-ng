@@ -48,7 +48,7 @@ using namespace std;
 #include "wifibroadcast.hpp"
 #include "tx.hpp"
 
-Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
+Transmitter::Transmitter(const fec_params_t &params, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
     fec_p(NULL), fec_k(-1), fec_n(-1),
     block_idx(0), fragment_idx(0),
     max_packet_size(0),
@@ -80,7 +80,7 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     }
     fclose(fp);
 
-    init_session(k, n);
+    init_session(params);
 }
 
 Transmitter::~Transmitter()
@@ -110,21 +110,25 @@ void Transmitter::deinit_session(void)
     fec_n = -1;
 }
 
-void Transmitter::init_session(int k, int n)
+void Transmitter::init_session(const fec_params_t &params)
 {
     if (fec_p != NULL)
     {
         deinit_session();
     }
 
-    assert(fec_p == NULL);
-    assert(k >= 1);
-    assert(n >= 1);
-    assert(n < 256);
-    assert(k <= n);
+    // Phase 2a: only block FEC is wired through. Sliding params will
+    // light up in Phase 2b once fec_swin is behind the interface.
+    assert(params.fec_type == WFB_FEC_VDM_RS);
 
-    fec_k = k;
-    fec_n = n;
+    assert(fec_p == NULL);
+    assert(params.k >= 1);
+    assert(params.n >= 1);
+    assert(params.n < 256);
+    assert(params.k <= params.n);
+
+    fec_k = params.k;
+    fec_n = params.n;
 
     zfex_status_code_t rc = fec_new(fec_k, fec_n, &fec_p);
     assert(rc == ZFEX_SC_OK);
@@ -193,10 +197,10 @@ void Transmitter::init_session(int k, int n)
 }
 
 
-RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay,
+RawSocketTransmitter::RawSocketTransmitter(const fec_params_t &params, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay,
                                            vector<tags_item_t> &tags, const vector<string> &wlans, radiotap_header_t &radiotap_header,
                                            uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay) : \
-    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags),
+    Transmitter(params, keypair, epoch, channel_id, fec_delay, tags),
     channel_id(channel_id),
     current_output(0),
     ieee80211_seq(0),
@@ -455,10 +459,10 @@ RawSocketTransmitter::~RawSocketTransmitter()
 }
 
 
-RemoteTransmitter::RemoteTransmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay,
+RemoteTransmitter::RemoteTransmitter(const fec_params_t &params, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay,
                                      vector<tags_item_t> &tags, const vector<pair<string, vector<uint16_t>>> &remote_hosts, radiotap_header_t &radiotap_header,
                                      uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size) : \
-    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags),
+    Transmitter(params, keypair, epoch, channel_id, fec_delay, tags),
     channel_id(channel_id),
     current_output(0),
     ieee80211_seq(0),
@@ -714,7 +718,8 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
     // Generate new session key after MAX_BLOCK_IDX blocks
     if (block_idx > MAX_BLOCK_IDX)
     {
-        init_session(fec_k, fec_n);
+        fec_params_t rekey_params = {WFB_FEC_VDM_RS, fec_k, fec_n, 0, 0, 0};
+        init_session(rekey_params);
         for(int i = 0; i < fec_n - fec_k + 1; i++)
         {
             send_session_key();
@@ -873,7 +878,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                     // Close open FEC block if any
                     while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
 
-                    t->init_session(fec_k, fec_n);
+                    fec_params_t new_params = {WFB_FEC_VDM_RS, fec_k, fec_n, 0, 0, 0};
+                    t->init_session(new_params);
 
                     // Emulate FEC for initial session key distribution
                     for(int i = 0; i < fec_n - fec_k + 1; i++)
@@ -1464,15 +1470,17 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
         IPC_MSG_SEND();
     }
 
+    fec_params_t fec_params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
+
     if (debug_port)
     {
         WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
-        t = unique_ptr<UdpTransmitter>(new UdpTransmitter(k, n, keypair, "127.0.0.1", debug_port, epoch, channel_id,
+        t = unique_ptr<UdpTransmitter>(new UdpTransmitter(fec_params, keypair, "127.0.0.1", debug_port, epoch, channel_id,
                                                           fec_delay, tags, use_qdisc, fwmark, snd_buf_size));
     }
     else
     {
-        t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
+        t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(fec_params, keypair, epoch, channel_id, fec_delay, tags,
                                                                       wlans, radiotap_header, frame_type, use_qdisc, fwmark,
                                                                       inject_retries, inject_retry_delay));
     }
@@ -1508,15 +1516,17 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
     IPC_MSG("%" PRIu64 "\tLISTEN_UNIX_END\n", get_time_ms());
     IPC_MSG_SEND();
 
+    fec_params_t fec_params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
+
     if (debug_port)
     {
         WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
-        t = unique_ptr<UdpTransmitter>(new UdpTransmitter(k, n, keypair, "127.0.0.1", debug_port, epoch, channel_id,
+        t = unique_ptr<UdpTransmitter>(new UdpTransmitter(fec_params, keypair, "127.0.0.1", debug_port, epoch, channel_id,
                                                           fec_delay, tags, use_qdisc, fwmark, snd_buf_size));
     }
     else
     {
-        t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
+        t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(fec_params, keypair, epoch, channel_id, fec_delay, tags,
                                                                       wlans, radiotap_header, frame_type, use_qdisc, fwmark,
                                                                       inject_retries, inject_retry_delay));
     }
@@ -1593,7 +1603,8 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
     }
 
     vector<tags_item_t> tags;
-    unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
+    fec_params_t fec_params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
+    unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(fec_params, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
@@ -1655,7 +1666,8 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
     IPC_MSG_SEND();
 
     vector<tags_item_t> tags;
-    unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
+    fec_params_t fec_params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
+    unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(fec_params, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 

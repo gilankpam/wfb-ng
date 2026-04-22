@@ -118,7 +118,8 @@ class MockTransmitter : public Transmitter {
 public:
     MockTransmitter(int k, int n, const std::string& keypair,
                     std::vector<tags_item_t>& tags, uint32_t fec_delay = 0)
-        : Transmitter(k, n, keypair, kEpoch, kChannelId, fec_delay, tags) {}
+        : Transmitter(fec_params_t{WFB_FEC_VDM_RS, k, n, 0, 0, 0},
+                      keypair, kEpoch, kChannelId, fec_delay, tags) {}
 
     std::vector<std::vector<uint8_t>> sent;
 
@@ -828,6 +829,56 @@ TEST_CASE("pipeline end-to-end benchmark (encode + AEAD + ring + decode, 1-erasu
         REQUIRE(f.rx.delivered.size() == 8);
         return f.rx.delivered.size();
     };
+}
+
+
+// Phase 2a, commit A2: fec_params_t is now the carrier for init_session /
+// init_fec / all three Transmitter subclass constructors. These tests
+// verify the struct is threaded correctly on the block path — no
+// behavior change vs pre-A2. The existing C1-C20 baseline cases are the
+// byte-identity check; these three are direct struct-round-trip checks.
+
+TEST_CASE("A2 fec_params_t populates block-FEC k/n via Transmitter ctor",
+          "[A2][fec_params]") {
+    TestKeys keys;
+    std::vector<tags_item_t> empty_tags;
+    MockTransmitter tx(5, 9, keys.tx_path, empty_tags, 0);
+
+    int reported_k = -1, reported_n = -1;
+    tx.get_fec(reported_k, reported_n);
+    REQUIRE(reported_k == 5);
+    REQUIRE(reported_n == 9);
+}
+
+TEST_CASE("A2 init_session(fec_params_t) updates fec_k/fec_n on re-init",
+          "[A2][fec_params]") {
+    TestKeys keys;
+    std::vector<tags_item_t> empty_tags;
+    MockTransmitter tx(8, 12, keys.tx_path, empty_tags, 0);
+
+    int k0 = -1, n0 = -1;
+    tx.get_fec(k0, n0);
+    REQUIRE(k0 == 8);
+    REQUIRE(n0 == 12);
+
+    fec_params_t new_params = {WFB_FEC_VDM_RS, 4, 6, 0, 0, 0};
+    tx.init_session(new_params);
+
+    int k1 = -1, n1 = -1;
+    tx.get_fec(k1, n1);
+    REQUIRE(k1 == 4);
+    REQUIRE(n1 == 6);
+}
+
+TEST_CASE("A2 fec_params_t threaded end-to-end for non-default k/n",
+          "[A2][fec_params]") {
+    Fixture f(6, 10);  // non-default (k, n) exercises the new path with
+                       // values that differ from the baseline default.
+
+    f.send_data(6, 256);
+    PassThrough pt;
+    run_pipeline(f.tx, f.rx, pt);
+    REQUIRE(f.rx.delivered.size() == 6);
 }
 
 

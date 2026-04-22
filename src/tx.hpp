@@ -32,6 +32,7 @@
 
 #include "wifibroadcast.hpp"
 #include "tx_cmd.h"
+#include "fec_iface.hpp"
 
 
 // Tags item
@@ -72,11 +73,11 @@ typedef enum {
 class Transmitter
 {
 public:
-    Transmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags);
+    Transmitter(const fec_params_t &params, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags);
     virtual ~Transmitter();
     bool send_packet(const uint8_t *buf, size_t size, uint8_t flags);
     void send_session_key(void);
-    void init_session(int k, int n);
+    void init_session(const fec_params_t &params);
     void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
     virtual void select_output(int idx) = 0;
     virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
@@ -156,7 +157,7 @@ typedef std::unordered_map<uint64_t, txAntennaItem> tx_antenna_stat_t;
 class RawSocketTransmitter : public Transmitter
 {
 public:
-    RawSocketTransmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags,
+    RawSocketTransmitter(const fec_params_t &params, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags,
                          const std::vector<std::string> &wlans, radiotap_header_t &radiotap_header,
                          uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay);
     virtual ~RawSocketTransmitter();
@@ -204,9 +205,9 @@ private:
 class UdpTransmitter : public Transmitter
 {
 public:
-    UdpTransmitter(int k, int n, const std::string &keypair, const std::string &client_addr, int base_port, uint64_t epoch, uint32_t channel_id,
+    UdpTransmitter(const fec_params_t &params, const std::string &keypair, const std::string &client_addr, int base_port, uint64_t epoch, uint32_t channel_id,
                    uint32_t fec_delay, std::vector<tags_item_t> &tags, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size): \
-        Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags), radiotap_header({}), base_port(base_port), use_qdisc(use_qdisc), fwmark_base(fwmark_base)
+        Transmitter(params, keypair, epoch, channel_id, fec_delay, tags), radiotap_header({}), base_port(base_port), use_qdisc(use_qdisc), fwmark_base(fwmark_base)
     {
         sockfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (sockfd < 0) throw std::runtime_error(string_format("Error opening socket: %s", strerror(errno)));
@@ -309,7 +310,7 @@ private:
 class RemoteTransmitter : public Transmitter
 {
 public:
-    RemoteTransmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags,
+    RemoteTransmitter(const fec_params_t &params, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags,
                       const std::vector<std::pair<std::string, std::vector<uint16_t>>> &remote_hosts, radiotap_header_t &radiotap_header,
                       uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size);
     virtual ~RemoteTransmitter()

@@ -303,16 +303,20 @@ Aggregator::~Aggregator()
     }
 }
 
-void Aggregator::init_fec(int k, int n)
+void Aggregator::init_fec(const fec_params_t &params)
 {
-    assert(fec_p == NULL);
-    assert(k >= 1);
-    assert(n >= 1);
-    assert(n < 256);
-    assert(k <= n);
+    // Phase 2a: only block FEC is wired through. Sliding params will
+    // light up in Phase 2b once fec_swin is behind the interface.
+    assert(params.fec_type == WFB_FEC_VDM_RS);
 
-    fec_k = k;
-    fec_n = n;
+    assert(fec_p == NULL);
+    assert(params.k >= 1);
+    assert(params.n >= 1);
+    assert(params.n < 256);
+    assert(params.k <= params.n);
+
+    fec_k = params.k;
+    fec_n = params.n;
 
     zfex_status_code_t rc = fec_new(fec_k, fec_n, &fec_p);
     assert(rc == ZFEX_SC_OK);
@@ -693,7 +697,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 deinit_fec();
             }
 
-            init_fec(new_session_data->k, new_session_data->n);
+            // Phase 2a: fec_type guard at rx.cpp:659-664 already rejected
+            // anything other than WFB_FEC_VDM_RS, so k and n are populated
+            // from the fixed session header. Sliding fields stay zero
+            // until Phase 2b adds the TLV extraction.
+            fec_params_t session_params = {WFB_FEC_VDM_RS,
+                                           new_session_data->k,
+                                           new_session_data->n,
+                                           0, 0, 0};
+            init_fec(session_params);
 
             IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
             IPC_MSG_SEND();

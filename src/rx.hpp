@@ -33,6 +33,7 @@
 
 #include "wifibroadcast.hpp"
 #include "zfex.h"
+#include "fec_iface.hpp"
 
 // Forward declaration for isolated packet loss notification
 class PacketLossListener
@@ -218,7 +219,7 @@ private:
     Aggregator(const Aggregator&);
     Aggregator& operator=(const Aggregator&);
 
-    void init_fec(int k, int n);
+    void init_fec(const fec_params_t &params);
     void deinit_fec(void);
     void send_packet(int ring_idx, int fragment_idx);
     void apply_fec(int ring_idx);
