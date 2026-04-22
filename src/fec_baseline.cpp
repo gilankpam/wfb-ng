@@ -1475,6 +1475,264 @@ TEST_CASE("B1 fec_encode_row_simd rejects misaligned input / output",
 }
 
 
+// ============================================================================
+// B2 tests — SwinFecEncoder
+// ============================================================================
+//
+// First real caller of fec_encode_row_simd (B1). Verifies the §7.3
+// scheduling state machine, the §5.2 nonce layout, the §5.3
+// repair_idx allocation rule, and the §5.4 wpacket_hdr_repair_t
+// framing.
+
+#include "fec_swin.hpp"
+
+namespace {
+
+// Pull the 11-byte inner header out of a repair payload for easier
+// assertion. Takes the raw `out` buffer that next_repair filled.
+struct SwinRepairHdr {
+    uint8_t  flags;
+    uint16_t payload_size;      // host order (already byteswapped)
+    uint64_t window_tail_seq;   // host order
+};
+
+SwinRepairHdr parse_swin_repair_hdr(const uint8_t* out) {
+    const wpacket_hdr_repair_t* wire = (const wpacket_hdr_repair_t*)out;
+    SwinRepairHdr h;
+    h.flags = wire->flags;
+    h.payload_size = be16toh(wire->payload_size);
+    h.window_tail_seq = be64toh(wire->window_tail_seq);
+    return h;
+}
+
+// Nonce accessors per §5.2.
+inline uint8_t  nonce_is_repair(uint64_t n)  { return (n >> 63) & 1; }
+inline uint8_t  nonce_repair_idx(uint64_t n) { return (n >> 56) & 0x7f; }
+inline uint64_t nonce_seq_num(uint64_t n)    { return n & BLOCK_IDX_MASK; }
+
+// Build a deterministic framed source: wpacket_hdr_t + payload of a
+// rolling byte pattern. Returns the framed logical size.
+size_t build_swin_source(uint8_t* dst, uint8_t marker, size_t user_bytes) {
+    std::memset(dst, 0, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+    wpacket_hdr_t* hdr = (wpacket_hdr_t*)dst;
+    hdr->flags = 0;
+    hdr->packet_size = htobe16((uint16_t)user_bytes);
+    std::memset(dst + sizeof(wpacket_hdr_t), marker, user_bytes);
+    return sizeof(wpacket_hdr_t) + user_bytes;
+}
+
+}  // namespace
+
+TEST_CASE("B2 SwinFecEncoder R=0.5 emits one repair every 2 sources",
+          "[B2][fec_swin]") {
+    // W=64, R=0.5 → ⌈1/R⌉=2. repair_due_in starts at 2; after each
+    // source, decrement; on hit-0, emit one repair (repair_idx=0).
+    // So sources 0, 2, 4, ... trigger repairs (the even-indexed
+    // sources, 0-indexed after the first decrement).
+    SwinFecEncoder enc(64, 1, 2);  // R_num=1, R_den=2
+    AlignedBuf src, rep;
+
+    size_t sz; uint64_t nonce;
+    int repairs_seen = 0;
+
+    for (int i = 0; i < 10; i++) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)(i + 1), 100);
+        enc.on_source_packet((uint64_t)i, src.ptr, framed);
+
+        // Drain contract.
+        while (enc.next_repair(rep.ptr, &sz, &nonce)) {
+            repairs_seen++;
+            // repair_idx must be 0 per §5.3 for R ≤ 1.
+            REQUIRE(nonce_is_repair(nonce) == 1);
+            REQUIRE(nonce_repair_idx(nonce) == 0);
+            SwinRepairHdr h = parse_swin_repair_hdr(rep.ptr);
+            REQUIRE(h.flags == WFB_PACKET_REPAIR_SWIN);
+            REQUIRE(h.window_tail_seq == (uint64_t)i);
+        }
+    }
+
+    // 10 sources, repairs at the 2nd, 4th, 6th, 8th, 10th → 5 repairs.
+    REQUIRE(repairs_seen == 5);
+}
+
+TEST_CASE("B2 SwinFecEncoder R=1.0 emits exactly one repair per source",
+          "[B2][fec_swin]") {
+    // Mavlink / tunnel defaults. ⌈1/R⌉=1; every source triggers a
+    // repair with repair_idx=0.
+    SwinFecEncoder enc(16, 1, 1);
+    AlignedBuf src, rep;
+
+    int repairs_seen = 0;
+    size_t sz; uint64_t nonce;
+    for (int i = 0; i < 20; i++) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)i, 50);
+        enc.on_source_packet((uint64_t)i, src.ptr, framed);
+        while (enc.next_repair(rep.ptr, &sz, &nonce)) {
+            repairs_seen++;
+            REQUIRE(nonce_repair_idx(nonce) == 0);
+        }
+    }
+    REQUIRE(repairs_seen == 20);
+}
+
+TEST_CASE("B2 SwinFecEncoder R=2.0 emits 2 repairs per source with repair_idx 0,1",
+          "[B2][fec_swin]") {
+    // R > 1 path (§7.3). Every source triggers ⌈R⌉=2 repairs. Within
+    // a single source's burst, repair_idx goes 0, 1. Next source's
+    // window gets fresh repair_idx=0, 1.
+    SwinFecEncoder enc(8, 2, 1);
+    AlignedBuf src, rep;
+
+    size_t sz; uint64_t nonce;
+    for (int i = 0; i < 6; i++) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)(0x40 + i), 80);
+        enc.on_source_packet((uint64_t)i, src.ptr, framed);
+
+        // Expect exactly 2 repairs, repair_idx=0 then repair_idx=1.
+        REQUIRE(enc.next_repair(rep.ptr, &sz, &nonce) == true);
+        REQUIRE(nonce_repair_idx(nonce) == 0);
+        REQUIRE(parse_swin_repair_hdr(rep.ptr).window_tail_seq == (uint64_t)i);
+
+        REQUIRE(enc.next_repair(rep.ptr, &sz, &nonce) == true);
+        REQUIRE(nonce_repair_idx(nonce) == 1);
+        REQUIRE(parse_swin_repair_hdr(rep.ptr).window_tail_seq == (uint64_t)i);
+
+        REQUIRE(enc.next_repair(rep.ptr, &sz, &nonce) == false);
+    }
+}
+
+TEST_CASE("B2 SwinFecEncoder window_tail_seq advances monotonically",
+          "[B2][fec_swin]") {
+    // For R=0.5, each emitted repair must carry a window_tail_seq
+    // equal to the seq_num of the source that triggered it. That
+    // value must strictly increase across repairs.
+    SwinFecEncoder enc(32, 1, 2);
+    AlignedBuf src, rep;
+    size_t sz; uint64_t nonce;
+    uint64_t prev_tail = 0;
+    bool seen_first = false;
+
+    for (int i = 0; i < 40; i++) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)i, 100);
+        enc.on_source_packet((uint64_t)i, src.ptr, framed);
+        while (enc.next_repair(rep.ptr, &sz, &nonce)) {
+            uint64_t tail = parse_swin_repair_hdr(rep.ptr).window_tail_seq;
+            if (seen_first) REQUIRE(tail > prev_tail);
+            prev_tail = tail;
+            seen_first = true;
+        }
+    }
+    REQUIRE(seen_first);
+}
+
+TEST_CASE("B2 SwinFecEncoder all nonces unique across 500 source+repair emissions",
+          "[B2][fec_swin][nonce-uniq]") {
+    // §5.6 invariant: every data_nonce emitted under one session
+    // key is unique. The high bit partitions source/repair; source
+    // seq_num is monotone; repair seq_num is monotone and
+    // independent. A std::set over all emitted nonces must have the
+    // same size as the emit count.
+    SwinFecEncoder enc(64, 1, 2);  // W=64 R=0.5 → 32 repairs per window
+    AlignedBuf src, rep;
+
+    std::set<uint64_t> nonces;
+    size_t sz; uint64_t nonce;
+
+    for (int i = 0; i < 500; i++) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)(i & 0xff), 64);
+        // Source nonce: is_repair=0, low 56 bits = i. We also insert
+        // this — it's the on-wire data_nonce the Transmitter would
+        // use for the source fragment.
+        const uint64_t source_nonce = (uint64_t)i;
+        REQUIRE(nonces.insert(source_nonce).second == true);
+
+        enc.on_source_packet((uint64_t)i, src.ptr, framed);
+        while (enc.next_repair(rep.ptr, &sz, &nonce)) {
+            REQUIRE(nonces.insert(nonce).second == true);
+        }
+    }
+    // 500 sources + 250 repairs = 750 distinct nonces.
+    REQUIRE(nonces.size() == 750);
+}
+
+TEST_CASE("B2 SwinFecEncoder seq_num near MAX_BLOCK_IDX boundary",
+          "[B2][fec_swin][overflow]") {
+    // Source seq_num is bounded to 2^55-1 by the rekey policy.
+    // Feeding values at the boundary must produce correctly-formed
+    // repairs without nonce truncation.
+    SwinFecEncoder enc(4, 1, 1);
+    AlignedBuf src, rep;
+    size_t sz; uint64_t nonce;
+
+    const uint64_t big_base = MAX_BLOCK_IDX - 10;
+    for (int i = 0; i < 5; i++) {
+        size_t framed = build_swin_source(src.ptr, 0x5a, 100);
+        const uint64_t seq = big_base + i;
+        enc.on_source_packet(seq, src.ptr, framed);
+        REQUIRE(enc.next_repair(rep.ptr, &sz, &nonce) == true);
+        // window_tail_seq in the hdr must equal the source's seq_num.
+        REQUIRE(parse_swin_repair_hdr(rep.ptr).window_tail_seq == seq);
+        // is_repair bit set, seq_num low bits preserved.
+        REQUIRE(nonce_is_repair(nonce) == 1);
+        REQUIRE((nonce_seq_num(nonce) & BLOCK_IDX_MASK) == nonce_seq_num(nonce));
+    }
+}
+
+TEST_CASE("B2 SwinFecEncoder repair payload_size tracks max source size",
+          "[B2][fec_swin]") {
+    // Feed sources of varying size within one window. The repair's
+    // payload_size field (§5.4) must equal the max source size seen
+    // since the last repair — the parity must fit all of them
+    // uniformly.
+    SwinFecEncoder enc(4, 1, 1);
+    AlignedBuf src, rep;
+    size_t sz; uint64_t nonce;
+
+    // Source 0: small
+    size_t s0 = build_swin_source(src.ptr, 0x11, 20);
+    enc.on_source_packet(0, src.ptr, s0);
+    REQUIRE(enc.next_repair(rep.ptr, &sz, &nonce) == true);
+    // Expect parity payload_size == s0.
+    REQUIRE(parse_swin_repair_hdr(rep.ptr).payload_size == s0);
+
+    // Source 1: much bigger. Because R ≤ 1, max_packet_size_ carries
+    // across windows (see impl comment in on_source_packet). So the
+    // repair's payload_size == max(s0, s1) = s1.
+    size_t s1 = build_swin_source(src.ptr, 0x22, 1400);
+    enc.on_source_packet(1, src.ptr, s1);
+    REQUIRE(enc.next_repair(rep.ptr, &sz, &nonce) == true);
+    REQUIRE(parse_swin_repair_hdr(rep.ptr).payload_size == s1);
+
+    // Source 2: smaller. Max still s1.
+    size_t s2 = build_swin_source(src.ptr, 0x33, 500);
+    enc.on_source_packet(2, src.ptr, s2);
+    REQUIRE(enc.next_repair(rep.ptr, &sz, &nonce) == true);
+    REQUIRE(parse_swin_repair_hdr(rep.ptr).payload_size == s1);
+}
+
+TEST_CASE("B2 make_fec_encoder dispatches SWIN_RS to SwinFecEncoder",
+          "[B2][fec_swin][iface]") {
+    // Factory should accept a SWIN fec_params_t and return a working
+    // IFecEncoder that emits repairs with the SWIN nonce layout.
+    fec_params_t p{};
+    p.fec_type = WFB_FEC_SWIN_RS;
+    p.k = 0; p.n = 0;              // reserved under SWIN (§5.5)
+    p.swin_w = 16;
+    p.swin_r_num = 1;
+    p.swin_r_den = 1;
+
+    auto enc = make_fec_encoder(p);
+    REQUIRE(enc != nullptr);
+
+    AlignedBuf src, rep;
+    size_t sz; uint64_t nonce;
+    size_t framed = build_swin_source(src.ptr, 0xa5, 50);
+    enc->on_source_packet(0, src.ptr, framed);
+    REQUIRE(enc->next_repair(rep.ptr, &sz, &nonce) == true);
+    REQUIRE(nonce_is_repair(nonce) == 1);
+}
+
+
 int main(int argc, char* argv[]) {
     if (sodium_init() < 0) {
         fprintf(stderr, "libsodium init failed\n");

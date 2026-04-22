@@ -5,6 +5,7 @@
 // make_fec_decoder stub; A3b replaces the stub with BlockFecDecoder.
 
 #include "fec_block.hpp"
+#include "fec_swin.hpp"
 #include "wifibroadcast.hpp"
 
 #include <cassert>
@@ -139,9 +140,20 @@ void BlockFecEncoder::tick(uint64_t /*now_ms*/) {
 // ----- Factories (from fec_iface.hpp) ------------------------------------
 
 std::unique_ptr<IFecEncoder> make_fec_encoder(const fec_params_t& params) {
-    // Phase 2a: only block FEC is wired through. SWIN lands in Phase 2b.
-    assert(params.fec_type == WFB_FEC_VDM_RS);
-    return std::unique_ptr<IFecEncoder>(new BlockFecEncoder(params.k, params.n));
+    switch (params.fec_type) {
+        case WFB_FEC_VDM_RS:
+            return std::unique_ptr<IFecEncoder>(
+                new BlockFecEncoder(params.k, params.n));
+        case WFB_FEC_SWIN_RS:
+            // B2: SwinFecEncoder lands here. SwinFecDecoder is B3.
+            return std::unique_ptr<IFecEncoder>(
+                new SwinFecEncoder(params.swin_w,
+                                   params.swin_r_num,
+                                   params.swin_r_den));
+        default:
+            throw std::runtime_error(
+                "make_fec_encoder: unknown fec_type");
+    }
 }
 
 std::unique_ptr<IFecDecoder> make_fec_decoder(const fec_params_t& params,
