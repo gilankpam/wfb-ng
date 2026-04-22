@@ -90,6 +90,20 @@ test: all_bin fec_test libsodium_test fec_baseline
 	./fec_baseline
 	PYTHONPATH=`pwd` $(PYTHON) -m twisted.trial wfb_ng.tests
 
+# Rebuild fec_baseline under AddressSanitizer and run it. Commit reports
+# for Phase 2a (A2-A4) reference this target. Does a clean rebuild because
+# .o files don't track sanitizer flags.
+test-asan:
+	$(MAKE) clean
+	$(MAKE) fec_baseline CFLAGS="$(CFLAGS) -g -fno-omit-frame-pointer -fsanitize=address -fsanitize-address-use-after-scope" LDFLAGS="$(LDFLAGS) -fsanitize=address"
+	./fec_baseline
+
+# Rebuild fec_baseline under UndefinedBehaviorSanitizer and run it.
+test-ubsan:
+	$(MAKE) clean
+	$(MAKE) fec_baseline CFLAGS="$(CFLAGS) -g -fno-omit-frame-pointer -fsanitize=undefined" LDFLAGS="$(LDFLAGS) -fsanitize=undefined"
+	./fec_baseline
+
 rpm:  all_bin wfb_rtsp $(ENV)
 	rm -rf dist
 	$$(PATH=$(ENV)/bin:$(ENV)/local/bin:$(PATH) which python3) ./setup.py bdist_rpm --force-arch $(ARCH) --requires python3-twisted,python3-pyroute2,python3-pyserial,python3-msgpack,python3-jinja2,python3-yaml,socat,iw
