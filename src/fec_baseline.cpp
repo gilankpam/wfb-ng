@@ -2511,6 +2511,158 @@ TEST_CASE("B7 block fixture keeps Aggregator::count_w_flush at zero",
 }
 
 
+// ============================================================================
+// B8 tests — integration: SWIN TX → SWIN RX end-to-end through the full
+// wire pipeline (framing, nonce, AEAD, session TLVs, inner repair header).
+//
+// These exercise what B3 (decoder direct) and B4 (narrow wire) could not:
+// the full Transmitter / Aggregator stack under realistic loss patterns,
+// with Aggregator's public counters as the observable.
+//
+// Where B3 drove the decoder with synthetic inputs and B4 checked each
+// wire piece in isolation, B8 asserts the composed system behaves
+// correctly — losing sources on the wire, having repairs recover them,
+// and having Aggregator's counters reflect the recovery accurately.
+// ============================================================================
+
+namespace {
+
+// Drop a set of source seq_nums on the SWIN wire. Source identification
+// uses data_nonce's bit-63 = 0 + low 56 bits = seq_num (§5.2). Session
+// and repair packets always pass through.
+class DropSwinSources : public LossFilter {
+public:
+    DropSwinSources(std::initializer_list<uint64_t> drops)
+        : drops_(drops) {}
+    DropSwinSources(std::set<uint64_t> drops) : drops_(std::move(drops)) {}
+    bool deliver(size_t, const uint8_t* buf, size_t size) override {
+        if (size < sizeof(wblock_hdr_t)) return true;
+        if (buf[0] != WFB_PACKET_DATA) return true;
+        uint64_t nonce_be;
+        std::memcpy(&nonce_be, buf + offsetof(wblock_hdr_t, data_nonce),
+                    sizeof(nonce_be));
+        uint64_t nonce = be64toh(nonce_be);
+        const bool is_repair = (nonce >> 63) & 1;
+        if (is_repair) return true;
+        const uint64_t seq_num = nonce & BLOCK_IDX_MASK;
+        return drops_.find(seq_num) == drops_.end();
+    }
+private:
+    std::set<uint64_t> drops_;
+};
+
+}  // namespace
+
+
+TEST_CASE("B8 SWIN loopback: W=64 R=1/2 lossless delivers 128 sources in order",
+          "[B8][swin][integration][lossless]") {
+    SwinFixture f(/*W=*/64, /*R_num=*/1, /*R_den=*/2);
+    const int N = 128;
+    const size_t payload_size = 256;
+    f.send_data(N, payload_size);
+    PassThrough pt;
+    run_pipeline(f.tx, f.rx, pt);
+
+    REQUIRE(f.rx.count_p_dec_err == 0);
+    REQUIRE(f.rx.count_p_bad == 0);
+    REQUIRE(f.rx.delivered.size() == (size_t)N);
+    REQUIRE(f.rx.count_p_fec_recovered == 0);  // no loss → no recovery
+    REQUIRE(f.rx.count_w_flush == 0);
+
+    // Content check: each delivered payload is `seed+i` bytes.
+    for (int i = 0; i < N; i++) {
+        REQUIRE(f.rx.delivered[i].size() == payload_size);
+        REQUIRE(f.rx.delivered[i][0] == (uint8_t)i);
+    }
+}
+
+
+TEST_CASE("B8 SWIN loopback: isolated losses recover under R=1/2",
+          "[B8][swin][integration][recovery]") {
+    // §7.2 R<1 regime: each window carries only 1 repair, so every
+    // loss must sit alone inside its coverage window of W sources.
+    // Spacing < W puts two losses inside one window → that window's
+    // single equation can't solve for both, and cascade only helps
+    // if another window sees the losses in isolation. Tests that
+    // want to exercise scattered-with-cascade recovery under R<1
+    // need spacing ≥ W, not just any-scatter.
+    SwinFixture f(/*W=*/64, /*R_num=*/1, /*R_den=*/2);
+    const int N = 256;
+    f.send_data(N, /*size=*/200);
+
+    // Two losses, 80 apart (> W=64). Each sits alone in its coverage
+    // window [tail-63..tail] when tail ≥ loss_seq.
+    DropSwinSources drop({20, 100});
+    run_pipeline(f.tx, f.rx, drop);
+
+    REQUIRE(f.rx.count_p_bad == 0);
+    REQUIRE(f.rx.delivered.size() == (size_t)N);
+    REQUIRE(f.rx.count_p_fec_recovered == 2);
+    REQUIRE(f.rx.count_w_flush == 0);
+
+    // Recovered sources carry the correct seeded content. Bytes were
+    // written with value (uint8_t)i at index 0 — note seq=20 → i=20
+    // wraps each 256 so delivered[100][0] == 100.
+    REQUIRE(f.rx.delivered[20][0]  == (uint8_t)20);
+    REQUIRE(f.rx.delivered[100][0] == (uint8_t)100);
+}
+
+
+TEST_CASE("B8 SWIN loopback: consecutive burst recovers via cascade under R=1/1",
+          "[B8][swin][integration][recovery][burst]") {
+    SwinFixture f(/*W=*/16, /*R_num=*/1, /*R_den=*/1);
+    const int N = 48;
+    f.send_data(N, /*size=*/200);
+
+    // Drop 4 consecutive sources mid-stream. Under R=1/1 every
+    // source triggers one repair; the overlap + cascade (§7.4)
+    // propagates solutions across adjacent windows until the burst
+    // is fully recovered.
+    DropSwinSources drop({20, 21, 22, 23});
+    run_pipeline(f.tx, f.rx, drop);
+
+    REQUIRE(f.rx.count_p_bad == 0);
+    REQUIRE(f.rx.delivered.size() == (size_t)N);
+    REQUIRE(f.rx.count_p_fec_recovered == 4);
+    REQUIRE(f.rx.count_w_flush == 0);
+    REQUIRE(f.rx.delivered[20][0] == (uint8_t)20);
+    REQUIRE(f.rx.delivered[23][0] == (uint8_t)23);
+}
+
+
+TEST_CASE("B8 SWIN wire distinctness: source nonces < 2^63, repair nonces >= 2^63",
+          "[B8][swin][integration][wire]") {
+    SwinFixture f(/*W=*/16, /*R_num=*/1, /*R_den=*/1);
+    f.send_data(/*count=*/32, /*size=*/100);
+
+    // §5.2 invariant: source data_nonce has bit 63 = 0, repair
+    // has bit 63 = 1. Walk the TX capture and check every DATA
+    // packet partitions cleanly. This is a full-stack check that
+    // the TX-side nonce assembly survives through send_block_fragment's
+    // htobe64 wrap and out to the wire unchanged.
+    size_t sources = 0;
+    size_t repairs = 0;
+    for (const auto& pkt : f.tx.sent) {
+        if (pkt.empty() || pkt[0] != WFB_PACKET_DATA) continue;
+        uint64_t n = parse_data_nonce(pkt);
+        const uint8_t top = (uint8_t)(n >> 56);  // is_repair | repair_idx
+        if (top & 0x80) {
+            // Repair: bit 63 set, repair_idx = low 7 bits.
+            repairs++;
+            const uint8_t repair_idx = top & 0x7f;
+            // Under R=1/1 repair_idx is always 0 per §5.3 (R ≤ 1).
+            REQUIRE(repair_idx == 0);
+        } else {
+            // Source: entire top byte is zero (is_repair=0, repair_idx=0).
+            sources++;
+            REQUIRE(top == 0);
+        }
+    }
+    REQUIRE(sources == 32);
+    REQUIRE(repairs == 32);   // R=1/1
+}
+
+
 TEST_CASE("B7 SWIN fixture exposes count_w_flush mirror from decoder",
           "[B7][swin]") {
     SwinFixture f(/*W=*/8, /*R_num=*/1, /*R_den=*/1);
