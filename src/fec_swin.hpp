@@ -38,6 +38,8 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <map>
+#include <vector>
 
 // Inner-header layout for SWIN repair packets (§5.4). Lives inside
 // the AEAD-encrypted payload. Fields are big-endian on the wire;
@@ -146,6 +148,142 @@ private:
     // Independent of the source-side seq_num tracked via
     // window_tail_seq_.
     uint64_t repair_seq_next_;
+};
+
+
+// SwinFecDecoder — decoder half of the sliding-window codec.
+//
+// RX model (§7.4):
+// - Source ring with W_rx = 2·W slots; slot = seq_num % W_rx.
+// - Repair store keyed by (window_tail_seq, repair_idx), up to
+//   W_rx · R entries in practice; implemented as std::map (dynamic).
+// - On each source arrival: place in ring, track arrival time, try
+//   to drain pop_ready in order.
+// - On each repair arrival: store by key, attempt to decode the
+//   window [window_tail - W + 1, window_tail] if total known inputs
+//   (source + repair) ≥ W.
+// - Emit order: pop_ready returns source packets in increasing
+//   seq_num order (B0: seq_out IS the flat packet_seq). Gaps in
+//   the front are waited for (recovery or T_flush).
+// - tick(now_ms): if any RECEIVED/RECOVERED slot ahead of
+//   next_emit_seq has been sitting for ≥ T_flush ms, force-advance
+//   past the gaps between; count_w_flush++ per flush event.
+//
+// Ownership / thread model same as SwinFecEncoder.
+class SwinFecDecoder : public IFecDecoder {
+public:
+    SwinFecDecoder(uint16_t W, uint8_t R_num, uint8_t R_den,
+                   PacketLossListener* loss_listener,
+                   uint64_t T_flush_ms);
+    ~SwinFecDecoder() override;
+
+    void on_source_packet(uint64_t seq,
+                          const uint8_t* payload,
+                          size_t sz) override;
+
+    void on_repair_packet(uint64_t repair_nonce,
+                          uint64_t window_tail_seq,
+                          uint8_t  repair_idx,
+                          const uint8_t* payload,
+                          size_t sz) override;
+
+    bool pop_ready(uint64_t* seq_out,
+                   uint8_t* out,
+                   size_t* sz_out) override;
+
+    void tick(uint64_t now_ms) override;
+
+    // IFecDecoder B0 accessors.
+    bool is_repair_fragment(uint64_t data_nonce) const override {
+        return (data_nonce >> 63) & 1;
+    }
+    uint32_t count_p_fec_recovered() const override { return count_p_fec_recovered_; }
+    uint32_t count_p_override() const override { return 0; }  // block-specific
+    uint32_t count_w_flush() const override { return count_w_flush_; }
+
+private:
+    SwinFecDecoder(const SwinFecDecoder&) = delete;
+    SwinFecDecoder& operator=(const SwinFecDecoder&) = delete;
+
+    struct SourceSlot {
+        uint64_t seq;               // which seq this slot currently
+                                    // holds; UINT64_MAX = never used
+        uint8_t* data;              // aligned MAX_FEC_PAYLOAD buffer
+        size_t   data_size;         // logical payload size (incl.
+                                    // wpacket_hdr_t)
+        enum State : uint8_t {
+            EMPTY = 0,              // slot known to exist (seq set)
+                                    // but no data yet (gap)
+            RECEIVED,               // source arrived on the wire
+            RECOVERED,              // filled via fec_decode_simd
+            EMITTED,                // already popped by caller
+        } state;
+        uint64_t arrival_time_ms;   // when this slot was marked
+                                    // RECEIVED or RECOVERED
+                                    // (for T_flush deadline)
+    };
+
+    struct RepairKey {
+        uint64_t window_tail_seq;
+        uint8_t  repair_idx;
+        bool operator<(const RepairKey& o) const {
+            if (window_tail_seq != o.window_tail_seq) {
+                return window_tail_seq < o.window_tail_seq;
+            }
+            return repair_idx < o.repair_idx;
+        }
+    };
+
+    struct RepairEntry {
+        uint8_t* data;              // aligned parity buffer
+        size_t   data_size;         // parity_len from wpacket_hdr_repair_t
+        uint64_t arrival_time_ms;
+    };
+
+    // Internal helpers.
+    void advance_max_seq(uint64_t new_max);
+
+    // One decode attempt for window ending at `tail`, parity
+    // payload size `parity_len`. Returns newly-recovered seqs
+    // (empty if no progress). Idempotent: calling twice with the
+    // same (tail, parity_len) does no additional work.
+    std::vector<uint64_t> do_decode_once(uint64_t tail, size_t parity_len);
+
+    // Cascade: seed a decode at (tail, parity_len), then for each
+    // newly-recovered source seq S, retry decode for any
+    // repair-bearing window covering S (tail ∈ [S, S+W-1]).
+    // Iterative (worklist) to avoid stack blow-up on long bursts.
+    void cascade_decode(uint64_t initial_tail, size_t initial_parity_len);
+
+    bool drain_one(uint64_t* seq_out, uint8_t* out, size_t* sz_out);
+
+    // Configuration.
+    const uint16_t W_;
+    const uint16_t W_rx_;           // 2 * W
+    const uint16_t repairs_per_window_;
+    const uint64_t T_flush_ms_;
+
+    fec_t* fec_p_;
+    PacketLossListener* loss_listener_;
+
+    std::vector<SourceSlot> ring_;  // sized to W_rx_ at ctor
+    std::map<RepairKey, RepairEntry> repair_store_;
+
+    // Stream state.
+    uint64_t max_seq_received_;
+    uint64_t next_emit_seq_;
+    bool     has_any_source_;
+    uint64_t last_tick_ms_;
+
+    // Stats (IFecDecoder accessors return these).
+    uint32_t count_p_fec_recovered_;
+    uint32_t count_w_flush_;
+
+    // Decode scratch (reused across try_decode_window calls to avoid
+    // per-call heap alloc). Resized to W_ at ctor.
+    std::vector<const gf*>     decode_inpkts_;
+    std::vector<gf*>           decode_outpkts_;
+    std::vector<unsigned int>  decode_index_;
 };
 
 #endif // FEC_SWIN_HPP

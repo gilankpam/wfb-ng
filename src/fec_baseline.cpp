@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
@@ -1730,6 +1731,337 @@ TEST_CASE("B2 make_fec_encoder dispatches SWIN_RS to SwinFecEncoder",
     enc->on_source_packet(0, src.ptr, framed);
     REQUIRE(enc->next_repair(rep.ptr, &sz, &nonce) == true);
     REQUIRE(nonce_is_repair(nonce) == 1);
+}
+
+
+// ============================================================================
+// B3 tests — SwinFecDecoder
+// ============================================================================
+//
+// Encoder/decoder handshake tests. Each test builds a real encoder,
+// pipes sources + repairs through a DropFilter, and drives the
+// decoder. The decoder's pop_ready output is verified for order,
+// completeness, and correct payload content.
+
+namespace {
+
+// Pipe helper: feed source i through enc/dec, collecting the
+// encoder's output (1 source + any repairs) and delivering them to
+// the decoder unless filtered.
+struct SwinPipeResult {
+    std::vector<uint64_t> delivered_seqs;   // in pop_ready order
+    uint32_t fec_recovered;
+    uint32_t w_flush;
+};
+
+// Predicate: given (is_repair, seq_or_nonce, window_tail), decide
+// whether to drop.
+// For source packets: is_repair=false, arg = source seq_num.
+// For repair packets: is_repair=true,  arg = repair_seq_num (from
+// nonce low 56 bits), window_tail passed for convenience.
+using DropPred = std::function<bool(bool is_repair,
+                                    uint64_t seq_or_nonce_seq,
+                                    uint64_t window_tail)>;
+
+SwinPipeResult run_swin_pipeline(uint16_t W, uint8_t R_num, uint8_t R_den,
+                                 uint64_t T_flush_ms,
+                                 int num_sources,
+                                 DropPred drop_pred) {
+    SwinFecEncoder enc(W, R_num, R_den);
+    SwinFecDecoder dec(W, R_num, R_den, /*listener=*/nullptr, T_flush_ms);
+
+    AlignedBuf tx_scratch;
+    AlignedBuf rep_scratch;
+    AlignedBuf out_scratch;
+
+    SwinPipeResult result{};
+    uint64_t fake_time_ms = 0;
+
+    auto drain_decoder = [&]() {
+        uint64_t seq_out = 0;
+        size_t sz_out = 0;
+        while (dec.pop_ready(&seq_out, out_scratch.ptr, &sz_out)) {
+            result.delivered_seqs.push_back(seq_out);
+        }
+    };
+
+    dec.tick(fake_time_ms);  // prime last_tick_ms_
+
+    for (int i = 0; i < num_sources; i++) {
+        const uint64_t seq = (uint64_t)i;
+        size_t framed = build_swin_source(tx_scratch.ptr, (uint8_t)(i & 0xff), 200);
+        enc.on_source_packet(seq, tx_scratch.ptr, framed);
+
+        // Encoder's source nonce = seq (is_repair=0, repair_idx=0).
+        // Deliver source unless dropped.
+        if (!drop_pred(false, seq, 0)) {
+            dec.on_source_packet(seq, tx_scratch.ptr, framed);
+            drain_decoder();
+        }
+
+        // Drain repairs.
+        size_t sz; uint64_t nonce;
+        while (enc.next_repair(rep_scratch.ptr, &sz, &nonce)) {
+            const uint64_t r_seq = nonce & BLOCK_IDX_MASK;
+            const uint8_t r_idx = (nonce >> 56) & 0x7f;
+            const SwinRepairHdr h = parse_swin_repair_hdr(rep_scratch.ptr);
+            if (drop_pred(true, r_seq, h.window_tail_seq)) continue;
+            // Aggregator's real code strips the 11-byte hdr before
+            // calling on_repair_packet. Simulate that here.
+            dec.on_repair_packet(
+                nonce,
+                h.window_tail_seq,
+                r_idx,
+                rep_scratch.ptr + sizeof(wpacket_hdr_repair_t),
+                h.payload_size);
+            drain_decoder();
+        }
+    }
+
+    // Advance time enough to flush any remaining unrecovered gaps.
+    fake_time_ms += T_flush_ms * 10;
+    dec.tick(fake_time_ms);
+    drain_decoder();
+
+    result.fec_recovered = dec.count_p_fec_recovered();
+    result.w_flush = dec.count_w_flush();
+    return result;
+}
+
+}  // namespace
+
+TEST_CASE("B3 SwinFecDecoder lossless delivery in seq order",
+          "[B3][fec_swin]") {
+    auto r = run_swin_pipeline(64, 1, 2, /*T_flush=*/100, /*N=*/128,
+                               [](bool, uint64_t, uint64_t) { return false; });
+    REQUIRE(r.delivered_seqs.size() == 128);
+    for (size_t i = 0; i < 128; i++) {
+        REQUIRE(r.delivered_seqs[i] == i);
+    }
+    REQUIRE(r.fec_recovered == 0);
+    REQUIRE(r.w_flush == 0);
+}
+
+TEST_CASE("B3 SwinFecDecoder single-gap recovery via repair",
+          "[B3][fec_swin]") {
+    // Drop source #50 only. R=0.5 means a repair arrives every 2
+    // sources; the window [50-63, 50] (W=64) covers seq 50. After
+    // enough later sources plus a repair, source 50 should recover.
+    auto r = run_swin_pipeline(64, 1, 2, 100, 128,
+        [](bool is_repair, uint64_t seq, uint64_t) {
+            return !is_repair && seq == 50;
+        });
+    REQUIRE(r.delivered_seqs.size() == 128);
+    // seq 50 must appear in delivery (recovered).
+    bool saw_50 = false;
+    for (auto s : r.delivered_seqs) {
+        if (s == 50) { saw_50 = true; break; }
+    }
+    REQUIRE(saw_50);
+    REQUIRE(r.fec_recovered >= 1);
+    REQUIRE(r.w_flush == 0);
+}
+
+TEST_CASE("B3 SwinFecDecoder scattered losses cascade-recover under R=0.5",
+          "[B3][fec_swin][cascade]") {
+    // R=0.5 emits parity only at odd tails. A non-consecutive loss
+    // pattern CAN cascade: each loss's recovery is seeded by a window
+    // containing only that loss, then adjacent windows' decodes
+    // progress. Drop seqs 10, 20, 30 (spaced 10 apart) — each pair
+    // of consecutive losses has ≥ 9 received sources between them,
+    // so windows containing one-at-a-time exist at odd tails.
+    auto r = run_swin_pipeline(64, 1, 2, 100, 128,
+        [](bool is_repair, uint64_t seq, uint64_t) {
+            return !is_repair && (seq == 10 || seq == 20 || seq == 30);
+        });
+    REQUIRE(r.delivered_seqs.size() == 128);
+    REQUIRE(r.fec_recovered == 3);
+    REQUIRE(r.w_flush == 0);
+}
+
+TEST_CASE("B3 SwinFecDecoder consecutive burst unrecoverable under R=0.5",
+          "[B3][fec_swin][cascade-limit]") {
+    // §7.3 R ≤ 1 scheduling emits ONE parity row per window
+    // (repair_idx=0). At R=0.5, parities arrive at odd tails only;
+    // even tails have no parity. For a consecutive burst of 2+
+    // losses, every window containing ANY loss contains ≥ 2
+    // consecutive losses; cascade can't seed (no window with exactly
+    // one burst-member has a parity). Burst is unrecoverable under
+    // R=0.5. This test pins that limit — the fix is higher R, not
+    // more clever decoding.
+    auto r = run_swin_pipeline(64, 1, 2, 100, 128,
+        [](bool is_repair, uint64_t seq, uint64_t) {
+            return !is_repair && seq >= 50 && seq <= 51;
+        });
+    // 128 total sources, 2 dropped, 0 recovered → 126 received.
+    // tick() force-advances past the 2 gaps → count_w_flush == 2.
+    REQUIRE(r.delivered_seqs.size() == 126);
+    REQUIRE(r.fec_recovered == 0);
+    REQUIRE(r.w_flush == 2);
+}
+
+TEST_CASE("B3 SwinFecDecoder consecutive burst recovered via cascade under R=1.0",
+          "[B3][fec_swin][cascade]") {
+    // R=1.0 emits a parity at every tail. For an N-consecutive
+    // burst ending at seq L, the decoder finds window
+    // [L+1, L+W] at tail=L+W containing zero losses (no-op), then
+    // windows [L, L+W-1], [L-1, L+W-2], ... each contain one more
+    // loss than the previous. The first decodable window is
+    // [L, L+W-1] (one loss, L itself). Cascade peels losses
+    // right-to-left through the burst.
+    //
+    // Drop 4 consecutive at seqs 6..9 — the §7.2 block-FEC-fails-on-
+    // straddle scenario. Under SWIN W=32 R=1.0 all 4 recover.
+    auto r = run_swin_pipeline(32, 1, 1, 100, 128,
+        [](bool is_repair, uint64_t seq, uint64_t) {
+            return !is_repair && seq >= 6 && seq <= 9;
+        });
+    REQUIRE(r.delivered_seqs.size() == 128);
+    REQUIRE(r.fec_recovered == 4);
+    REQUIRE(r.w_flush == 0);
+}
+
+TEST_CASE("B3 SwinFecDecoder longer consecutive burst also cascades at R=1.0",
+          "[B3][fec_swin][cascade]") {
+    // Stress the cascade with 16 consecutive losses under R=1.0
+    // W=64. All must recover.
+    auto r = run_swin_pipeline(64, 1, 1, 100, 256,
+        [](bool is_repair, uint64_t seq, uint64_t) {
+            return !is_repair && seq >= 100 && seq < 116;
+        });
+    REQUIRE(r.delivered_seqs.size() == 256);
+    REQUIRE(r.fec_recovered == 16);
+    REQUIRE(r.w_flush == 0);
+}
+
+TEST_CASE("B3 SwinFecDecoder out-of-order source arrival recovers in seq order",
+          "[B3][fec_swin][reorder]") {
+    // Manually drive the decoder with sources arriving out of order
+    // — simulating wire reorder without loss. pop_ready must return
+    // them in seq order regardless.
+    SwinFecDecoder dec(16, 1, 1, nullptr, 100);
+    AlignedBuf src, out;
+    dec.tick(0);
+
+    auto push_source = [&](uint64_t seq) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)seq, 50);
+        dec.on_source_packet(seq, src.ptr, framed);
+    };
+
+    // Deliver seq 0 first to anchor the stream at 0, then reorder.
+    push_source(0);
+    push_source(3);
+    push_source(1);
+    push_source(2);
+    push_source(5);
+    push_source(4);
+
+    std::vector<uint64_t> drained;
+    uint64_t s; size_t sz;
+    while (dec.pop_ready(&s, out.ptr, &sz)) drained.push_back(s);
+
+    REQUIRE(drained == std::vector<uint64_t>{0, 1, 2, 3, 4, 5});
+    REQUIRE(dec.count_w_flush() == 0);
+}
+
+TEST_CASE("B3 SwinFecDecoder T_flush retires stalled gaps",
+          "[B3][fec_swin][tflush]") {
+    // Drop source 5 (no repair arrives for it either) — dec has
+    // sources 0..4 emittable, then a gap at 5, then 6..10 waiting.
+    // Force the decoder's tick past T_flush and verify it advances,
+    // delivering 6..10.
+    SwinFecDecoder dec(16, 1, 1, nullptr, /*T_flush=*/100);
+    AlignedBuf src, out;
+
+    dec.tick(0);   // t=0: prime
+    for (int i = 0; i < 5; i++) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)i, 50);
+        dec.on_source_packet((uint64_t)i, src.ptr, framed);
+    }
+    // Skip seq=5.
+    for (int i = 6; i <= 10; i++) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)i, 50);
+        dec.on_source_packet((uint64_t)i, src.ptr, framed);
+    }
+
+    // Drain: should deliver 0..4; then stuck at gap 5.
+    std::vector<uint64_t> drained;
+    uint64_t s; size_t sz;
+    while (dec.pop_ready(&s, out.ptr, &sz)) drained.push_back(s);
+    REQUIRE(drained == std::vector<uint64_t>{0, 1, 2, 3, 4});
+    REQUIRE(dec.count_w_flush() == 0);
+
+    // Tick within T_flush — no flush yet.
+    dec.tick(50);
+    drained.clear();
+    while (dec.pop_ready(&s, out.ptr, &sz)) drained.push_back(s);
+    REQUIRE(drained.empty());
+    REQUIRE(dec.count_w_flush() == 0);
+
+    // Tick past T_flush — flush gap 5, deliver 6..10.
+    dec.tick(200);
+    drained.clear();
+    while (dec.pop_ready(&s, out.ptr, &sz)) drained.push_back(s);
+    REQUIRE(drained == std::vector<uint64_t>{6, 7, 8, 9, 10});
+    REQUIRE(dec.count_w_flush() == 1);
+}
+
+TEST_CASE("B3 SwinFecDecoder late-repair discard",
+          "[B3][fec_swin][late-repair]") {
+    // A repair whose window_tail is far enough behind next_emit_seq
+    // to be useless is dropped. We simulate this by: emit many
+    // sources normally; then hand the decoder a repair carrying a
+    // stale window_tail. Decoder should drop it without crashing
+    // (count_p_fec_recovered unchanged).
+    SwinFecDecoder dec(16, 1, 1, nullptr, 100);
+    AlignedBuf src, rep, out;
+    dec.tick(0);
+
+    // Feed 100 sources, all delivered.
+    for (int i = 0; i < 100; i++) {
+        size_t framed = build_swin_source(src.ptr, (uint8_t)(i & 0xff), 50);
+        dec.on_source_packet((uint64_t)i, src.ptr, framed);
+    }
+    uint64_t s; size_t sz;
+    while (dec.pop_ready(&s, out.ptr, &sz)) {}
+
+    const uint32_t rec_before = dec.count_p_fec_recovered();
+
+    // Forge a repair with window_tail_seq=5 — long passed.
+    std::memset(rep.ptr, 0, ZFEX_ROUND_UP_SIMD(MAX_FEC_PAYLOAD));
+    dec.on_repair_packet(
+        (1ULL << 63) | 0ULL,  // is_repair=1, repair_idx=0, seq=0
+        /*window_tail_seq=*/5,
+        /*repair_idx=*/0,
+        rep.ptr + sizeof(wpacket_hdr_repair_t),
+        50);
+
+    // Repair should be dropped; no recovery, no crash.
+    REQUIRE(dec.count_p_fec_recovered() == rec_before);
+}
+
+TEST_CASE("B3 make_fec_decoder dispatches SWIN_RS to SwinFecDecoder",
+          "[B3][fec_swin][iface]") {
+    fec_params_t p{};
+    p.fec_type = WFB_FEC_SWIN_RS;
+    p.k = 0; p.n = 0;
+    p.swin_w = 16;
+    p.swin_r_num = 1;
+    p.swin_r_den = 1;
+
+    auto dec = make_fec_decoder(p, nullptr);
+    REQUIRE(dec != nullptr);
+
+    // B0 accessors return sensible defaults on a fresh decoder.
+    REQUIRE(dec->count_p_fec_recovered() == 0);
+    REQUIRE(dec->count_p_override() == 0);
+    REQUIRE(dec->count_w_flush() == 0);
+
+    // is_repair_fragment — SWIN rule: bit 63.
+    REQUIRE(dec->is_repair_fragment(0x0000000000000000ULL) == false);
+    REQUIRE(dec->is_repair_fragment(0x7fffffffffffffffULL) == false);
+    REQUIRE(dec->is_repair_fragment(0x8000000000000000ULL) == true);
+    REQUIRE(dec->is_repair_fragment(0xffffffffffffffffULL) == true);
 }
 
 

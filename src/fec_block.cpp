@@ -162,12 +162,18 @@ std::unique_ptr<IFecDecoder> make_fec_decoder(const fec_params_t& params,
         case WFB_FEC_VDM_RS:
             return std::unique_ptr<IFecDecoder>(
                 new BlockFecDecoder(params.k, params.n, loss_listener));
-        case WFB_FEC_SWIN_RS:
-            // Phase 2b commit B3 lands SwinFecDecoder and replaces this
-            // branch.
-            throw std::runtime_error(
-                "make_fec_decoder: SWIN decoder not yet implemented "
-                "(Phase 2b commit B3 pending)");
+        case WFB_FEC_SWIN_RS: {
+            // T_flush default: B3 hard-codes 100 ms (video profile).
+            // B5 will thread this from CLI / config per §7.4 so each
+            // profile can pick its own.
+            constexpr uint64_t kDefaultTFlushMs = 100;
+            return std::unique_ptr<IFecDecoder>(
+                new SwinFecDecoder(params.swin_w,
+                                   params.swin_r_num,
+                                   params.swin_r_den,
+                                   loss_listener,
+                                   kDefaultTFlushMs));
+        }
         default:
             throw std::runtime_error(
                 "make_fec_decoder: unknown fec_type");
