@@ -202,6 +202,7 @@ public:
         count_p_override = 0;
         count_p_outgoing = 0;
         count_b_outgoing = 0;
+        count_w_flush = 0;
         // B0: decoder counters are monotone cumulative; Aggregator's
         // public counters are per-interval. Rebase the per-interval
         // baseline to the decoder's current cumulative so the next
@@ -209,9 +210,11 @@ public:
         if (decoder) {
             mirror_baseline_fec_recovered = decoder->count_p_fec_recovered();
             mirror_baseline_override      = decoder->count_p_override();
+            mirror_baseline_w_flush       = decoder->count_w_flush();
         } else {
             mirror_baseline_fec_recovered = 0;
             mirror_baseline_override      = 0;
+            mirror_baseline_w_flush       = 0;
         }
     }
 
@@ -228,6 +231,10 @@ public:
     uint32_t count_p_override;
     uint32_t count_p_outgoing;
     uint32_t count_b_outgoing;
+    // B7: SWIN-specific — windows retired at T_flush with at least
+    // one unrecovered gap (§7.4, §10.3). Mirrored from
+    // IFecDecoder::count_w_flush(); stays 0 under block FEC.
+    uint32_t count_w_flush;
 
 protected:
     virtual void send_to_socket(const uint8_t *payload, uint16_t packet_size) = 0;
@@ -264,6 +271,8 @@ private:
     // the delta since then.
     uint32_t mirror_baseline_fec_recovered;
     uint32_t mirror_baseline_override;
+    uint32_t mirror_baseline_w_flush;   // B7: rebased at clear_stats
+                                        // so count_w_flush is per-interval.
     fec_params_t current_params;   // codec parameters of the active
                                    // session. Used for the SESSION log,
                                    // the process_packet fragment_idx

@@ -409,9 +409,23 @@ class RXAntennaProtocol(LineReceiver):
                 if len(cols) != 3:
                     raise BadTelemetry()
 
-                k_tuple = ('all', 'all_bytes', 'dec_err', 'session', 'data', 'uniq', 'fec_rec', 'lost', 'bad', 'out', 'out_bytes')
-                counters = tuple(int(i) for i in cols[2].split(':'))
-                assert len(counters) == len(k_tuple)
+                # B7 §10.3: the PKT line grew from 11 to 12
+                # colon-separated counters — w_flush (windows retired
+                # at T_flush with unrecovered gaps) appended at the
+                # end. Accept both during rolling upgrades: pre-B7
+                # wfb_rx binaries still emit the 11-field form; pad
+                # w_flush=0 in that case so downstream consumers
+                # always see the same dict shape.
+                k_tuple = ('all', 'all_bytes', 'dec_err', 'session', 'data',
+                           'uniq', 'fec_rec', 'lost', 'bad',
+                           'out', 'out_bytes', 'w_flush')
+                raw = tuple(int(i) for i in cols[2].split(':'))
+                if len(raw) == len(k_tuple) - 1:
+                    counters = raw + (0,)   # pre-B7 — synthesize w_flush=0
+                elif len(raw) == len(k_tuple):
+                    counters = raw
+                else:
+                    raise BadTelemetry()
 
                 if not self.count_all:
                     self.count_all = counters

@@ -177,13 +177,20 @@ class AntennaStat(Int32StringReceiver):
 
         diversity = p['data'][0] / p['uniq'][0] if p['uniq'][0] > 0 else 0
 
-        msg_l = (('{recv}  %4d$ (%d)' % _norm(p['all']),     0),
+        msg_l = [('{recv}  %4d$ (%d)' % _norm(p['all']),     0),
                  ('{udp}   %4d$ (%d)' % _norm(p['out']),     0),
                  ('sess  %4d$ (%d)' % _norm(p['session']),  0),
                  ('fec_r %4d$ (%d)' % _norm(p['fec_rec']), curses.A_REVERSE if p['fec_rec'][0] else 0),
                  ('lost  %4d$ (%d)' % _norm(p['lost']),    curses.A_REVERSE if p['lost'][0] else 0),
                  ('d_err %4d$ (%d)' % _norm(p['dec_err']), curses.A_REVERSE if p['dec_err'][0] else 0),
-                 ('bad   %4d$ (%d)' % _norm(p['bad']),     curses.A_REVERSE if p['bad'][0] else 0))
+                 ('bad   %4d$ (%d)' % _norm(p['bad']),     curses.A_REVERSE if p['bad'][0] else 0)]
+
+        # B7: w_flush row visible only under SWIN sessions — block
+        # never bumps it so it would be a dead row on the display.
+        if session_d and session_d.get('fec_type') == 'SWIN_RS':
+            w_flush = p.get('w_flush', (0, 0))
+            msg_l.append(('flush %4d$ (%d)' % _norm(w_flush),
+                          curses.A_REVERSE if w_flush[0] else 0))
 
         ymax = window.getmaxyx()[0]
         for y, (msg, attr) in enumerate(msg_l, 1):

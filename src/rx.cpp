@@ -273,8 +273,9 @@ Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_i
                        uint8_t configured_codec, uint64_t T_flush_ms) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
+    count_w_flush(0),
     decoder(), pop_scratch(nullptr),
-    mirror_baseline_fec_recovered(0), mirror_baseline_override(0),
+    mirror_baseline_fec_recovered(0), mirror_baseline_override(0), mirror_baseline_w_flush(0),
     current_params{},
     configured_codec(configured_codec),
     T_flush_ms(T_flush_ms),
@@ -354,9 +355,10 @@ void Aggregator::init_fec(const fec_params_t &params)
     // SWIN decoder here (block decoder ignores it).
     decoder = make_fec_decoder(current_params, packet_loss_listener_, T_flush_ms);
 
-    // Fresh decoder: cumulative counters are 0, so baseline is 0.
+    // Fresh decoder: cumulative counters are 0, so baselines are 0.
     mirror_baseline_fec_recovered = 0;
     mirror_baseline_override = 0;
+    mirror_baseline_w_flush = 0;
 }
 
 
@@ -429,19 +431,30 @@ void Aggregator::dump_stats(void)
                 it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
     }
 
-    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
+    // B7: PKT line grew from 11 to 12 fields — count_w_flush appended
+    // at the end. Block sessions always emit 0 for the new field;
+    // SWIN sessions emit the count of windows retired at T_flush
+    // with at least one unrecovered gap (§10.3). Python parser in
+    // wfb_ng/protocols.py must accept 12 tokens.
+    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
             count_p_all, count_b_all,                    // incoming
             count_p_dec_err,                             // decryption
             count_p_session, count_p_data,               // classification
             (uint32_t)count_p_uniq.size(),               // unique check
             count_p_fec_recovered, count_p_lost,         // fec recovering
             count_p_bad,                                 // internal errors
-            count_p_outgoing, count_b_outgoing);         // outgoing
+            count_p_outgoing, count_b_outgoing,          // outgoing
+            count_w_flush);                              // swin T_flush retirements
     IPC_MSG_SEND();
 
     if(count_p_override)
     {
         WFB_ERR("%u block overrides\n", count_p_override);
+    }
+
+    if(count_w_flush)
+    {
+        WFB_ERR("%u windows T_flush-retired with gaps\n", count_w_flush);
     }
 
     if(count_p_lost)
@@ -863,6 +876,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     // memcpy overhead.
     count_p_fec_recovered = decoder->count_p_fec_recovered() - mirror_baseline_fec_recovered;
     count_p_override      = decoder->count_p_override()      - mirror_baseline_override;
+    count_w_flush         = decoder->count_w_flush()         - mirror_baseline_w_flush;
 }
 
 void Aggregator::emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size_t sz)
