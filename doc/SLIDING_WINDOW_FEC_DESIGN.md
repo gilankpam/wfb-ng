@@ -1501,11 +1501,14 @@ right default for:
 2. **Phase 2b**: implement `fec_swin.{cpp,hpp}` behind the
    interface, with `fec_type = sliding` opt-in per profile. Default
    stays block. Validate in-tree tests.
-3. **Phase 2c**: run side-by-side benchmarks (Phase-2 doc: harness) on
-   representative links (lab netem, field traces). Publish results.
-4. **Phase 2d**: flip the default for `[video]` profile to sliding if
-   bench results warrant; hold `[mavlink]` and `[tunnel]` on block
-   unless benches say otherwise.
+3. **Phase 2c**: run side-by-side benchmarks per the harness spec in
+   §12.2 (axes separated by regime: scattered, consecutive burst,
+   scattered-span). Publish results.
+4. **Phase 2d**: flip the default for `[video]` profile to sliding
+   only if Phase-2c results show SWIN wins on the scattered-loss axis
+   by a margin that outweighs its expected loss on the
+   consecutive-burst axis under the field-trace mix. Hold `[mavlink]`
+   and `[tunnel]` on block unless benches say otherwise.
 5. **Phase 3+**: optional — incremental-encode zfex extension,
    feedback-driven `R`, adaptive `W`.
 
@@ -1557,11 +1560,41 @@ per-profile. Rollback cost is minimal.
 Items resolved by the revision-2 triage (§9.1, §9.4, §10.1, §10.3, §6,
 §8.2) are no longer listed here. What remains:
 
-- **Benchmark harness spec.** How to drive both codecs over a controlled
-  lossy link (netem, or the existing
-  [src/fec_test.cpp](../src/fec_test.cpp) rig extended). What metrics to
-  capture: goodput, glass-to-glass p50 / p99 latency, recovered ratio,
-  window-flush count. A Phase-2 doc.
+- **Benchmark harness spec (Phase 2c).** How to drive both codecs over a
+  controlled lossy link (netem, or the existing
+  [src/fec_test.cpp](../src/fec_test.cpp) rig extended). The spec must
+  **separate loss-pattern regimes on independent measurement axes** so
+  Phase 2d's video default-flip decision isn't misled by a single
+  headline "recovery rate" that averages across regimes SWIN wins and
+  regimes SWIN loses. Required axes (each reported separately, not
+  blended):
+
+  - **Scattered-loss axis.** Independent per-packet Bernoulli loss at
+    rates {1%, 2%, 5%, 10%}. SWIN's expected win regime (§7.2 scattered
+    table row).
+  - **Consecutive-burst axis.** Fixed-length bursts of {2, 4, 8, 16,
+    32} consecutive packets with clean intervals between. The regime
+    where SWIN at R=0.5 falls off (§7.2 "unrecoverable") while SWIN at
+    R=1.0 cascades up to ⌈R·W⌉; block FEC at (k=8, n=12) handles
+    ≤ 4-bursts within a block.
+  - **Scattered-span axis.** Random losses with total span varied
+    across {W/2, W, 2W, 4W} (i.e. straddling the span gate from §7.2).
+    Exposes the `W_rx = 2W` ring-preservation limit; data feeds the
+    Phase-3+ decision on whether to expose `W_rx` as a profile
+    tunable.
+  - **Mixed / real-world traces** (if available): replay captured
+    field pcaps. Reported alongside the synthetic axes, NOT as a
+    substitute for them.
+
+  For every axis, at each tested R value, report: goodput,
+  glass-to-glass p50 / p99 latency, recovery rate (recovered /
+  losses, broken out per regime), window-flush count, block
+  override count (block FEC only), CPU % on the RX reference
+  platform (RPi Zero 2W).
+
+  Each (codec, R, regime) cell produces one row. A single summary
+  table that collapses regimes into one "recovery rate" number MUST
+  NOT be the decision basis for Phase 2d.
 - **Wire-compat matrix expansion.** Explicit matrix of every TX/RX
   binary-version × fec_type combination, with expected behavior and
   operator-visible symptoms. Phase 2.
