@@ -710,30 +710,51 @@ defaults satisfy this with headroom.
 The RS matrix capacity is `⌈R · W⌉` parities per window. In
 principle that recovers up to `⌈R · W⌉` losses within a window.
 The §7.3 scheduling together with §7.4's **cascade decode**
-(added in Phase 2b clarification) realize this bound under two
-distinct regimes:
+(added in Phase 2b clarification) realize this bound under the
+regimes below. **Two gates govern recoverability:** a cascade
+SEEDING condition (is there any parity-bearing window with only
+one unknown?) and a ring-PRESERVATION condition (is the slot
+holding that unknown still in the RX buffer?). Both must hold.
 
-| Loss pattern         | R ≥ 1.0 (parity at every tail) | R < 1.0 (e.g. R=0.5, parity every ⌈1/R⌉ tails) |
-|---------------------:|:------------------------------:|:-------------------------------------------------:|
-| Isolated single loss | recoverable                    | recoverable                                       |
-| Scattered losses spaced ≥ ⌈1/R⌉ apart | recoverable via cascade | recoverable via cascade         |
-| Consecutive burst    | recoverable up to `⌈R · W⌉` via cascade | **NOT recoverable** (no parity at the "one-loss-window" tail to seed the cascade) |
+| Loss pattern                                       | R ≥ 1.0                                 | R < 1.0                                                                              |
+|---------------------------------------------------:|:---------------------------------------:|:------------------------------------------------------------------------------------:|
+| Isolated single loss                               | recoverable                             | recoverable                                                                          |
+| Scattered losses, each in its own isolating window | recoverable (independent decodes)       | recoverable (independent decodes) if spacing ≥ W                                     |
+| Scattered losses with span ≤ `W_rx − W`            | recoverable via cascade                 | recoverable via cascade if seeding holds; see span gate below                        |
+| Scattered losses with span > `W_rx − W`            | leftmost ones lost (ring rolled over)   | leftmost ones lost (ring rolled over)                                                |
+| Consecutive burst ≤ `⌈R · W⌉`                      | recoverable via cascade, span ≤ `W_rx − W` | **NOT recoverable** (no parity at the "one-loss-window" tail to seed the cascade) |
 
-**Cascade seeding condition.** Cascade starts from a window whose
-tail holds a parity AND whose range contains exactly one loss.
-Under R ≥ 1.0 every tail has a parity, so every window that
-contains exactly one burst-member is a valid seed. Under R < 1.0
-only a fraction of tails have parities; consecutive bursts have no
-"exactly-one-loss window" at a parity-bearing tail (each shift of
-the window boundary moves it past one burst-member, but the parity
-only arrives at every ⌈1/R⌉-th tail, skipping the single-loss
-boundary window).
+`W_rx = 2 · W` in the Phase 2b impl, so `W_rx − W = W`. "Span" below means
+`last_loss_seq − first_loss_seq` in the scattered group.
+
+**Seeding condition.** Cascade starts from a window whose tail holds a parity
+AND whose range contains exactly one unknown. Under R ≥ 1.0 every tail has a
+parity, so every window containing exactly one burst-member is a valid seed.
+Under R < 1.0 parities arrive only at every `⌈1/R⌉`-th tail. Consecutive bursts
+under R < 1.0 have no "exactly-one-loss window" at a parity-bearing tail — each
+shift of the window boundary moves it past one burst-member, but the parity
+skips the single-loss boundary tail.
+
+**Span gate (ring-preservation).** Cascade runs atomically inside one
+`on_repair_packet` call — `max_seq_received_` is frozen for the cascade's
+duration. A loss at seq `L` is only cascade-recoverable if its decode window is
+still intact in the ring: `max_seq_at_cascade_start − L < W_rx`. Since the
+seeding tail for the rightmost loss sits at or after `L_last + W − 1`, cascade
+can only reach earlier losses satisfying `L > L_last + W − 1 − W_rx`. With
+`W_rx = 2W` that collapses to `L_last − L_first ≤ W`. Losses further back than
+that can't be recovered even when there's nominally enough parity coverage; the
+`tick()` flush retires them and increments `count_w_flush`.
+
+Scattered losses with spacing `≥ W` dodge the span gate entirely: each loss has
+its own independent isolating window (leftmost loss decodes first, no cascade
+needed), so only per-loss ring-preservation matters — the same constraint that
+applies to an isolated single loss.
 
 **Practical implications:**
 
 - **Mavlink / tunnel (R=1.0):** full consecutive-burst recovery up
-  to `⌈R · W⌉` losses. Strictly stronger than block FEC at the same
-  overhead ratio for bursty loss.
+  to `⌈R · W⌉` losses, provided the burst's span ≤ `W`. Strictly
+  stronger than block FEC at the same overhead ratio for bursty loss.
 - **Video (R=0.5):** suited for sparse / interleaved losses, which
   is typical of Wi-Fi air-interface loss patterns. A dedicated
   consecutive-burst longer than 1 packet is NOT recoverable at
@@ -748,6 +769,12 @@ boundary window).
   does NOT handle consecutive bursts ≥ 2. SWIN's win is HOL-free
   immediate source delivery (§2 motivation) and cascade recovery
   of scattered losses, NOT burst tolerance at this overhead.
+- **W_rx sizing is a Phase 3 tunable.** The span-gate limit scales
+  with `W_rx`. Larger `W_rx` widens the recoverable-span window at
+  the cost of proportionally more RX buffer. Phase 2b ships
+  `W_rx = 2W` as the balanced default; phase-3+ may expose a
+  profile-level override for operators who observe scattered-loss
+  spans exceeding `W` in the field.
 
 ### 7.3 Emission schedule (Phase 1: proactive only)
 

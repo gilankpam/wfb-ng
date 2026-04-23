@@ -2579,19 +2579,18 @@ TEST_CASE("B8 SWIN loopback: W=64 R=1/2 lossless delivers 128 sources in order",
 
 TEST_CASE("B8 SWIN loopback: isolated losses recover under R=1/2",
           "[B8][swin][integration][recovery]") {
-    // §7.2 R<1 regime: each window carries only 1 repair, so every
-    // loss must sit alone inside its coverage window of W sources.
-    // Spacing < W puts two losses inside one window → that window's
-    // single equation can't solve for both, and cascade only helps
-    // if another window sees the losses in isolation. Tests that
-    // want to exercise scattered-with-cascade recovery under R<1
-    // need spacing ≥ W, not just any-scatter.
+    // §7.2 "scattered losses, each in its own isolating window" row
+    // under R < 1.0. Two losses 80 apart (> W=64): each sits alone
+    // in its first parity-bearing window [tail-63..tail] as soon as
+    // tail ≥ loss_seq + W - 1. Each decodes INDEPENDENTLY — no
+    // cascade. (Cascade-based recovery of scattered losses under
+    // R<1 is bounded by the span gate in §7.2: span must fit
+    // within W_rx - W ≈ W; our span of 80 exceeds that, so this
+    // test cannot rely on cascade and doesn't need to.)
     SwinFixture f(/*W=*/64, /*R_num=*/1, /*R_den=*/2);
     const int N = 256;
     f.send_data(N, /*size=*/200);
 
-    // Two losses, 80 apart (> W=64). Each sits alone in its coverage
-    // window [tail-63..tail] when tail ≥ loss_seq.
     DropSwinSources drop({20, 100});
     run_pipeline(f.tx, f.rx, drop);
 
@@ -2600,9 +2599,8 @@ TEST_CASE("B8 SWIN loopback: isolated losses recover under R=1/2",
     REQUIRE(f.rx.count_p_fec_recovered == 2);
     REQUIRE(f.rx.count_w_flush == 0);
 
-    // Recovered sources carry the correct seeded content. Bytes were
-    // written with value (uint8_t)i at index 0 — note seq=20 → i=20
-    // wraps each 256 so delivered[100][0] == 100.
+    // Recovered sources carry the correct seeded content. send_data
+    // writes (uint8_t)(seed+i) at every byte, so delivered[i][0] == (uint8_t)i.
     REQUIRE(f.rx.delivered[20][0]  == (uint8_t)20);
     REQUIRE(f.rx.delivered[100][0] == (uint8_t)100);
 }
@@ -2610,14 +2608,16 @@ TEST_CASE("B8 SWIN loopback: isolated losses recover under R=1/2",
 
 TEST_CASE("B8 SWIN loopback: consecutive burst recovers via cascade under R=1/1",
           "[B8][swin][integration][recovery][burst]") {
+    // §7.2 "consecutive burst ≤ ⌈R·W⌉" row under R ≥ 1.0. At R=1/1
+    // every source tail has a parity, so cascade seeds at
+    // tail=L_last+1 (window contains the burst plus one known
+    // following source) and peels right-to-left. Span gate: burst
+    // span (3 here, ≤ W=16) well within W_rx-W = 16, so the ring
+    // still holds all burst slots when cascade runs.
     SwinFixture f(/*W=*/16, /*R_num=*/1, /*R_den=*/1);
     const int N = 48;
     f.send_data(N, /*size=*/200);
 
-    // Drop 4 consecutive sources mid-stream. Under R=1/1 every
-    // source triggers one repair; the overlap + cascade (§7.4)
-    // propagates solutions across adjacent windows until the burst
-    // is fully recovered.
     DropSwinSources drop({20, 21, 22, 23});
     run_pipeline(f.tx, f.rx, drop);
 
