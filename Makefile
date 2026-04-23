@@ -57,6 +57,17 @@ wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o
 fec_test: src/fec_test.cpp src/zfex.o
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) $(shell pkg-config --libs catch2-with-main)
 
+# Phase 0 benchmark harness. Deliberately not in `all` / `test` --
+# opt-in per doc/design/fec-enhancements-v2.md §5.2.
+fec_bench: src/bench/fec_bench.cpp src/bench/channel_model.hpp src/zfex.o
+	$(CXX) $(_CFLAGS) -std=gnu++11 -Isrc -o $@ src/bench/fec_bench.cpp src/zfex.o $(LDFLAGS) -lrt
+
+# Runs the full baseline sweep and writes bench/baseline.csv. Slow
+# (minutes); not a default target.
+bench_baseline: fec_bench
+	@mkdir -p bench
+	./fec_bench --sweep full --output bench/baseline.csv
+
 libsodium_test: src/libsodium_test.cpp
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) -lsodium $(shell pkg-config --libs catch2-with-main)
 
@@ -102,7 +113,7 @@ pylint:
 	pylint --disable=R,C wfb_ng/*.py
 
 clean:
-	rm -rf env wfb_rx wfb_tx wfb_tx_cmd wfb_tun wfb_rtsp wfb_keygen dist deb_dist build wfb_ng.egg-info wfb_ng-*.tar.gz _trial_temp *~ src/*.o fec_test libsodium_test
+	rm -rf env wfb_rx wfb_tx wfb_tx_cmd wfb_tun wfb_rtsp wfb_keygen dist deb_dist build wfb_ng.egg-info wfb_ng-*.tar.gz _trial_temp *~ src/*.o fec_test libsodium_test fec_bench bench/baseline.csv
 
 deb_docker:  /opt/qemu/bin
 	@if ! [ -d /opt/qemu ]; then echo "Docker cross build requires patched QEMU!\nApply ./scripts/qemu/qemu.patch to qemu-7.2.0 and build it:\n  ./configure --prefix=/opt/qemu --static --disable-system && make && sudo make install"; exit 1; fi
