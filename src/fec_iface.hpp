@@ -40,6 +40,27 @@
 #define TLV_SWIN_REPAIR_RATIO    0x11  // uint8 num, uint8 den
 #endif
 
+// ----- SWIN repair inner header (§5.4) ------------------------------------
+// Sits at the start of every AEAD-encrypted SWIN repair payload. Written
+// by SwinFecEncoder::next_repair; parsed by Aggregator::process_packet
+// on the repair path. Fields are big-endian on the wire; callers must
+// byteswap explicitly.
+//
+// Layout (11 bytes total, packed):
+//   flags           — WFB_PACKET_REPAIR_SWIN
+//   payload_size    — big-endian uint16; size in bytes of the parity
+//                     payload (= max source size across the covered
+//                     window).
+//   window_tail_seq — big-endian uint64; seq_num of the latest source
+//                     covered by this repair. The covered window is
+//                     [window_tail_seq - W + 1, window_tail_seq].
+
+typedef struct __attribute__((packed)) {
+    uint8_t  flags;
+    uint16_t payload_size;
+    uint64_t window_tail_seq;
+} wpacket_hdr_repair_t;
+
 // ----- Parameter carrier --------------------------------------------------
 // Passed into init_session / init_fec and into the factory functions.
 // Populated from -k/-n (block) or --swin-w/--swin-r (sliding); the
@@ -272,7 +293,11 @@ public:
 
 std::unique_ptr<IFecEncoder> make_fec_encoder(const fec_params_t& params);
 
+// T_flush_ms is SWIN-only (see §7.4). Block decoder ignores it. Default
+// of 100 ms matches the video-profile recommendation from §7.2; callers
+// with other profiles (mavlink, tunnel → 300 ms) pass explicitly.
 std::unique_ptr<IFecDecoder> make_fec_decoder(const fec_params_t& params,
-                                              PacketLossListener* loss_listener);
+                                              PacketLossListener* loss_listener,
+                                              uint64_t T_flush_ms = 100);
 
 #endif // FEC_IFACE_HPP

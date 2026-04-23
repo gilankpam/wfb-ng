@@ -41,16 +41,9 @@
 #include <map>
 #include <vector>
 
-// Inner-header layout for SWIN repair packets (§5.4). Lives inside
-// the AEAD-encrypted payload. Fields are big-endian on the wire;
-// callers / readers must byteswap explicitly.
-typedef struct __attribute__((packed)) {
-    uint8_t  flags;             // WFB_PACKET_REPAIR_SWIN
-    uint16_t payload_size;      // big-endian, parity-payload size in bytes
-                                // (= max_packet_size across the covered window)
-    uint64_t window_tail_seq;   // big-endian, seq_num of last source
-                                // covered by this repair
-} wpacket_hdr_repair_t;
+// wpacket_hdr_repair_t moved to fec_iface.hpp in B4 so tx.cpp and
+// rx.cpp can write/parse the repair inner header without pulling
+// SwinFecEncoder / SwinFecDecoder declarations.
 
 
 // SwinFecEncoder — encoder half of the sliding-window codec.

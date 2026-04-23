@@ -122,6 +122,13 @@ public:
         : Transmitter(fec_params_t{WFB_FEC_VDM_RS, k, n, 0, 0, 0},
                       keypair, kEpoch, kChannelId, fec_delay, tags) {}
 
+    // B4: SWIN-flavoured ctor.
+    MockTransmitter(uint16_t W, uint8_t R_num, uint8_t R_den,
+                    const std::string& keypair,
+                    std::vector<tags_item_t>& tags, uint32_t fec_delay = 0)
+        : Transmitter(fec_params_t{WFB_FEC_SWIN_RS, 0, 0, W, R_num, R_den},
+                      keypair, kEpoch, kChannelId, fec_delay, tags) {}
+
     std::vector<std::vector<uint8_t>> sent;
 
     void select_output(int) override {}
@@ -142,6 +149,11 @@ class MockAggregator : public Aggregator {
 public:
     MockAggregator(const std::string& keypair)
         : Aggregator(keypair, kEpoch, kChannelId) {}
+
+    // B4: configured-codec ctor, for SWIN RX tests.
+    MockAggregator(const std::string& keypair, uint8_t configured_codec,
+                   uint64_t T_flush_ms = 100)
+        : Aggregator(keypair, kEpoch, kChannelId, configured_codec, T_flush_ms) {}
 
     std::vector<std::vector<uint8_t>> delivered;
 
@@ -562,22 +574,17 @@ TEST_CASE("C8 block-FEC nonce layout: (block<<8|frag) unique per session",
 
 
 TEST_CASE("C9 block path has no T_flush / count_w_flush", "[baseline][C9]") {
-    // B0 update: the original Phase 1.5 version of this test was a
-    // source-text sentinel — it asserted rx.cpp did not contain the
-    // string "count_w_flush" or "T_flush". B0 added the accessor
-    // count_w_flush() to IFecDecoder, so rx.cpp now mentions it in a
-    // comment. The SEMANTIC invariant the test is asserting — "block
-    // FEC has no window-flush concept" — is unchanged, so the check
-    // is rewritten behaviorally.
+    // Phase 1.5 shipped this as a source-text sentinel asserting
+    // "T_flush" did not appear in rx.cpp. B0 already relaxed it
+    // (the accessor count_w_flush() is now named in an IFecDecoder
+    // comment); B4 drops the source-text check entirely because
+    // T_flush_ms is now a legitimate Aggregator member plumbed to
+    // SwinFecDecoder via make_fec_decoder — it IS supposed to
+    // appear in rx.cpp on the SWIN path.
     //
-    // 1) rx.cpp must not contain the string "T_flush" anywhere.
-    //    T_flush is strictly a sliding-FEC concept (§7.4) and must
-    //    not leak into the block RX path.
-    // 2) BlockFecDecoder::count_w_flush() returns 0 unconditionally,
-    //    at construction and after arbitrary packet ingestion.
-    std::string rx_src = slurp("src/rx.cpp");
-    REQUIRE(rx_src.find("T_flush") == std::string::npos);
-
+    // The load-bearing invariant — "block FEC has no window-flush
+    // concept" — survives as a pure behavioral check on
+    // BlockFecDecoder::count_w_flush().
     BlockFecDecoder dec(8, 12, nullptr);
     REQUIRE(dec.count_w_flush() == 0);
     // Advance tick arbitrarily — block's tick is a no-op, so count_w_flush
@@ -2062,6 +2069,404 @@ TEST_CASE("B3 make_fec_decoder dispatches SWIN_RS to SwinFecDecoder",
     REQUIRE(dec->is_repair_fragment(0x7fffffffffffffffULL) == false);
     REQUIRE(dec->is_repair_fragment(0x8000000000000000ULL) == true);
     REQUIRE(dec->is_repair_fragment(0xffffffffffffffffULL) == true);
+}
+
+
+// ============================================================================
+// B4 tests — SWIN wire format & session parse
+// ============================================================================
+//
+// B4 wires SWIN TX → SWIN RX end-to-end for the first time. These
+// tests cover the three pieces the commit touches:
+//   1. TX emits a SESSION with fec_type=WFB_FEC_SWIN_RS, k=n=0, and
+//      TLV_SWIN_WINDOW / TLV_SWIN_REPAIR_RATIO.
+//   2. RX session parse accepts matching-codec sessions, rejects
+//      mismatches or malformed SWIN TLVs.
+//   3. RX data-packet parse extracts wpacket_hdr_repair_t from the
+//      decrypted SWIN repair payload and hands (window_tail, repair_idx)
+//      + parity bytes to the decoder.
+
+namespace {
+
+// Decrypt a SESSION packet and return (fec_type, k, n, tlv_region_bytes).
+struct ParsedSession {
+    uint8_t fec_type;
+    uint8_t k;
+    uint8_t n;
+    std::vector<uint8_t> tlv_bytes;
+};
+
+ParsedSession parse_session_packet(const std::vector<uint8_t>& pkt,
+                                   const TestKeys& keys)
+{
+    REQUIRE(pkt.size() >= sizeof(wsession_hdr_t) + sizeof(wsession_data_t)
+                          + crypto_box_MACBYTES);
+    REQUIRE(pkt[0] == WFB_PACKET_SESSION);
+
+    const wsession_hdr_t* hdr = (const wsession_hdr_t*)pkt.data();
+    std::vector<uint8_t> plain(pkt.size() - sizeof(wsession_hdr_t)
+                               - crypto_box_MACBYTES);
+    int rc = crypto_box_open_easy(plain.data(),
+                                  pkt.data() + sizeof(wsession_hdr_t),
+                                  pkt.size() - sizeof(wsession_hdr_t),
+                                  hdr->session_nonce,
+                                  keys.tx_public, keys.rx_secret);
+    REQUIRE(rc == 0);
+    REQUIRE(plain.size() >= sizeof(wsession_data_t));
+
+    const wsession_data_t* sd = (const wsession_data_t*)plain.data();
+    ParsedSession out;
+    out.fec_type = sd->fec_type;
+    out.k = sd->k;
+    out.n = sd->n;
+    out.tlv_bytes.assign(plain.begin() + sizeof(wsession_data_t), plain.end());
+    return out;
+}
+
+// Scan TLV region for a tag_id. Returns value bytes on match, empty vec on miss.
+std::vector<uint8_t> find_tlv(const std::vector<uint8_t>& tlvs, uint8_t tag_id) {
+    size_t off = 0;
+    while (off + sizeof(tlv_hdr_t) <= tlvs.size()) {
+        const tlv_hdr_t* t = (const tlv_hdr_t*)(tlvs.data() + off);
+        if (off + sizeof(tlv_hdr_t) + t->len > tlvs.size()) break;
+        if (t->id == tag_id) {
+            return std::vector<uint8_t>(t->value, t->value + t->len);
+        }
+        off += sizeof(tlv_hdr_t) + t->len;
+    }
+    return {};
+}
+
+// Forge a SWIN session packet with caller-chosen fixed-header k/n
+// and arbitrary TLV region. Used to exercise malformed-session paths
+// that the real TX never emits.
+std::vector<uint8_t> forge_session_with_tlvs(const TestKeys& keys,
+                                             uint64_t epoch,
+                                             uint32_t channel_id,
+                                             uint8_t fec_type,
+                                             uint8_t k, uint8_t n,
+                                             const std::vector<uint8_t>& tlvs)
+{
+    std::vector<uint8_t> plain(sizeof(wsession_data_t) + tlvs.size());
+    wsession_data_t* sd = (wsession_data_t*)plain.data();
+    sd->epoch = htobe64(epoch);
+    sd->channel_id = htobe32(channel_id);
+    sd->fec_type = fec_type;
+    sd->k = k;
+    sd->n = n;
+    randombytes_buf(sd->session_key, sizeof(sd->session_key));
+    if (!tlvs.empty()) {
+        std::memcpy(plain.data() + sizeof(wsession_data_t),
+                    tlvs.data(), tlvs.size());
+    }
+
+    std::vector<uint8_t> packet(sizeof(wsession_hdr_t) + plain.size()
+                                + crypto_box_MACBYTES);
+    wsession_hdr_t* hdr = (wsession_hdr_t*)packet.data();
+    hdr->packet_type = WFB_PACKET_SESSION;
+    randombytes_buf(hdr->session_nonce, sizeof(hdr->session_nonce));
+
+    int rc = crypto_box_easy(packet.data() + sizeof(wsession_hdr_t),
+                             plain.data(), plain.size(),
+                             hdr->session_nonce,
+                             keys.rx_public, keys.tx_secret);
+    REQUIRE(rc == 0);
+    return packet;
+}
+
+// Build a TLV blob from a list of (id, bytes) pairs.
+std::vector<uint8_t> build_tlvs(std::initializer_list<std::pair<uint8_t, std::vector<uint8_t>>> items)
+{
+    std::vector<uint8_t> out;
+    for (const auto& item : items) {
+        tlv_hdr_t h{};
+        h.id = item.first;
+        h.len = item.second.size();
+        const uint8_t* hb = (const uint8_t*)&h;
+        out.insert(out.end(), hb, hb + sizeof(tlv_hdr_t));
+        out.insert(out.end(), item.second.begin(), item.second.end());
+    }
+    return out;
+}
+
+// Fixture for SWIN end-to-end tests. Drives a SWIN TX and a matching
+// SWIN-configured RX through the session handshake.
+struct SwinFixture {
+    TestKeys keys;
+    std::vector<tags_item_t> empty_tags;
+    MockTransmitter tx;
+    MockAggregator rx;
+
+    SwinFixture(uint16_t W, uint8_t R_num, uint8_t R_den,
+                uint64_t T_flush_ms = 100)
+        : keys(),
+          empty_tags(),
+          tx(W, R_num, R_den, keys.tx_path, empty_tags),
+          rx(keys.rx_path, WFB_FEC_SWIN_RS, T_flush_ms)
+    {
+        tx.send_session_key();
+        PassThrough pt;
+        run_pipeline(tx, rx, pt);
+        REQUIRE(rx.count_p_session == 1);
+    }
+
+    void send_data(int count, size_t size, uint8_t seed = 0) {
+        std::vector<uint8_t> payload(size);
+        for (int i = 0; i < count; i++) {
+            std::memset(payload.data(), (uint8_t)(seed + i), size);
+            REQUIRE(tx.send_packet(payload.data(), size, 0) == true);
+        }
+    }
+};
+
+}  // namespace
+
+
+TEST_CASE("B4 SWIN TX session packet carries fec_type + W/R TLVs",
+          "[B4][swin][wire]") {
+    TestKeys keys;
+    std::vector<tags_item_t> empty_tags;
+    MockTransmitter tx(/*W=*/64, /*R_num=*/1, /*R_den=*/2,
+                       keys.tx_path, empty_tags);
+    tx.send_session_key();
+
+    // First injected packet should be the SESSION.
+    REQUIRE(tx.sent.size() >= 1);
+    REQUIRE(tx.sent[0][0] == WFB_PACKET_SESSION);
+
+    ParsedSession ps = parse_session_packet(tx.sent[0], keys);
+    REQUIRE(ps.fec_type == WFB_FEC_SWIN_RS);
+    REQUIRE(ps.k == 0);  // §5.5 — reserved under SWIN
+    REQUIRE(ps.n == 0);
+
+    // TLV_SWIN_WINDOW — uint16_be = 64
+    auto win = find_tlv(ps.tlv_bytes, TLV_SWIN_WINDOW);
+    REQUIRE(win.size() == 2);
+    uint16_t w_be;
+    std::memcpy(&w_be, win.data(), sizeof(w_be));
+    REQUIRE(be16toh(w_be) == 64);
+
+    // TLV_SWIN_REPAIR_RATIO — uint8 num, uint8 den
+    auto ratio = find_tlv(ps.tlv_bytes, TLV_SWIN_REPAIR_RATIO);
+    REQUIRE(ratio.size() == 2);
+    REQUIRE(ratio[0] == 1);  // num
+    REQUIRE(ratio[1] == 2);  // den
+}
+
+
+TEST_CASE("B4 block TX session still carries fec_type=VDM and no SWIN TLVs",
+          "[B4][swin][wire]") {
+    TestKeys keys;
+    std::vector<tags_item_t> empty_tags;
+    MockTransmitter tx(/*k=*/8, /*n=*/12, keys.tx_path, empty_tags);
+    tx.send_session_key();
+
+    REQUIRE(tx.sent.size() >= 1);
+    ParsedSession ps = parse_session_packet(tx.sent[0], keys);
+    REQUIRE(ps.fec_type == WFB_FEC_VDM_RS);
+    REQUIRE(ps.k == 8);
+    REQUIRE(ps.n == 12);
+
+    REQUIRE(find_tlv(ps.tlv_bytes, TLV_SWIN_WINDOW).empty());
+    REQUIRE(find_tlv(ps.tlv_bytes, TLV_SWIN_REPAIR_RATIO).empty());
+}
+
+
+TEST_CASE("B4 SWIN TX → SWIN RX lossless end-to-end at W=16 R=1/1",
+          "[B4][swin][pipeline]") {
+    SwinFixture f(/*W=*/16, /*R_num=*/1, /*R_den=*/1);
+    f.send_data(/*count=*/64, /*size=*/200);
+    PassThrough pt;
+    run_pipeline(f.tx, f.rx, pt);
+
+    // Time passes so T_flush retires any straggling windows.
+    // (Not strictly needed under PassThrough, but deterministic.)
+    REQUIRE(f.rx.count_p_dec_err == 0);
+    REQUIRE(f.rx.count_p_bad == 0);
+    REQUIRE(f.rx.delivered.size() == 64);
+    for (size_t i = 0; i < 64; i++) {
+        REQUIRE(f.rx.delivered[i].size() == 200);
+        REQUIRE(f.rx.delivered[i][0] == (uint8_t)i);
+    }
+    // No recovery needed under lossless pipe.
+    REQUIRE(f.rx.count_p_fec_recovered == 0);
+}
+
+
+TEST_CASE("B4 SWIN TX → SWIN RX recovers a single-source loss",
+          "[B4][swin][pipeline][recovery]") {
+    SwinFixture f(/*W=*/8, /*R_num=*/1, /*R_den=*/1);
+    f.send_data(/*count=*/16, /*size=*/200);
+
+    // Drop the 5th source (seq_num=4). Under W=8 R=1/1 a repair with
+    // window_tail=4 covers [0..4] (zero-padded at startup since the
+    // window is partially filled); repair with window_tail=5..7 also
+    // cover it. Any of these should recover source #4.
+    class DropSourceSeq : public LossFilter {
+    public:
+        uint64_t target;
+        DropSourceSeq(uint64_t t) : target(t) {}
+        bool deliver(size_t, const uint8_t* buf, size_t size) override {
+            if (size < sizeof(wblock_hdr_t)) return true;
+            if (buf[0] != WFB_PACKET_DATA) return true;
+            uint64_t nonce_be;
+            std::memcpy(&nonce_be, buf + offsetof(wblock_hdr_t, data_nonce),
+                        sizeof(nonce_be));
+            uint64_t nonce = be64toh(nonce_be);
+            const bool is_repair = (nonce >> 63) & 1;
+            const uint64_t seq_num = nonce & BLOCK_IDX_MASK;
+            if (!is_repair && seq_num == target) return false;
+            return true;
+        }
+    } drop(4);
+
+    run_pipeline(f.tx, f.rx, drop);
+
+    REQUIRE(f.rx.count_p_bad == 0);
+    REQUIRE(f.rx.delivered.size() == 16);
+    REQUIRE(f.rx.count_p_fec_recovered >= 1);
+    // Delivered source #4 must match the seed data.
+    REQUIRE(f.rx.delivered[4].size() == 200);
+    REQUIRE(f.rx.delivered[4][0] == (uint8_t)4);
+}
+
+
+TEST_CASE("B4 RX rejects SWIN session when configured for block FEC",
+          "[B4][swin][fail-closed]") {
+    TestKeys keys;
+    MockAggregator rx(keys.rx_path, WFB_FEC_VDM_RS);
+
+    // Forge a SWIN session with valid TLVs. RX should reject on
+    // configured_codec mismatch (count_p_dec_err++).
+    const std::vector<uint8_t> tlvs = build_tlvs({
+        { TLV_SWIN_WINDOW, std::vector<uint8_t>{0x00, 0x10} },      // 16 BE
+        { TLV_SWIN_REPAIR_RATIO, std::vector<uint8_t>{1, 1} },
+    });
+    auto pkt = forge_session_with_tlvs(keys, kEpoch, kChannelId,
+                                       WFB_FEC_SWIN_RS, /*k=*/0, /*n=*/0, tlvs);
+    const uint32_t before = rx.count_p_dec_err;
+    feed_raw(rx, pkt.data(), pkt.size());
+    REQUIRE(rx.count_p_dec_err == before + 1);
+    REQUIRE(rx.count_p_session == 0);
+}
+
+
+TEST_CASE("B4 RX rejects block session when configured for SWIN",
+          "[B4][swin][fail-closed]") {
+    TestKeys keys;
+    MockAggregator rx(keys.rx_path, WFB_FEC_SWIN_RS);
+
+    auto pkt = forge_session_with_tlvs(keys, kEpoch, kChannelId,
+                                       WFB_FEC_VDM_RS, /*k=*/8, /*n=*/12, {});
+    const uint32_t before = rx.count_p_dec_err;
+    feed_raw(rx, pkt.data(), pkt.size());
+    REQUIRE(rx.count_p_dec_err == before + 1);
+    REQUIRE(rx.count_p_session == 0);
+}
+
+
+TEST_CASE("B4 SWIN RX rejects malformed session params",
+          "[B4][swin][fail-closed][malformed]") {
+    TestKeys keys;
+
+    // Case A: k != 0 under SWIN.
+    {
+        MockAggregator rx(keys.rx_path, WFB_FEC_SWIN_RS);
+        const std::vector<uint8_t> tlvs = build_tlvs({
+            { TLV_SWIN_WINDOW, std::vector<uint8_t>{0x00, 0x10} },
+            { TLV_SWIN_REPAIR_RATIO, std::vector<uint8_t>{1, 1} },
+        });
+        auto pkt = forge_session_with_tlvs(keys, kEpoch, kChannelId,
+                                           WFB_FEC_SWIN_RS, /*k=*/8, /*n=*/0, tlvs);
+        const uint32_t before = rx.count_p_dec_err;
+        feed_raw(rx, pkt.data(), pkt.size());
+        REQUIRE(rx.count_p_dec_err == before + 1);
+    }
+
+    // Case B: missing TLV_SWIN_WINDOW.
+    {
+        MockAggregator rx(keys.rx_path, WFB_FEC_SWIN_RS);
+        const std::vector<uint8_t> tlvs = build_tlvs({
+            { TLV_SWIN_REPAIR_RATIO, std::vector<uint8_t>{1, 1} },
+        });
+        auto pkt = forge_session_with_tlvs(keys, kEpoch, kChannelId,
+                                           WFB_FEC_SWIN_RS, 0, 0, tlvs);
+        const uint32_t before = rx.count_p_dec_err;
+        feed_raw(rx, pkt.data(), pkt.size());
+        REQUIRE(rx.count_p_dec_err == before + 1);
+    }
+
+    // Case C: missing TLV_SWIN_REPAIR_RATIO.
+    {
+        MockAggregator rx(keys.rx_path, WFB_FEC_SWIN_RS);
+        const std::vector<uint8_t> tlvs = build_tlvs({
+            { TLV_SWIN_WINDOW, std::vector<uint8_t>{0x00, 0x10} },
+        });
+        auto pkt = forge_session_with_tlvs(keys, kEpoch, kChannelId,
+                                           WFB_FEC_SWIN_RS, 0, 0, tlvs);
+        const uint32_t before = rx.count_p_dec_err;
+        feed_raw(rx, pkt.data(), pkt.size());
+        REQUIRE(rx.count_p_dec_err == before + 1);
+    }
+
+    // Case D: W = 0 (invalid).
+    {
+        MockAggregator rx(keys.rx_path, WFB_FEC_SWIN_RS);
+        const std::vector<uint8_t> tlvs = build_tlvs({
+            { TLV_SWIN_WINDOW, std::vector<uint8_t>{0x00, 0x00} },
+            { TLV_SWIN_REPAIR_RATIO, std::vector<uint8_t>{1, 1} },
+        });
+        auto pkt = forge_session_with_tlvs(keys, kEpoch, kChannelId,
+                                           WFB_FEC_SWIN_RS, 0, 0, tlvs);
+        const uint32_t before = rx.count_p_dec_err;
+        feed_raw(rx, pkt.data(), pkt.size());
+        REQUIRE(rx.count_p_dec_err == before + 1);
+    }
+
+    // Case E: ⌈R·W⌉ > 128 (W=128, R=2/1 → 256 repairs/window).
+    {
+        MockAggregator rx(keys.rx_path, WFB_FEC_SWIN_RS);
+        const std::vector<uint8_t> tlvs = build_tlvs({
+            { TLV_SWIN_WINDOW, std::vector<uint8_t>{0x00, 0x80} },  // 128 BE
+            { TLV_SWIN_REPAIR_RATIO, std::vector<uint8_t>{2, 1} },
+        });
+        auto pkt = forge_session_with_tlvs(keys, kEpoch, kChannelId,
+                                           WFB_FEC_SWIN_RS, 0, 0, tlvs);
+        const uint32_t before = rx.count_p_dec_err;
+        feed_raw(rx, pkt.data(), pkt.size());
+        REQUIRE(rx.count_p_dec_err == before + 1);
+    }
+}
+
+
+TEST_CASE("B4 SWIN source/repair data_nonce layout on the wire",
+          "[B4][swin][nonce]") {
+    SwinFixture f(/*W=*/8, /*R_num=*/1, /*R_den=*/1);
+    f.send_data(/*count=*/16, /*size=*/100);
+
+    // Walk each DATA packet in tx.sent (post-session). Source packets
+    // should have bit 63 = 0; repairs should have bit 63 = 1. No two
+    // distinct packet-type (source vs repair) should map to the same
+    // full nonce.
+    std::set<uint64_t> nonces;
+    size_t sources = 0, repairs = 0;
+    for (const auto& pkt : f.tx.sent) {
+        if (pkt.empty() || pkt[0] != WFB_PACKET_DATA) continue;
+        uint64_t n = parse_data_nonce(pkt);
+        REQUIRE(nonces.insert(n).second);  // distinct
+        if ((n >> 63) & 1) repairs++;
+        else sources++;
+    }
+    REQUIRE(sources == 16);
+    REQUIRE(repairs == 16);  // R=1/1 → one repair per source
+}
+
+
+TEST_CASE("B4 Aggregator rejects unknown configured_codec at construction",
+          "[B4][swin][ctor]") {
+    TestKeys keys;
+    REQUIRE_THROWS_AS(MockAggregator(keys.rx_path, /*codec=*/0xff),
+                      std::runtime_error);
 }
 
 

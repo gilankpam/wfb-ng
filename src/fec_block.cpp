@@ -157,23 +157,20 @@ std::unique_ptr<IFecEncoder> make_fec_encoder(const fec_params_t& params) {
 }
 
 std::unique_ptr<IFecDecoder> make_fec_decoder(const fec_params_t& params,
-                                              PacketLossListener* loss_listener) {
+                                              PacketLossListener* loss_listener,
+                                              uint64_t T_flush_ms) {
     switch (params.fec_type) {
         case WFB_FEC_VDM_RS:
+            // Block decoder ignores T_flush_ms (no wall-clock retirement).
             return std::unique_ptr<IFecDecoder>(
                 new BlockFecDecoder(params.k, params.n, loss_listener));
-        case WFB_FEC_SWIN_RS: {
-            // T_flush default: B3 hard-codes 100 ms (video profile).
-            // B5 will thread this from CLI / config per §7.4 so each
-            // profile can pick its own.
-            constexpr uint64_t kDefaultTFlushMs = 100;
+        case WFB_FEC_SWIN_RS:
             return std::unique_ptr<IFecDecoder>(
                 new SwinFecDecoder(params.swin_w,
                                    params.swin_r_num,
                                    params.swin_r_den,
                                    loss_listener,
-                                   kDefaultTFlushMs));
-        }
+                                   T_flush_ms));
         default:
             throw std::runtime_error(
                 "make_fec_decoder: unknown fec_type");

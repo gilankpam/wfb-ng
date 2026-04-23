@@ -167,7 +167,16 @@ typedef std::unordered_map<rxAntennaKey, rxAntennaItem> rx_antenna_stat_t;
 class Aggregator : public BaseAggregator
 {
 public:
-    Aggregator(const std::string &keypair, uint64_t epoch, uint32_t channel_id);
+    // B4: `configured_codec` is the codec this RX was configured with
+    // (WFB_FEC_VDM_RS or WFB_FEC_SWIN_RS). Session packets whose
+    // fec_type disagrees are rejected via count_p_dec_err (§9.2
+    // step 3). `T_flush_ms` is passed into SwinFecDecoder at init_fec
+    // time; ignored for block FEC. Defaults match the RX's
+    // historical block-only behavior so existing call sites don't
+    // need to change until B5 wires the CLI.
+    Aggregator(const std::string &keypair, uint64_t epoch, uint32_t channel_id,
+               uint8_t configured_codec = WFB_FEC_VDM_RS,
+               uint64_t T_flush_ms = 100);
     virtual ~Aggregator();
     virtual void process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
                                 const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
@@ -262,6 +271,11 @@ private:
                                    // dispatch, and the block-FEC flat
                                    // packet_seq computation. Decoder
                                    // owns the codec-side copy.
+    const uint8_t  configured_codec;  // codec this RX accepts; session
+                                      // parse rejects any fec_type !=
+                                      // configured_codec (§9.2 step 3).
+    const uint64_t T_flush_ms;        // passed to SwinFecDecoder on
+                                      // init_fec; ignored under block.
     uint8_t session_hash[crypto_generichash_BYTES];
 
 protected:
@@ -288,7 +302,8 @@ private:
 class AggregatorUDPv4 : public Aggregator
 {
 public:
-    AggregatorUDPv4(const std::string &client_addr, int client_port, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size);
+    AggregatorUDPv4(const std::string &client_addr, int client_port, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size,
+                    uint8_t configured_codec = WFB_FEC_VDM_RS, uint64_t T_flush_ms = 100);
     virtual ~AggregatorUDPv4();
 
 protected:
@@ -306,7 +321,8 @@ private:
 class AggregatorUNIX : public Aggregator
 {
 public:
-    AggregatorUNIX(const std::string &unix_socket, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size);
+    AggregatorUNIX(const std::string &unix_socket, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size,
+                   uint8_t configured_codec = WFB_FEC_VDM_RS, uint64_t T_flush_ms = 100);
     virtual ~AggregatorUNIX();
 
 protected:

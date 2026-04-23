@@ -268,14 +268,22 @@ void Receiver::loop_iter(void)
 }
 
 
-Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
+Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id,
+                       uint8_t configured_codec, uint64_t T_flush_ms) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
     decoder(), pop_scratch(nullptr),
     mirror_baseline_fec_recovered(0), mirror_baseline_override(0),
-    current_params{}, seq(0),
+    current_params{},
+    configured_codec(configured_codec),
+    T_flush_ms(T_flush_ms),
+    seq(0),
     epoch(epoch), channel_id(channel_id)
 {
+    if (configured_codec != WFB_FEC_VDM_RS && configured_codec != WFB_FEC_SWIN_RS)
+    {
+        throw runtime_error(string_format("Aggregator: unknown configured_codec 0x%x", configured_codec));
+    }
     memset(session_key, '\0', sizeof(session_key));
     memset(session_hash, '\0', sizeof(session_hash));
 
@@ -318,22 +326,32 @@ Aggregator::~Aggregator()
 
 void Aggregator::init_fec(const fec_params_t &params)
 {
-    // Phase 2a: only block FEC is wired through. Sliding params will
-    // light up in Phase 2b once fec_swin is behind the interface.
-    assert(params.fec_type == WFB_FEC_VDM_RS);
-    assert(params.k >= 1);
-    assert(params.n >= 1);
-    assert(params.n < 256);
-    assert(params.k <= params.n);
+    // B4: both codecs are wired. Param validation mirrors the codec-
+    // side ctors (fec_block.cpp / fec_swin.cpp).
+    if (params.fec_type == WFB_FEC_VDM_RS)
+    {
+        assert(params.k >= 1);
+        assert(params.n >= 1);
+        assert(params.n < 256);
+        assert(params.k <= params.n);
+    }
+    else if (params.fec_type == WFB_FEC_SWIN_RS)
+    {
+        assert(params.k == 0 && params.n == 0);
+        assert(params.swin_w >= 1);
+        assert(params.swin_r_num >= 1 && params.swin_r_den >= 1);
+    }
+    else
+    {
+        throw runtime_error(string_format("init_fec: unknown fec_type 0x%x", params.fec_type));
+    }
 
     current_params = params;
     seq = 0;
 
-    // B0: factory now dispatches on fec_type. Aggregator no longer
-    // bypasses it — counters are exposed via IFecDecoder accessors
-    // (count_p_fec_recovered(), count_p_override(), count_w_flush())
-    // and mirrored into our public members after every drain.
-    decoder = make_fec_decoder(current_params, packet_loss_listener_);
+    // B0: factory dispatches on fec_type. B4: T_flush_ms flows to the
+    // SWIN decoder here (block decoder ignores it).
+    decoder = make_fec_decoder(current_params, packet_loss_listener_, T_flush_ms);
 
     // Fresh decoder: cumulative counters are 0, so baseline is 0.
     mirror_baseline_fec_recovered = 0;
@@ -512,7 +530,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         }
         break;
 
-    case WFB_PACKET_SESSION:
+    case WFB_PACKET_SESSION: {
         new_session_data = (wsession_data_t*)session_tmp;
 
         if(size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES || \
@@ -568,25 +586,106 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             return;
         }
 
-        if (new_session_data->fec_type != WFB_FEC_VDM_RS)
+        // B4: §9.2 step 3 — fail closed if the TX used a different
+        // codec than this RX was configured for. This catches
+        // symmetric mismatches (new TX + old RX; block TX + SWIN RX;
+        // SWIN TX + block RX) at the session packet before any
+        // data packet reaches the decoder.
+        if (new_session_data->fec_type != configured_codec)
         {
-            WFB_ERR("Unsupported FEC codec type: %d\n", new_session_data->fec_type);
+            WFB_ERR("Unsupported FEC codec type 0x%x (RX configured for 0x%x)\n",
+                    new_session_data->fec_type, configured_codec);
             count_p_dec_err += 1;
             return;
         }
 
-        if (new_session_data->n < 1)
-        {
-            WFB_ERR("Invalid FEC N: %d\n", new_session_data->n);
-            count_p_dec_err += 1;
-            return;
-        }
+        // Codec-specific param validation. fec_params_t carries both
+        // block (k, n) and sliding (swin_w, swin_r_num, swin_r_den)
+        // fields; only the fields for the active codec are populated,
+        // the rest stay 0.
+        fec_params_t session_params{};
+        session_params.fec_type = new_session_data->fec_type;
 
-        if (new_session_data->k < 1 || new_session_data->k > new_session_data->n)
+        if (new_session_data->fec_type == WFB_FEC_VDM_RS)
         {
-            WFB_ERR("Invalid FEC K: %d\n", new_session_data->k);
-            count_p_dec_err += 1;
-            return;
+            if (new_session_data->n < 1)
+            {
+                WFB_ERR("Invalid FEC N: %d\n", new_session_data->n);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            if (new_session_data->k < 1 || new_session_data->k > new_session_data->n)
+            {
+                WFB_ERR("Invalid FEC K: %d\n", new_session_data->k);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            session_params.k = new_session_data->k;
+            session_params.n = new_session_data->n;
+        }
+        else
+        {
+            // WFB_FEC_SWIN_RS — §5.5 reserves k/n = 0; §5.5 carries
+            // W and R in optional TLVs.
+            if (new_session_data->k != 0 || new_session_data->n != 0)
+            {
+                WFB_ERR("SWIN session has non-zero k/n (0x%x/0x%x)\n",
+                        new_session_data->k, new_session_data->n);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            const size_t fixed_prefix =
+                sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES;
+            const size_t tlv_size = size - fixed_prefix;
+            const void*  tlv_start = new_session_data->tags;
+
+            uint16_t w_be = 0;
+            int rc_w = get_tag(tlv_start, tlv_size, TLV_SWIN_WINDOW,
+                               &w_be, sizeof(w_be));
+            if (rc_w != (int)sizeof(w_be))
+            {
+                WFB_ERR("SWIN session missing/malformed TLV_SWIN_WINDOW (rc=%d)\n", rc_w);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            uint8_t r_bytes[2] = {0, 0};
+            int rc_r = get_tag(tlv_start, tlv_size, TLV_SWIN_REPAIR_RATIO,
+                               r_bytes, sizeof(r_bytes));
+            if (rc_r != (int)sizeof(r_bytes))
+            {
+                WFB_ERR("SWIN session missing/malformed TLV_SWIN_REPAIR_RATIO (rc=%d)\n", rc_r);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            const uint16_t w = be16toh(w_be);
+            const uint8_t  r_num = r_bytes[0];
+            const uint8_t  r_den = r_bytes[1];
+
+            if (w < 1 || r_num < 1 || r_den < 1)
+            {
+                WFB_ERR("Invalid SWIN params W=%u R=%u/%u\n", w, r_num, r_den);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            // §5.3: repair_idx is 7 bits, so ⌈R·W⌉ ≤ 128.
+            const uint32_t repairs_per_window =
+                ((uint32_t)w * (uint32_t)r_num + (uint32_t)r_den - 1) / (uint32_t)r_den;
+            if (repairs_per_window < 1 || repairs_per_window > 128)
+            {
+                WFB_ERR("SWIN ⌈R·W⌉=%u out of range [1,128]\n", repairs_per_window);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            session_params.swin_w = w;
+            session_params.swin_r_num = r_num;
+            session_params.swin_r_den = r_den;
         }
 
         count_p_session += 1;
@@ -600,19 +699,20 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             epoch = be64toh(new_session_data->epoch);
             memcpy(session_key, new_session_data->session_key, sizeof(session_key));
 
-            // Phase 2a: fec_type guard above already rejected anything
-            // other than WFB_FEC_VDM_RS, so k and n are populated from
-            // the fixed session header. Sliding fields stay zero until
-            // Phase 2b adds the TLV extraction. init_fec resets the
-            // decoder unique_ptr, which frees the previous rx_ring and
-            // zfex handle.
-            fec_params_t session_params = {WFB_FEC_VDM_RS,
-                                           new_session_data->k,
-                                           new_session_data->n,
-                                           0, 0, 0};
+            // B4: session_params is built above from the codec-specific
+            // fields. init_fec dispatches to block or SWIN via the
+            // factory. init_fec resets the decoder unique_ptr, which
+            // frees the previous ring / zfex handle.
             init_fec(session_params);
 
-            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, current_params.k, current_params.n);
+            // B4 log: hardcoded WFB_FEC_VDM_RS replaced with the
+            // session's actual fec_type. The log line still carries
+            // :k:d:n:d even under SWIN (both zero); SWIN's W/R will
+            // move into the SESSION line via B6's format extension.
+            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n",
+                    get_time_ms(), epoch,
+                    (unsigned)current_params.fec_type,
+                    current_params.k, current_params.n);
             IPC_MSG_SEND();
         }
 
@@ -620,6 +720,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         memcpy(session_hash, new_session_hash, sizeof(session_hash));
 
         return;
+    }
 
     default:
         WFB_ERR("Unknown packet type 0x%x\n", buf[0]);
@@ -650,24 +751,32 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     assert(decrypted_len <= MAX_FEC_PAYLOAD);
 
     const uint64_t data_nonce = be64toh(block_hdr->data_nonce);
-    uint64_t block_idx = data_nonce >> 8;
-    uint8_t fragment_idx = (uint8_t)(data_nonce & 0xff);
 
     count_p_uniq.insert(data_nonce);
 
-    // Should never happend due to generating new session key on tx side
-    if (block_idx > MAX_BLOCK_IDX)
+    // Block-FEC nonce validation lives here so the block path can
+    // trust (block_idx, fragment_idx) downstream. Under SWIN the
+    // nonce is (is_repair | repair_idx | seq_num) and these checks
+    // don't apply (block_idx = nonce>>8 is always > MAX_BLOCK_IDX
+    // for a SWIN repair where bit 63 = 1).
+    if (current_params.fec_type == WFB_FEC_VDM_RS)
     {
-        WFB_ERR("block_idx overflow\n");
-        count_p_bad += 1;
-        return;
-    }
+        uint64_t block_idx = data_nonce >> 8;
+        uint8_t fragment_idx_ = (uint8_t)(data_nonce & 0xff);
 
-    if (fragment_idx >= current_params.n)
-    {
-        WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
-        count_p_bad += 1;
-        return;
+        if (block_idx > MAX_BLOCK_IDX)
+        {
+            WFB_ERR("block_idx overflow\n");
+            count_p_bad += 1;
+            return;
+        }
+
+        if (fragment_idx_ >= current_params.n)
+        {
+            WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx_);
+            count_p_bad += 1;
+            return;
+        }
     }
 
     // B0: unified dispatch via decoder->is_repair_fragment(data_nonce).
@@ -678,18 +787,58 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     {
         decoder->on_source_packet(data_nonce, decrypted, decrypted_len);
     }
-    else
+    else if (current_params.fec_type == WFB_FEC_VDM_RS)
     {
-        // For the block path, synthesize window_tail_seq and repair_idx
-        // from the wire nonce. The sliding codec (Phase 2b) will ignore
-        // these and read window_tail_seq from the inner
-        // wpacket_hdr_repair_t header instead — process_packet would
-        // then look inside the decrypted payload. Left as a TODO for
-        // B4 where SWIN wire parsing lands.
+        // Block repair: synthesize (window_tail, repair_idx) from the
+        // wire nonce. window_tail = (block_idx << 8) | (fec_k - 1) —
+        // a synthetic value per IFecDecoder doc (§9.3) meaning "last
+        // source of this block".
+        const uint64_t block_idx     = data_nonce >> 8;
+        const uint8_t  fragment_idx_ = (uint8_t)(data_nonce & 0xff);
         const uint64_t window_tail = ((block_idx & BLOCK_IDX_MASK) << 8) | (uint8_t)(current_params.k - 1);
-        const uint8_t  repair_idx  = fragment_idx - (uint8_t)current_params.k;
+        const uint8_t  repair_idx  = fragment_idx_ - (uint8_t)current_params.k;
         decoder->on_repair_packet(data_nonce, window_tail, repair_idx,
                                   decrypted, decrypted_len);
+    }
+    else
+    {
+        // SWIN repair: the inner header (wpacket_hdr_repair_t, §5.4)
+        // carries the window tail. The wire nonce carries repair_idx
+        // in bits 62..56 (§5.2); we pass both to the decoder —
+        // repair_idx from the nonce is the authoritative value, the
+        // inner header has been integrity-protected by AEAD so we
+        // trust its window_tail_seq.
+        if (decrypted_len < sizeof(wpacket_hdr_repair_t))
+        {
+            WFB_ERR("SWIN repair packet too short (%llu < %zu)\n",
+                    decrypted_len, sizeof(wpacket_hdr_repair_t));
+            count_p_bad += 1;
+            return;
+        }
+        const wpacket_hdr_repair_t* rhdr = (const wpacket_hdr_repair_t*)decrypted;
+        if (rhdr->flags != WFB_PACKET_REPAIR_SWIN)
+        {
+            WFB_ERR("SWIN repair inner flags mismatch 0x%x (want 0x%x)\n",
+                    rhdr->flags, WFB_PACKET_REPAIR_SWIN);
+            count_p_bad += 1;
+            return;
+        }
+
+        const size_t   parity_len     = be16toh(rhdr->payload_size);
+        const uint64_t window_tail    = be64toh(rhdr->window_tail_seq);
+        const uint8_t  repair_idx     = (uint8_t)((data_nonce >> 56) & 0x7f);
+
+        if (sizeof(wpacket_hdr_repair_t) + parity_len > decrypted_len)
+        {
+            WFB_ERR("SWIN repair payload_size %zu exceeds decrypted len %llu\n",
+                    parity_len, decrypted_len);
+            count_p_bad += 1;
+            return;
+        }
+
+        decoder->on_repair_packet(data_nonce, window_tail, repair_idx,
+                                  decrypted + sizeof(wpacket_hdr_repair_t),
+                                  parity_len);
     }
 
     // Drain every source packet the decoder is ready to emit. pop_ready
@@ -761,8 +910,9 @@ void Aggregator::emit_source(uint64_t seq_from_decoder, const uint8_t* buf, size
     }
 }
 
-AggregatorUDPv4::AggregatorUDPv4(const std::string &client_addr, int client_port, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size) : \
-    Aggregator(keypair, epoch, channel_id)
+AggregatorUDPv4::AggregatorUDPv4(const std::string &client_addr, int client_port, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size,
+                                 uint8_t configured_codec, uint64_t T_flush_ms) : \
+    Aggregator(keypair, epoch, channel_id, configured_codec, T_flush_ms)
 {
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) throw std::runtime_error(string_format("Error opening socket: %s", strerror(errno)));
@@ -792,8 +942,9 @@ void AggregatorUDPv4::send_to_socket(const uint8_t *payload, uint16_t packet_siz
     sendto(sockfd, payload, packet_size, MSG_DONTWAIT, (sockaddr*)&saddr, sizeof(saddr));
 }
 
-AggregatorUNIX::AggregatorUNIX(const std::string &socket_path, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size) : \
-    Aggregator(keypair, epoch, channel_id)
+AggregatorUNIX::AggregatorUNIX(const std::string &socket_path, const std::string &keypair, uint64_t epoch, uint32_t channel_id, int snd_buf_size,
+                               uint8_t configured_codec, uint64_t T_flush_ms) : \
+    Aggregator(keypair, epoch, channel_id, configured_codec, T_flush_ms)
 {
     sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sockfd < 0) throw std::runtime_error(string_format("Error opening socket: %s", strerror(errno)));

@@ -113,17 +113,38 @@ void Transmitter::init_session(const fec_params_t &params)
 {
     deinit_session();
 
-    // Phase 2a: only block FEC is wired through. Sliding params will
-    // light up in Phase 2b once fec_swin is behind the interface.
-    assert(params.fec_type == WFB_FEC_VDM_RS);
-    assert(params.k >= 1);
-    assert(params.n >= 1);
-    assert(params.n < 256);
-    assert(params.k <= params.n);
+    // B4: both codecs are wired. Param validation mirrors the codec-
+    // side validation in fec_block.cpp / fec_swin.cpp.
+    if (params.fec_type == WFB_FEC_VDM_RS)
+    {
+        assert(params.k >= 1);
+        assert(params.n >= 1);
+        assert(params.n < 256);
+        assert(params.k <= params.n);
+        assert(params.swin_w == 0 && params.swin_r_num == 0 && params.swin_r_den == 0);
+    }
+    else if (params.fec_type == WFB_FEC_SWIN_RS)
+    {
+        assert(params.k == 0 && params.n == 0);
+        assert(params.swin_w >= 1);
+        assert(params.swin_r_num >= 1 && params.swin_r_den >= 1);
+        // ⌈R·W⌉ ≤ 128 per §5.3 (7-bit repair_idx).
+        const uint32_t repairs_per_window =
+            ((uint32_t)params.swin_w * (uint32_t)params.swin_r_num
+             + (uint32_t)params.swin_r_den - 1) / (uint32_t)params.swin_r_den;
+        assert(repairs_per_window >= 1 && repairs_per_window <= 128);
+    }
+    else
+    {
+        throw runtime_error(string_format("init_session: unknown fec_type 0x%x", params.fec_type));
+    }
 
     encoder = make_fec_encoder(params);
     current_params = params;
 
+    // Block-FEC wire counters. For SWIN they are reused as (block_idx =
+    // 56-bit source seq_num counter; fragment_idx unused). Keeping the
+    // same members avoids a second pair of counters in Transmitter.
     block_idx = 0;
     fragment_idx = 0;
 
@@ -147,7 +168,10 @@ void Transmitter::init_session(const fec_params_t &params)
 
         session_data->epoch = htobe64(epoch);
         session_data->channel_id = htobe32(channel_id);
-        session_data->fec_type = WFB_FEC_VDM_RS;
+        session_data->fec_type = current_params.fec_type;
+        // Under SWIN, §5.5 reserves k/n in the fixed header; set them
+        // to 0 so a block-only RX can reject cleanly on the codec guard
+        // instead of stumbling on non-zero "k"/"n" that mean nothing.
         session_data->k = (uint8_t)current_params.k;
         session_data->n = (uint8_t)current_params.n;
 
@@ -158,6 +182,36 @@ void Transmitter::init_session(const fec_params_t &params)
     // Fill optional Tags
 
     uint32_t session_data_size = sizeof(wsession_data_t);
+
+    // B4: prepend codec-specific TLVs ahead of the user-supplied tags
+    // so the session parse on the RX can extract them regardless of
+    // whether the caller passed any extra tags. TLV layout matches
+    // §5.5: TLV_SWIN_WINDOW (uint16_be W), TLV_SWIN_REPAIR_RATIO
+    // (uint8 num, uint8 den).
+    if (current_params.fec_type == WFB_FEC_SWIN_RS)
+    {
+        // TLV_SWIN_WINDOW
+        {
+            tlv_hdr_t* tlv = (tlv_hdr_t*)((uint8_t*)tmp + session_data_size);
+            session_data_size += sizeof(tlv_hdr_t) + sizeof(uint16_t);
+            assert(session_data_size <= sizeof(tmp));
+            tlv->id = TLV_SWIN_WINDOW;
+            tlv->len = sizeof(uint16_t);
+            uint16_t w_be = htobe16(current_params.swin_w);
+            memcpy(tlv->value, &w_be, sizeof(w_be));
+        }
+        // TLV_SWIN_REPAIR_RATIO
+        {
+            tlv_hdr_t* tlv = (tlv_hdr_t*)((uint8_t*)tmp + session_data_size);
+            session_data_size += sizeof(tlv_hdr_t) + 2;
+            assert(session_data_size <= sizeof(tmp));
+            tlv->id = TLV_SWIN_REPAIR_RATIO;
+            tlv->len = 2;
+            tlv->value[0] = current_params.swin_r_num;
+            tlv->value[1] = current_params.swin_r_den;
+        }
+    }
+
     for(auto it = tags.begin(); it != tags.end(); it++)
     {
         tlv_hdr_t* tlv = (tlv_hdr_t*)((uint8_t*)tmp + session_data_size);
@@ -640,6 +694,84 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
 {
     assert(size <= MAX_PAYLOAD_SIZE);
     assert(encoder);
+
+    // SWIN dispatch below mostly mirrors the block path, but the nonce
+    // layout, the repair-drain gating, and the rekey trigger differ.
+    // Forking keeps both paths readable.
+    if (current_params.fec_type == WFB_FEC_SWIN_RS)
+    {
+        // FEC-only packets are meaningful under block FEC (they close
+        // partially-opened blocks). Under SWIN every source is self-
+        // contained; ignore the flag.
+        if (flags & WFB_PACKET_FEC_ONLY) return false;
+
+        const size_t framed_size = sizeof(wpacket_hdr_t) + size;
+        wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)scratch;
+        packet_hdr->flags = flags;
+        packet_hdr->packet_size = htobe16(size);
+        if (size > 0)
+        {
+            assert(buf != NULL);
+            memcpy(scratch + sizeof(wpacket_hdr_t), buf, size);
+        }
+        memset(scratch + framed_size, '\0', MAX_FEC_PAYLOAD - framed_size);
+
+        // fwmark: source packets → 0, repair packets → 1 (mirrors block).
+        set_mark(0);
+
+        // Under SWIN, reuse block_idx as a 56-bit source seq_num counter.
+        // Source nonce (§5.2): is_repair=0, repair_idx=0, seq_num=block_idx.
+        const uint64_t source_seq = block_idx & BLOCK_IDX_MASK;
+        encoder->on_source_packet(source_seq, scratch, framed_size);
+        send_block_fragment(scratch, framed_size, source_seq);
+
+        // Drain all repairs the encoder scheduled for this source. The
+        // repair nonce already carries is_repair=1 | repair_idx |
+        // repair_seq_num (encoder-owned; see SwinFecEncoder::next_repair).
+        size_t repair_size = 0;
+        uint64_t repair_nonce = 0;
+        bool drained_any = false;
+        while (encoder->next_repair(scratch, &repair_size, &repair_nonce))
+        {
+            if (!drained_any)
+            {
+                set_mark(1);
+                drained_any = true;
+            }
+            if (fec_delay > 0)
+            {
+                struct timespec t = { .tv_sec = (time_t)(fec_delay / 1000000),
+                                      .tv_nsec = (suseconds_t)(fec_delay % 1000000) * 1000 };
+
+                int rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &t, NULL);
+
+                if (rc != 0 && rc != EINTR)
+                {
+                    throw runtime_error(string_format("clock_nanosleep: %s", strerror(rc)));
+                }
+            }
+            send_block_fragment(scratch, repair_size, repair_nonce);
+        }
+
+        block_idx += 1;
+
+        // Rekey when the 56-bit source seq_num counter is about to
+        // overflow. Under block FEC this triggers on MAX_BLOCK_IDX
+        // (2^55-1 blocks); under SWIN the equivalent boundary is the
+        // 56-bit seq_num space (§5.6). Both reuse MAX_BLOCK_IDX.
+        if (block_idx > MAX_BLOCK_IDX)
+        {
+            const fec_params_t rekey_params = current_params;
+            init_session(rekey_params);
+            // Announce a few times for redundancy; use the same
+            // ballpark as the block path (n - k + 1 redundant sends).
+            for(int i = 0; i < 4; i++) send_session_key();
+        }
+
+        return true;
+    }
+
+    // Block FEC path (unchanged pre-B4 behavior).
 
     // FEC-only packets are only for closing already opened blocks
     if (fragment_idx == 0 && (flags & WFB_PACKET_FEC_ONLY))
