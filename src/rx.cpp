@@ -706,14 +706,19 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             // frees the previous ring / zfex handle.
             init_fec(session_params);
 
-            // B4 log: hardcoded WFB_FEC_VDM_RS replaced with the
-            // session's actual fec_type. The log line still carries
-            // :k:d:n:d even under SWIN (both zero); SWIN's W/R will
-            // move into the SESSION line via B6's format extension.
-            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n",
+            // B6 log format (§10.3.1):
+            //   ts <TAB> SESSION <TAB> epoch:fec_type:k:n:swin_w:r_num/r_den
+            // Block sessions carry W=0, r_num/r_den=0/0 (SWIN fields
+            // unused). SWIN sessions carry k=n=0 (block fields unused).
+            // Both flavors are always 6 colon-separated fields so the
+            // Python parser can disambiguate on token count.
+            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u/%u\n",
                     get_time_ms(), epoch,
                     (unsigned)current_params.fec_type,
-                    current_params.k, current_params.n);
+                    current_params.k, current_params.n,
+                    (unsigned)current_params.swin_w,
+                    (unsigned)current_params.swin_r_num,
+                    (unsigned)current_params.swin_r_den);
             IPC_MSG_SEND();
         }
 

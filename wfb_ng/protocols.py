@@ -42,7 +42,7 @@ class WFBFlags(object):
     LINK_JAMMED = 2
 
 
-fec_types = {1: 'VDM_RS'}
+fec_types = {1: 'VDM_RS', 2: 'SWIN_RS'}
 
 class StatisticsMsgPackProtocol(Int32StringReceiver):
     def connectionMade(self):
@@ -430,9 +430,40 @@ class RXAntennaProtocol(LineReceiver):
                 if len(cols) != 3:
                     raise BadTelemetry()
 
-                epoch, fec_type, fec_k, fec_n = list(int(i) for i in cols[2].split(':'))
-                self.session = dict(fec_type=fec_types.get(fec_type, 'Unknown'), fec_k=fec_k, fec_n=fec_n, epoch=epoch)
-                log.msg('New session detected [%s]: FEC=%s K=%d, N=%d, epoch=%d' % (self.rx_id, fec_types.get(fec_type, 'Unknown'), fec_k, fec_n, epoch))
+                # B6 §10.3.1: the SESSION line grew from 4 to 6
+                # colon-separated fields to carry swin_w and
+                # swin_r_num/swin_r_den. Accept both during the
+                # transition — old wfb_rx binaries still on a drone
+                # may emit the 4-field form.
+                parts = cols[2].split(':')
+                if len(parts) == 4:
+                    epoch, fec_type, fec_k, fec_n = (int(x) for x in parts)
+                    swin_w, swin_r_num, swin_r_den = 0, 0, 0
+                elif len(parts) == 6:
+                    epoch = int(parts[0])
+                    fec_type = int(parts[1])
+                    fec_k = int(parts[2])
+                    fec_n = int(parts[3])
+                    swin_w = int(parts[4])
+                    r_num, r_den = parts[5].split('/', 1)
+                    swin_r_num = int(r_num)
+                    swin_r_den = int(r_den)
+                else:
+                    raise BadTelemetry()
+
+                self.session = dict(fec_type=fec_types.get(fec_type, 'Unknown'),
+                                    fec_k=fec_k, fec_n=fec_n,
+                                    swin_w=swin_w,
+                                    swin_r_num=swin_r_num, swin_r_den=swin_r_den,
+                                    epoch=epoch)
+
+                fec_name = fec_types.get(fec_type, 'Unknown')
+                if fec_type == 2:  # SWIN_RS
+                    log.msg('New session detected [%s]: FEC=%s W=%d, R=%d/%d, epoch=%d' %
+                            (self.rx_id, fec_name, swin_w, swin_r_num, swin_r_den, epoch))
+                else:
+                    log.msg('New session detected [%s]: FEC=%s K=%d, N=%d, epoch=%d' %
+                            (self.rx_id, fec_name, fec_k, fec_n, epoch))
 
                 if self.ant_stat_cb is not None:
                     self.ant_stat_cb.process_new_session(self.rx_id, self.session)

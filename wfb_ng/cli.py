@@ -196,7 +196,12 @@ class AntennaStat(Int32StringReceiver):
               human_rate(1000 * p['out_bytes'][0] / self.log_interval))
 
         if session_d:
-            flow_str += '{FEC:} %(fec_k)d/%(fec_n)d  ' % (session_d)
+            # B6: SWIN sessions carry k=n=0 and use swin_w / swin_r
+            # instead. Display the codec-appropriate form.
+            if session_d.get('fec_type') == 'SWIN_RS':
+                flow_str += '{FEC:} W=%(swin_w)d R=%(swin_r_num)d/%(swin_r_den)d  ' % (session_d)
+            else:
+                flow_str += '{FEC:} %(fec_k)d/%(fec_n)d  ' % (session_d)
 
         flow_str += '{Diversity:} %.2f' % (diversity,)
 

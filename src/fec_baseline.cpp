@@ -730,16 +730,21 @@ TEST_CASE("C13 counter semantics: all relevant counters increment", "[baseline][
 }
 
 
-TEST_CASE("C14 SESSION IPC log hardcodes WFB_FEC_VDM_RS", "[baseline][C14]") {
+TEST_CASE("C14 SESSION IPC log format carries SWIN fields", "[baseline][C14]") {
+    // B6 §10.3.1 extended the SESSION IPC line from 4 colon fields
+    // (epoch:fec_type:k:n) to 6 (epoch:fec_type:k:n:swin_w:r_num/r_den).
+    // Check the source contains the new format spec and the new
+    // argument tokens — a source-text guard against accidental
+    // reversion.
     std::string rx_src = slurp("src/rx.cpp");
-    // Look for the literal token in the SESSION IPC_MSG arg list near line 698.
-    // We're not parsing C; just confirming the identifier exists and there is
-    // an IPC_MSG that mentions SESSION.
-    REQUIRE(rx_src.find("WFB_FEC_VDM_RS") != std::string::npos);
-    const bool session_ipc_present =
-        rx_src.find("\"%\" PRIu64 \"\\tSESSION") != std::string::npos ||
-        rx_src.find("SESSION\\t") != std::string::npos;
-    REQUIRE(session_ipc_present);
+    REQUIRE(rx_src.find("\\tSESSION\\t") != std::string::npos);
+    // Format string fingerprint: "%u:%u/%u" — the swin_r_num/r_den tail.
+    REQUIRE(rx_src.find(":%u:%u/%u\\n") != std::string::npos);
+    // Argument fingerprint: the format string is now fed swin_w and
+    // swin_r_{num,den}.
+    REQUIRE(rx_src.find("current_params.swin_w") != std::string::npos);
+    REQUIRE(rx_src.find("current_params.swin_r_num") != std::string::npos);
+    REQUIRE(rx_src.find("current_params.swin_r_den") != std::string::npos);
 }
 
 
