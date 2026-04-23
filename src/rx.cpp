@@ -1025,6 +1025,11 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
         }
 
         cur_ts = get_time_ms();
+        // B8: advance SWIN decoder wall-clock state. Under load this
+        // fires ~per-packet; under idle, at log_interval cadence via
+        // the poll timeout. Block decoder's tick is a no-op.
+        agg->tick(cur_ts);
+
         if (cur_ts >= log_send_ts)
         {
             agg->dump_stats();
@@ -1072,6 +1077,10 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
         }
 
         cur_ts = get_time_ms();
+        // B8: advance SWIN decoder wall-clock state (see radio_loop for
+        // the symmetric call).
+        agg->tick(cur_ts);
+
         if (cur_ts >= log_send_ts)
         {
             agg->dump_stats();

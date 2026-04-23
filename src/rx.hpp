@@ -71,6 +71,12 @@ public:
                                 uint8_t bandwidth, sockaddr_in *sockaddr) = 0;
 
     virtual void dump_stats(void) = 0;
+
+    // B8: advance wall-clock state so SWIN's T_flush retirement
+    // (§7.4) fires on schedule. Default no-op — Forwarder has no
+    // decoder, Aggregator forwards to decoder->tick(). Main RX
+    // loops call this every poll iteration.
+    virtual void tick(uint64_t /*now_ms*/) {}
 };
 
 
@@ -182,6 +188,27 @@ public:
                                 const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth, sockaddr_in *sockaddr);
     virtual void dump_stats(void);
+
+    // B8: forwards to decoder->tick(), then drains any slots the
+    // tick freed up (T_flush retirement unblocks pop_ready past
+    // stalled gaps), then re-mirrors counter deltas. Main loops
+    // call this every poll iteration. Without it the
+    // SwinFecDecoder's wall-clock T_flush retirement (§7.4) never
+    // fires in production.
+    virtual void tick(uint64_t now_ms) override
+    {
+        if (!decoder) return;
+        decoder->tick(now_ms);
+        uint64_t out_seq = 0;
+        size_t   out_sz  = 0;
+        while (decoder->pop_ready(&out_seq, pop_scratch, &out_sz))
+        {
+            emit_source(out_seq, pop_scratch, out_sz);
+        }
+        count_p_fec_recovered = decoder->count_p_fec_recovered() - mirror_baseline_fec_recovered;
+        count_p_override      = decoder->count_p_override()      - mirror_baseline_override;
+        count_w_flush         = decoder->count_w_flush()         - mirror_baseline_w_flush;
+    }
 
     // Packet loss listener for immediate notifications
     void set_packet_loss_listener(PacketLossListener* listener) { packet_loss_listener_ = listener; }

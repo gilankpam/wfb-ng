@@ -2663,6 +2663,109 @@ TEST_CASE("B8 SWIN wire distinctness: source nonces < 2^63, repair nonces >= 2^6
 }
 
 
+TEST_CASE("B8 SWIN recovers in-block 5-burst that block FEC cannot",
+          "[B8][swin][integration][vs-block]") {
+    // The Phase-2c "SWIN wins" motivating scenario: a 5-consecutive
+    // source burst inside a single block. Block FEC at (k=8, n=12)
+    // recovers up to n-k=4 erasures per block — a 5-burst lands
+    // wholly in one block and that block is unrecoverable. SWIN at
+    // W=16 R=1/1 cascades the 5-burst (span 4 ≤ W=16, within
+    // W_rx-W=16 span gate) and delivers all of them.
+
+    // Shared drop set: seqs 2..6 (5 consecutive), wholly inside
+    // block 0 (seqs 0..7) under (k=8, n=12). Block 0 loses 5 → can't
+    // recover → all 8 sources of block 0 are lost.
+    const std::set<uint64_t> drop_seqs = {2, 3, 4, 5, 6};
+
+    const int N = 48;   // large enough that cascade can seed past the burst
+
+    // --- Block FEC pipe ---
+    {
+        Fixture f(/*k=*/8, /*n=*/12);
+        f.send_data(N, /*size=*/200);
+        // DropFragment keys on (block_idx, fragment_idx). For block 0
+        // (k=8), seqs 2..6 are fragment_idx 2..6.
+        DropFragment drop({
+            {0, 2}, {0, 3}, {0, 4}, {0, 5}, {0, 6},
+        });
+        run_pipeline(f.tx, f.rx, drop);
+        // Block 0 loses 5 sources > n-k=4 → unrecoverable. The
+        // 3 RECEIVED sources of block 0 (seqs 0, 1, 7) still flow
+        // through the ring; the 5 missing seqs (2..6) never do.
+        // Remaining 5 blocks (8..47) deliver all 40. Total: 3 + 40 = 43.
+        REQUIRE(f.rx.delivered.size() == (size_t)(N - 5));
+        REQUIRE(f.rx.count_p_fec_recovered == 0);
+        // The 5 dropped seqs stay lost on the block path.
+        REQUIRE(f.rx.count_p_lost == 5);
+    }
+
+    // --- SWIN pipe (same logical drops) ---
+    {
+        SwinFixture f(/*W=*/16, /*R_num=*/1, /*R_den=*/1);
+        f.send_data(N, /*size=*/200);
+        DropSwinSources drop(std::set<uint64_t>(drop_seqs.begin(), drop_seqs.end()));
+        run_pipeline(f.tx, f.rx, drop);
+        // Cascade starts at tail=21 (window [6..21] contains only
+        // {6}) and peels leftward through 5, 4, 3, 2.
+        REQUIRE(f.rx.delivered.size() == (size_t)N);
+        REQUIRE(f.rx.count_p_fec_recovered == 5);
+        REQUIRE(f.rx.count_w_flush == 0);
+        for (uint64_t s : drop_seqs) {
+            REQUIRE(f.rx.delivered[s][0] == (uint8_t)s);
+        }
+    }
+}
+
+
+TEST_CASE("B8 SWIN uncovered burst under R=1/2 retires via T_flush",
+          "[B8][swin][integration][flush]") {
+    // §7.2 R<1 consecutive-burst row: a 2+ consecutive burst is
+    // unrecoverable at R=1/2. The decoder must eventually retire
+    // the stalled gap via wall-clock T_flush so downstream sources
+    // can drain — otherwise pop_ready blocks forever on the gap.
+    //
+    // Requires the B8 tick wiring (Aggregator::tick → decoder->tick).
+    // Without that, count_w_flush never bumps and delivered stays
+    // stuck at everything before the burst.
+
+    const uint64_t T_flush_ms = 50;   // short for a fast test
+    SwinFixture f(/*W=*/16, /*R_num=*/1, /*R_den=*/2, T_flush_ms);
+    const int N = 32;
+    f.send_data(N, /*size=*/200);
+
+    // 2-burst at seqs 10, 11 — unrecoverable under R=1/2.
+    DropSwinSources drop({10, 11});
+    run_pipeline(f.tx, f.rx, drop);
+
+    // Before tick fires: source 10 and 11 are EMPTY gaps. pop_ready
+    // can drain 0..9 but stalls at 10. Sources 12..31 accumulate in
+    // the ring but can't emit until the gap clears. Real sleep is
+    // too slow for a unit test — instead call agg->tick() with a
+    // time past T_flush to force retirement.
+    const size_t before_flush = f.rx.delivered.size();
+    REQUIRE(before_flush < (size_t)N);             // stuck on the gap
+    REQUIRE(f.rx.count_w_flush == 0);              // tick hasn't fired yet
+
+    // Advance Aggregator wall clock well past T_flush. Two calls
+    // because the decoder retires ONE gap per tick pass (10 and 11
+    // are two adjacent gaps).
+    f.rx.tick(get_time_ms() + T_flush_ms * 10);
+    f.rx.tick(get_time_ms() + T_flush_ms * 10);
+
+    // tick() retired the gaps; pop_ready still needs to drain the
+    // now-emittable slots. Re-run the pipeline with a no-op pass to
+    // let Aggregator re-drain.
+    PassThrough pt;
+    run_pipeline(f.tx, f.rx, pt);
+
+    // After flush: 30 sources delivered (32 sent − 2 dropped &
+    // unrecovered). count_w_flush registers both gaps.
+    REQUIRE(f.rx.delivered.size() == (size_t)(N - 2));
+    REQUIRE(f.rx.count_w_flush == 2);
+    REQUIRE(f.rx.count_p_fec_recovered == 0);
+}
+
+
 TEST_CASE("B7 SWIN fixture exposes count_w_flush mirror from decoder",
           "[B7][swin]") {
     SwinFixture f(/*W=*/8, /*R_num=*/1, /*R_den=*/1);
