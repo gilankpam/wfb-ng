@@ -702,13 +702,52 @@ profiles' redundancy:
 | Mavlink  | (1, 2)         | 1.00                        | 16           | 1.00         |
 | Tunnel   | (1, 2)         | 1.00                        | 32           | 1.00         |
 
-At the video defaults, sliding-window is *strictly stronger* than block
-FEC for bursty loss: a burst that straddles two blocks under `(8, 12)`
-is unrecoverable; the same burst inside a single W=64 window is
-recoverable up to `⌈R · W⌉ = 32` losses.
-
 Constraint: `R · W ≤ 128` (7-bit `repair_idx` cap). All recommended
 defaults satisfy this with headroom.
+
+#### Recovery capacity per window
+
+The RS matrix capacity is `⌈R · W⌉` parities per window. In
+principle that recovers up to `⌈R · W⌉` losses within a window.
+The §7.3 scheduling together with §7.4's **cascade decode**
+(added in Phase 2b clarification) realize this bound under two
+distinct regimes:
+
+| Loss pattern         | R ≥ 1.0 (parity at every tail) | R < 1.0 (e.g. R=0.5, parity every ⌈1/R⌉ tails) |
+|---------------------:|:------------------------------:|:-------------------------------------------------:|
+| Isolated single loss | recoverable                    | recoverable                                       |
+| Scattered losses spaced ≥ ⌈1/R⌉ apart | recoverable via cascade | recoverable via cascade         |
+| Consecutive burst    | recoverable up to `⌈R · W⌉` via cascade | **NOT recoverable** (no parity at the "one-loss-window" tail to seed the cascade) |
+
+**Cascade seeding condition.** Cascade starts from a window whose
+tail holds a parity AND whose range contains exactly one loss.
+Under R ≥ 1.0 every tail has a parity, so every window that
+contains exactly one burst-member is a valid seed. Under R < 1.0
+only a fraction of tails have parities; consecutive bursts have no
+"exactly-one-loss window" at a parity-bearing tail (each shift of
+the window boundary moves it past one burst-member, but the parity
+only arrives at every ⌈1/R⌉-th tail, skipping the single-loss
+boundary window).
+
+**Practical implications:**
+
+- **Mavlink / tunnel (R=1.0):** full consecutive-burst recovery up
+  to `⌈R · W⌉` losses. Strictly stronger than block FEC at the same
+  overhead ratio for bursty loss.
+- **Video (R=0.5):** suited for sparse / interleaved losses, which
+  is typical of Wi-Fi air-interface loss patterns. A dedicated
+  consecutive-burst longer than 1 packet is NOT recoverable at
+  R=0.5 — the design trades this worst-case burst coverage for
+  lower bandwidth overhead. Operators who need consecutive-burst
+  coverage at video rates should pick R ≥ 1.0 (or a Phase 3+
+  scheduling variant that emits multiple parity rows per window
+  under R < 1.0).
+- Relative to block FEC at matched overhead (video R=0.5 vs block
+  (8, 12)): block FEC recovers up to 4 per-block losses, including
+  a 4-consecutive burst entirely within one block. SWIN at R=0.5
+  does NOT handle consecutive bursts ≥ 2. SWIN's win is HOL-free
+  immediate source delivery (§2 motivation) and cascade recovery
+  of scattered losses, NOT burst tolerance at this overhead.
 
 ### 7.3 Emission schedule (Phase 1: proactive only)
 
@@ -740,17 +779,14 @@ always provide.
 
 ### 7.4 RX window and flush deadline
 
-- RX keeps `W_rx = 2 · W` source slots plus `W_rx · R` repair slots.
+- RX keeps `W_rx = 2 · W` source slots plus a repair store sized
+  dynamically up to `W_rx · R` entries (std::map in the Phase 2b
+  impl — fixed-capacity pool is a Phase 3 optimization).
 - A source packet is emitted to the socket immediately on arrival, before
   any repair logic runs. Duplicate-seq arrivals are ignored (dedup via
   `count_p_uniq`-style set; see §10.3 risk).
-- A repair packet triggers a decode attempt on its window
-  `[tail - W + 1, tail]` if the total known inputs (source + repair)
-  for that window is at least `W`.
-- A decode attempt reconstructs every missing source packet in the
-  window and releases them to the socket in `seq_num` order (catching up
-  where possible; strictly past-position gaps are released out of order
-  only if the jitter buffer is enabled).
+- A repair packet triggers a **cascade decode** (see below) on its
+  window `[tail - W + 1, tail]`.
 - Wall-clock flush: every `T_flush_check = 10 ms`, retire any source
   slot whose `seq_num < max_seq_received - W_rx` OR whose age ≥
   `T_flush`. On retirement, gaps are declared lost; the stats counter
@@ -766,6 +802,62 @@ Recommended `T_flush`:
 
 These values let typical bursts recover while keeping worst-case gap
 detection bounded.
+
+#### Cascade decode
+
+A single `fec_decode_simd` call solves ONE window — given W inputs
+(source slots plus parity substitutes), it recovers up to `n - k =
+⌈R · W⌉` erasures in that window. To recover an N-consecutive
+burst at parity-every-tail (R ≥ 1.0), RX must re-attempt decode on
+ADJACENT windows after each successful recovery, because each
+recovery provides one more "known source" to the overlapping
+neighbor window, potentially unblocking it.
+
+**Algorithm:**
+
+1. Primary trigger: on each repair arrival at `window_tail_seq = T`,
+   attempt `do_decode_once(T)`. If it recovers sources `S_1, ..., S_k`,
+   enqueue the set of repair-bearing windows covering any `S_i`:
+   `{ct : repair_store contains (ct, *) AND ct ∈ [S_i, S_i + W - 1]}`.
+2. Pop the worklist; for each popped `ct`, run `do_decode_once(ct)`;
+   if more recoveries, enqueue more; repeat until empty.
+3. Secondary trigger: on out-of-order source arrival that fills a
+   prior gap (as opposed to advancing the front), run the same
+   cascade over windows covering the filled seq.
+
+The worklist is bounded. Each window only "decodes for real" a
+small constant number of times before its `known_sources == W`
+early-return kicks in on subsequent visits.
+
+**Load-bearing implementation invariants** (missing these causes
+silent corruption, not just sub-optimal recovery):
+
+- **Early-recovery preservation.** The encoder may emit a repair
+  for window tail T immediately after placing source T in its
+  ring. That repair arrives at RX before `max_seq_received`
+  reaches T. If the decoder has seq T-W+1..T-1 (all sources
+  preceding T) plus this parity, it can recover source T *before*
+  the source itself is on the wire — or even before the source's
+  drop is observable as a gap. When `max_seq_received` later
+  advances past T (via a successor source's arrival), the
+  ring-initialization loop MUST NOT clobber slot T's RECOVERED
+  state back to EMPTY.
+- **Stale-cascade skip.** `do_decode_once(tail)` MUST return
+  without effect if `tail < next_emit_seq` — that window's sources
+  have already been emitted (or flushed) to the socket; any
+  "recovery" there is wasted work AND may write into ring slots
+  that have been reused for newer seqs.
+- **Ring-rollover abort.** Before setting up output buffers,
+  `do_decode_once` MUST scan the window's W slots. If any slot's
+  `seq` doesn't match the expected position (and isn't the
+  uninitialized sentinel), the ring has rolled through this window
+  and decode MUST abort — writing a recovered payload into a slot
+  that now holds a different seq's data would corrupt that data.
+
+These invariants aren't derivable from §9.3's surface-level
+contract; they fall out of the ring+cascade combination and must
+be respected in every IFecDecoder implementation that shares this
+decoder shape.
 
 ---
 
