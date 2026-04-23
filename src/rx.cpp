@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <time.h>
 #include <sys/resource.h>
 #include <pcap.h>
@@ -1124,8 +1125,45 @@ int main(int argc, char* const *argv)
     string keypair = "rx.key";
     string unix_socket = "";
 
-    while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:")) != -1) {
+    // B5: codec selector + T_flush override. Default stays block so
+    // existing deployments behave identically. SWIN's W and R come from
+    // the session TLV at runtime; no RX CLI flags for those.
+    uint8_t  configured_codec = WFB_FEC_VDM_RS;
+    uint64_t t_flush_ms = 100;
+
+    enum {
+        OPT_CODEC   = 256,
+        OPT_TFLUSH  = 257,
+    };
+
+    static const struct option long_options[] = {
+        { "codec",       required_argument, nullptr, OPT_CODEC  },
+        { "t-flush-ms",  required_argument, nullptr, OPT_TFLUSH },
+        { nullptr, 0, nullptr, 0 }
+    };
+
+    while ((opt = getopt_long(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:",
+                              long_options, nullptr)) != -1) {
         switch (opt) {
+        case OPT_CODEC:
+            if (strcmp(optarg, "block") == 0) {
+                configured_codec = WFB_FEC_VDM_RS;
+            } else if (strcmp(optarg, "sliding") == 0) {
+                configured_codec = WFB_FEC_SWIN_RS;
+            } else {
+                WFB_ERR("Invalid --codec: %s (expected block|sliding)\n", optarg);
+                exit(1);
+            }
+            break;
+        case OPT_TFLUSH: {
+            long v = atol(optarg);
+            if (v < 0) {
+                WFB_ERR("Invalid --t-flush-ms: %s\n", optarg);
+                exit(1);
+            }
+            t_flush_ms = (uint64_t)v;
+            break;
+        }
         case 'K':
             keypair = optarg;
             break;
@@ -1165,13 +1203,14 @@ int main(int argc, char* const *argv)
             break;
         default: /* '?' */
         show_usage:
-            WFB_INFO("Local RX: %s [-K rx_key] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-p radio_port]\n"
+            WFB_INFO("Local RX: %s [-K rx_key] [--codec block|sliding] [--t-flush-ms MS] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-p radio_port]\n"
                      "             [-R rcv_buf] [-s snd_buf] [-l log_interval] [-e epoch] [-i link_id] interface1 [interface2] ...\n", argv[0]);
             WFB_INFO("RX forwarder: %s -f [-c client_addr] [-u client_port] [-p radio_port]  [-R rcv_buf] [-s snd_buf]\n"
                      "                    [-i link_id] interface1 [interface2] ...\n", argv[0]);
-            WFB_INFO("RX aggregator: %s -a server_port [-K rx_key] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-R rcv_buf]\n"
+            WFB_INFO("RX aggregator: %s -a server_port [-K rx_key] [--codec block|sliding] [--t-flush-ms MS] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-R rcv_buf]\n"
                      "                                 [-s snd_buf] [-l log_interval] [-p radio_port] [-e epoch] [-i link_id]\n", argv[0]);
-            WFB_INFO("Default: K='%s', connect=%s:%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", log_interval=%d, rcv_buf=system_default, snd_buf=system_default\n", keypair.c_str(), client_addr.c_str(), client_port, link_id, radio_port, epoch, log_interval);
+            WFB_INFO("Default: K='%s', codec=block, t_flush_ms=%" PRIu64 ", connect=%s:%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", log_interval=%d, rcv_buf=system_default, snd_buf=system_default\n",
+                     keypair.c_str(), t_flush_ms, client_addr.c_str(), client_port, link_id, radio_port, epoch, log_interval);
             WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
             WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
             exit(1);
@@ -1221,11 +1260,13 @@ int main(int argc, char* const *argv)
         case AGGREGATOR:
             if(unix_socket.length() > 0)
             {
-                agg = unique_ptr<AggregatorUNIX>(new AggregatorUNIX(unix_socket, keypair, epoch, channel_id, snd_buf));
+                agg = unique_ptr<AggregatorUNIX>(new AggregatorUNIX(unix_socket, keypair, epoch, channel_id, snd_buf,
+                                                                   configured_codec, t_flush_ms));
             }
             else
             {
-                agg = unique_ptr<AggregatorUDPv4>(new AggregatorUDPv4(client_addr, client_port, keypair, epoch, channel_id, snd_buf));
+                agg = unique_ptr<AggregatorUDPv4>(new AggregatorUDPv4(client_addr, client_port, keypair, epoch, channel_id, snd_buf,
+                                                                     configured_codec, t_flush_ms));
             }
             break;
 

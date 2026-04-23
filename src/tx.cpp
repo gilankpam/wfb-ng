@@ -34,6 +34,7 @@
 #include <linux/if_ether.h>
 #include <linux/random.h>
 #include <inttypes.h>
+#include <getopt.h>
 
 #include <string>
 #include <memory>
@@ -1562,7 +1563,7 @@ int open_control_fd(int control_port)
 }
 
 void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
-                    int udp_port, int debug_port, int k, int n, const string &keypair, int fec_timeout,
+                    int udp_port, int debug_port, const fec_params_t &fec_params, const string &keypair, int fec_timeout,
                     uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                     radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
@@ -1601,8 +1602,6 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
         IPC_MSG_SEND();
     }
 
-    fec_params_t fec_params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
-
     if (debug_port)
     {
         WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
@@ -1621,7 +1620,7 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
 }
 
 void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
-                     const char *unix_socket, int debug_port, int k, int n, const string &keypair, int fec_timeout,
+                     const char *unix_socket, int debug_port, const fec_params_t &fec_params, const string &keypair, int fec_timeout,
                      uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                      radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
                      int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
@@ -1647,8 +1646,6 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
     IPC_MSG("%" PRIu64 "\tLISTEN_UNIX_END\n", get_time_ms());
     IPC_MSG_SEND();
 
-    fec_params_t fec_params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
-
     if (debug_port)
     {
         WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
@@ -1668,7 +1665,7 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
 
 
 void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
-                      int udp_port, int k, int n, const string &keypair, int fec_timeout,
+                      int udp_port, const fec_params_t &fec_params, const string &keypair, int fec_timeout,
                       uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                       radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
                       int snd_buf_size)
@@ -1734,7 +1731,6 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
     }
 
     vector<tags_item_t> tags;
-    fec_params_t fec_params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(fec_params, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
@@ -1745,7 +1741,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
 
 
 void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
-                           const char* unix_socket, int k, int n, const string &keypair, int fec_timeout,
+                           const char* unix_socket, const fec_params_t &fec_params, const string &keypair, int fec_timeout,
                            uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                            radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
                            int snd_buf_size)
@@ -1797,13 +1793,32 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
     IPC_MSG_SEND();
 
     vector<tags_item_t> tags;
-    fec_params_t fec_params = {WFB_FEC_VDM_RS, k, n, 0, 0, 0};
     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(fec_params, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
+}
+
+
+// B5: parse "NUM/DEN" for --swin-r. Returns true on success, populates
+// num/den. Both must be in [1, 255]. Whitespace not allowed.
+static bool parse_swin_ratio(const char* s, uint8_t* num, uint8_t* den)
+{
+    if (s == nullptr || *s == '\0') return false;
+    const char* slash = strchr(s, '/');
+    if (slash == nullptr || slash == s || *(slash + 1) == '\0') return false;
+
+    char* end = nullptr;
+    long n_val = strtol(s, &end, 10);
+    if (end != slash) return false;
+    long d_val = strtol(slash + 1, &end, 10);
+    if (*end != '\0') return false;
+    if (n_val < 1 || n_val > 255 || d_val < 1 || d_val > 255) return false;
+    *num = (uint8_t)n_val;
+    *den = (uint8_t)d_val;
+    return true;
 }
 
 
@@ -1840,8 +1855,57 @@ int main(int argc, char * const *argv)
     uint32_t inject_retries = 0;
     uint32_t inject_retry_delay = 5000; // 5ms
 
-    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
+    // B5: codec selector + SWIN params. Default stays block so existing
+    // deployments and tests without --codec behave identically.
+    uint8_t  fec_type = WFB_FEC_VDM_RS;
+    uint16_t swin_w = 0;
+    uint8_t  swin_r_num = 0;
+    uint8_t  swin_r_den = 0;
+
+    // Long-only option IDs (no short forms). Pick values outside the
+    // ASCII range so they can't collide with the short-option letters
+    // in the optstring below.
+    enum {
+        OPT_CODEC   = 256,
+        OPT_SWIN_W  = 257,
+        OPT_SWIN_R  = 258,
+    };
+
+    static const struct option long_options[] = {
+        { "codec",   required_argument, nullptr, OPT_CODEC   },
+        { "swin-w",  required_argument, nullptr, OPT_SWIN_W  },
+        { "swin-r",  required_argument, nullptr, OPT_SWIN_R  },
+        { nullptr, 0, nullptr, 0 }
+    };
+
+    while ((opt = getopt_long(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:",
+                              long_options, nullptr)) != -1) {
         switch (opt) {
+        case OPT_CODEC:
+            if (strcmp(optarg, "block") == 0) {
+                fec_type = WFB_FEC_VDM_RS;
+            } else if (strcmp(optarg, "sliding") == 0) {
+                fec_type = WFB_FEC_SWIN_RS;
+            } else {
+                WFB_ERR("Invalid --codec: %s (expected block|sliding)\n", optarg);
+                exit(1);
+            }
+            break;
+        case OPT_SWIN_W: {
+            long w = atol(optarg);
+            if (w < 1 || w > 65535) {
+                WFB_ERR("Invalid --swin-w: %s (expected 1..65535)\n", optarg);
+                exit(1);
+            }
+            swin_w = (uint16_t)w;
+            break;
+        }
+        case OPT_SWIN_R:
+            if (!parse_swin_ratio(optarg, &swin_r_num, &swin_r_den)) {
+                WFB_ERR("Invalid --swin-r: %s (expected num/den, each 1..255)\n", optarg);
+                exit(1);
+            }
+            break;
         case 'I':
             tx_mode = INJECTOR;
             srv_port = atoi(optarg);
@@ -1959,19 +2023,21 @@ int main(int argc, char * const *argv)
 
         default: /* '?' */
         show_usage:
-            WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
+            WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] [--codec block|sliding] [--swin-w W] [--swin-r NUM/DEN]\n"
+                     "             { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
                      "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                      "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
                      "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n",
                     argv[0]);
-            WFB_INFO("TX distributor: %s -d [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-s snd_buf] [-p radio_port]\n"
+            WFB_INFO("TX distributor: %s -d [-K tx_key] [-k RS_K] [-n RS_N] [--codec block|sliding] [--swin-w W] [--swin-r NUM/DEN]\n"
+                     "                      { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-s snd_buf] [-p radio_port]\n"
                      "                      [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                      "                      [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
                      "                      [-P fwmark] [-C control_port] host1:port1,port2,... [host2:port1,port2,...] ...\n",
                     argv[0]);
             WFB_INFO("TX injector: %s -I port [-Q] [-R rcv_buf] [-l log_interval] interface1 [interface2] ...\n",
                     argv[0]);
-            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u\n",
+            WFB_INFO("Default: K='%s', codec=block, k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u\n",
                      keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay);
             WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
             WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
@@ -2005,6 +2071,31 @@ int main(int argc, char * const *argv)
         return 1;
     }
 
+    // B5: build fec_params_t from CLI selections. Injector mode never
+    // runs FEC (it just rewraps radiotap frames), so we skip validation
+    // for that mode — the struct is not consumed there.
+    fec_params_t fec_params{};
+    if (tx_mode != INJECTOR)
+    {
+        fec_params.fec_type = fec_type;
+        if (fec_type == WFB_FEC_VDM_RS)
+        {
+            fec_params.k = k;
+            fec_params.n = n;
+        }
+        else if (fec_type == WFB_FEC_SWIN_RS)
+        {
+            if (swin_w == 0 || swin_r_num == 0 || swin_r_den == 0)
+            {
+                WFB_ERR("--codec=sliding requires --swin-w and --swin-r\n");
+                exit(1);
+            }
+            fec_params.swin_w = swin_w;
+            fec_params.swin_r_num = swin_r_num;
+            fec_params.swin_r_den = swin_r_den;
+        }
+    }
+
     try
     {
         auto radiotap_header = init_radiotap_header(stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss);
@@ -2020,7 +2111,7 @@ int main(int argc, char * const *argv)
             if (unix_socket != NULL)
             {
                 local_loop_unix(argc, argv, optind, rcv_buf, log_interval,
-                                unix_socket, debug_port, k, n, keypair, fec_timeout,
+                                unix_socket, debug_port, fec_params, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
                                 snd_buf, inject_retries, inject_retry_delay);
@@ -2028,7 +2119,7 @@ int main(int argc, char * const *argv)
             else
             {
                 local_loop_udp(argc, argv, optind, rcv_buf, log_interval,
-                               udp_port, debug_port, k, n, keypair, fec_timeout,
+                               udp_port, debug_port, fec_params, keypair, fec_timeout,
                                epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                radiotap_header, frame_type, control_port, mirror,
                                snd_buf, inject_retries, inject_retry_delay);
@@ -2039,7 +2130,7 @@ int main(int argc, char * const *argv)
             if (unix_socket != NULL)
             {
                 distributor_loop_unix(argc, argv, optind, rcv_buf, log_interval,
-                                      unix_socket, k, n, keypair, fec_timeout,
+                                      unix_socket, fec_params, keypair, fec_timeout,
                                       epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                       radiotap_header, frame_type, control_port, mirror,
                                       snd_buf);
@@ -2047,7 +2138,7 @@ int main(int argc, char * const *argv)
             else
             {
                 distributor_loop(argc, argv, optind, rcv_buf, log_interval,
-                                 udp_port, k, n, keypair, fec_timeout,
+                                 udp_port, fec_params, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
                                  snd_buf);

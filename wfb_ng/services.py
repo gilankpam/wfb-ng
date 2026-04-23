@@ -54,6 +54,36 @@ def hash_link_domain(link_domain):
     return int.from_bytes(hashlib.sha1(link_domain.encode('utf-8')).digest()[:3], 'big')
 
 
+# B5: codec-specific arg fragments for wfb_tx / wfb_rx command lines.
+# Centralized here so every caller (udp_direct_tx, mavlink, tunnel,
+# udp_proxy) emits the same flags. cfg.fec_type selects the codec;
+# block keeps -k/-n for backward compat, sliding emits the long-form
+# --codec/--swin-w/--swin-r flags B5 added to wfb_tx.
+
+def fec_tx_args(cfg):
+    fec_type = getattr(cfg, 'fec_type', 'block')
+    if fec_type == 'block':
+        return '-k %d -n %d' % (cfg.fec_k, cfg.fec_n)
+    elif fec_type == 'sliding':
+        return '--codec=sliding --swin-w=%d --swin-r=%s' % (cfg.swin_w, cfg.swin_r)
+    else:
+        raise Exception('Unknown fec_type: %r' % (fec_type,))
+
+
+def fec_rx_args(cfg):
+    # RX learns W/R from the session TLV, so SWIN only needs --codec on
+    # the RX side (plus optional --t-flush-ms if the profile wants a
+    # non-default retirement deadline, §7.4).
+    fec_type = getattr(cfg, 'fec_type', 'block')
+    if fec_type == 'block':
+        return ''
+    elif fec_type == 'sliding':
+        tf = getattr(cfg, 't_flush_ms', 100)
+        return '--codec=sliding --t-flush-ms=%d' % (tf,)
+    else:
+        raise Exception('Unknown fec_type: %r' % (fec_type,))
+
+
 def parse_services(profile_name, udp_port_allocator):
     res = []
     for stream in getattr(settings, profile_name).streams:
@@ -103,7 +133,7 @@ def init_udp_direct_tx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
     cmd = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d %(conn_str)s -K %(key)s '\
            '-B %(bw)d -G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
            '%(mirror)s%(force_vht)s%(qdisc)s '\
-           '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d '\
+           '%(fec_args)s -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d '\
            '-R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d '\
            '-J %(injection_retries)d -E %(injection_retry_delay)d' % \
            dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_tx'),
@@ -121,8 +151,7 @@ def init_udp_direct_tx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
                 ldpc=cfg.ldpc,
                 mcs=cfg.mcs_index,
                 mirror=' -m' if cfg.mirror else '',
-                fec_k=cfg.fec_k,
-                fec_n=cfg.fec_n,
+                fec_args=fec_tx_args(cfg),
                 fec_timeout=cfg.fec_timeout,
                 fec_delay=cfg.fec_delay,
                 link_id=link_id,
@@ -163,7 +192,7 @@ def init_udp_direct_rx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
     else:
         raise Exception('%s: unsupported peer address: %s' % (service_name, cfg.peer))
 
-    cmd = ('%(cmd)s%(cluster)s -p %(stream)d %(conn_str)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+    cmd = ('%(cmd)s%(cluster)s -p %(stream)d %(conn_str)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d %(fec_rx_args)s' % \
            dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                 cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                 stream=cfg.stream_rx,
@@ -172,7 +201,8 @@ def init_udp_direct_rx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
                 rcv_buf_size=settings.common.tx_rcv_buf_size,
                 snd_buf_size=settings.common.rx_snd_buf_size,
                 log_interval=settings.common.log_interval,
-                link_id=link_id)).split() + (wlans if not is_cluster else [])
+                link_id=link_id,
+                fec_rx_args=fec_rx_args(cfg))).split() + (wlans if not is_cluster else [])
 
     df = RXProtocol(ant_sel_f, cmd, '%s rx' % (service_name,)).start()
 
@@ -247,7 +277,7 @@ def init_mavlink(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_on
     rx_socket = reactor.listenUNIXDatagram(b'\0' + rx_socket_path.encode(), p_rx)
     sockets = [rx_socket]
 
-    cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+    cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d %(fec_rx_args)s' % \
               dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                    cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                    stream=cfg.stream_rx,
@@ -256,13 +286,14 @@ def init_mavlink(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_on
                    rcv_buf_size=settings.common.tx_rcv_buf_size,
                    snd_buf_size=settings.common.rx_snd_buf_size,
                    log_interval=settings.common.log_interval,
-                   link_id=link_id)).split() + (wlans if not is_cluster else [])
+                   link_id=link_id,
+                   fec_rx_args=fec_rx_args(cfg))).split() + (wlans if not is_cluster else [])
 
     tx_socket_path = '%s-tx-%s' % (service_name, os.urandom(4).hex())
     cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d '\
               '-G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
               '%(mirror)s%(force_vht)s%(qdisc)s '\
-              '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
+              '%(fec_args)s -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
               dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_tx'),
                    cluster=' -d' if is_cluster else '',
                    frame_type=cfg.frame_type,
@@ -278,8 +309,7 @@ def init_mavlink(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_on
                    ldpc=cfg.ldpc,
                    mcs=cfg.mcs_index,
                    mirror=' -m' if cfg.mirror else '',
-                   fec_k=cfg.fec_k,
-                   fec_n=cfg.fec_n,
+                   fec_args=fec_tx_args(cfg),
                    fec_timeout=cfg.fec_timeout,
                    fec_delay=cfg.fec_delay,
                    link_id=link_id,
@@ -361,7 +391,7 @@ def init_tunnel(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_onl
     rx_socket = reactor.listenUNIXDatagram(b'\0' + rx_socket_path.encode(), p_rx)
     sockets = [rx_socket]
 
-    cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+    cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d %(fec_rx_args)s' % \
               dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                    cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                    stream=cfg.stream_rx,
@@ -370,13 +400,14 @@ def init_tunnel(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_onl
                    rcv_buf_size=settings.common.tx_rcv_buf_size,
                    snd_buf_size=settings.common.rx_snd_buf_size,
                    log_interval=settings.common.log_interval,
-                   link_id=link_id)).split() + (wlans if not is_cluster else [])
+                   link_id=link_id,
+                   fec_rx_args=fec_rx_args(cfg))).split() + (wlans if not is_cluster else [])
 
     tx_socket_path = '%s-tx-%s' % (service_name, os.urandom(4).hex())
     cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d -G %(gi)s '\
               '-S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
               '%(mirror)s%(force_vht)s%(qdisc)s '\
-              '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
+              '%(fec_args)s -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
               dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_tx'),
                    cluster=' -d' if is_cluster else '',
                    frame_type=cfg.frame_type,
@@ -392,8 +423,7 @@ def init_tunnel(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_onl
                    ldpc=cfg.ldpc,
                    mcs=cfg.mcs_index,
                    mirror=' -m' if cfg.mirror else '',
-                   fec_k=cfg.fec_k,
-                   fec_n=cfg.fec_n,
+                   fec_args=fec_tx_args(cfg),
                    fec_timeout=cfg.fec_timeout,
                    fec_delay=cfg.fec_delay,
                    link_id=link_id,
@@ -480,7 +510,7 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
         rx_socket_path = '%s-rx-%s' % (service_name, os.urandom(4).hex())
         rx_socket = reactor.listenUNIXDatagram(b'\0' + rx_socket_path.encode(), p_rx)
         sockets = [rx_socket]
-        cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+        cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d %(fec_rx_args)s' % \
                   dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                        cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                        stream=cfg.stream_rx,
@@ -489,7 +519,8 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
                        rcv_buf_size=settings.common.tx_rcv_buf_size,
                        snd_buf_size=settings.common.rx_snd_buf_size,
                        log_interval=settings.common.log_interval,
-                       link_id=link_id)).split() + (wlans if not is_cluster else [])
+                       link_id=link_id,
+                       fec_rx_args=fec_rx_args(cfg))).split() + (wlans if not is_cluster else [])
 
         log.msg('%s RX: %s' % (service_name, ' '.join(cmd_rx)))
         dl.append(RXProtocol(ant_sel_f, cmd_rx, '%s rx' % (service_name,)).start())
@@ -499,7 +530,7 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
         cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d '\
                   '-G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
                   '%(mirror)s%(force_vht)s%(qdisc)s '\
-                  '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
+                  '%(fec_args)s -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
                   dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_tx'),
                        cluster=' -d' if is_cluster else '',
                        frame_type=cfg.frame_type,
@@ -515,8 +546,7 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
                        ldpc=cfg.ldpc,
                        mcs=cfg.mcs_index,
                        mirror=' -m' if cfg.mirror else '',
-                       fec_k=cfg.fec_k,
-                       fec_n=cfg.fec_n,
+                       fec_args=fec_tx_args(cfg),
                        fec_timeout=cfg.fec_timeout,
                        fec_delay=cfg.fec_delay,
                        link_id=link_id,
