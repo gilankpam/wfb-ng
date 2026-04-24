@@ -195,6 +195,9 @@ public:
         count_p_override = 0;
         count_p_outgoing = 0;
         count_b_outgoing = 0;
+        count_bursts_recovered = 0;
+        count_holdoff_fired = 0;
+        count_late_after_deadline = 0;
     }
 
     rx_antenna_stat_t antenna_stat;
@@ -210,6 +213,14 @@ public:
     uint32_t count_p_override;
     uint32_t count_p_outgoing;
     uint32_t count_b_outgoing;
+    // Phase 1 Step A counters. Append-only to the RX `PKT` IPC line
+    // as fields #12-#14 (plan §2 Phase 4 / §2.1 stability commitment).
+    // They stay at zero until Phase 1 Step D wires the deadline state
+    // machine in; they are declared here now so the IPC contract
+    // stabilises in this PR.
+    uint32_t count_bursts_recovered;
+    uint32_t count_holdoff_fired;
+    uint32_t count_late_after_deadline;
 
 protected:
     virtual void send_to_socket(const uint8_t *payload, uint16_t packet_size) = 0;
@@ -232,6 +243,9 @@ private:
     fec_t* fec_p;
     int fec_k;  // RS number of primary fragments in block
     int fec_n;  // RS total number of fragments in block
+    uint8_t session_fec_type;  // plan §4.1 B1: stock RX would reject anything non-WFB_FEC_VDM_RS
+    uint8_t interleave_depth;  // TLV_INTERLEAVE_DEPTH from last SESSION; 1 = no interleaving
+    bool session_established;  // true once first valid SESSION has been seen
     uint8_t session_hash[crypto_generichash_BYTES];
 
     uint32_t seq;

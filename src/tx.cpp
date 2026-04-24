@@ -48,6 +48,29 @@ using namespace std;
 #include "wifibroadcast.hpp"
 #include "tx.hpp"
 
+namespace {
+// Phase 1 Step A helpers. At interleave_depth == 1 (default) both
+// are no-ops, so the wire is byte-identical to master. When depth > 1
+// we append a TLV so RX can discover the depth from SESSION, and we
+// raise fec_type to WFB_FEC_VDM_RS_INTERLEAVED so stock RX rejects
+// the session cleanly (plan §4.1 B1) rather than silently mis-
+// decoding.
+void add_interleave_depth_tag(vector<tags_item_t>& tags, int interleave_depth)
+{
+    if (interleave_depth <= 1) return;
+    tags_item_t tag;
+    tag.id = TLV_INTERLEAVE_DEPTH;
+    tag.value.push_back((uint8_t)interleave_depth);
+    tags.push_back(tag);
+}
+
+void apply_interleave_fec_type(unique_ptr<Transmitter>& t, int interleave_depth)
+{
+    if (interleave_depth <= 1) return;
+    t->set_fec_type(WFB_FEC_VDM_RS_INTERLEAVED);
+}
+} // namespace
+
 Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
     fec_p(NULL), fec_k(-1), fec_n(-1),
     block_idx(0), fragment_idx(0),
@@ -60,7 +83,8 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     session_key{},
     session_packet{},
     session_packet_size(0),
-    tags(tags)
+    tags(tags),
+    fec_type(WFB_FEC_VDM_RS)
 {
 
     FILE *fp;
@@ -159,7 +183,7 @@ void Transmitter::init_session(int k, int n)
 
         session_data->epoch = htobe64(epoch);
         session_data->channel_id = htobe32(channel_id);
-        session_data->fec_type = WFB_FEC_VDM_RS;
+        session_data->fec_type = fec_type;   // set via set_fec_type(); defaults to WFB_FEC_VDM_RS
         session_data->k = (uint8_t)fec_k;
         session_data->n = (uint8_t)fec_n;
 
@@ -969,6 +993,23 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                 }
                 break;
 
+                // Phase 1 Step A: the SET/GET_INTERLEAVE_DEPTH cmd
+                // IDs are reserved so the control socket wire format
+                // stabilises now, but the runtime semantics arrive in
+                // Step C (close open block, drain interleaver,
+                // re-broadcast SESSION on the same session_key --
+                // plan v2.1 R1). Step A handlers reject with EINVAL
+                // so no operator can accidentally rely on them.
+                case CMD_SET_INTERLEAVE_DEPTH:
+                case CMD_GET_INTERLEAVE_DEPTH:
+                {
+                    resp.rc = htonl(EINVAL);
+                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                    WFB_ERR("CMD_(SET|GET)_INTERLEAVE_DEPTH not implemented at Step A\n");
+                    continue;
+                }
+                break;
+
                 default:
                 {
                     resp.rc = htonl(ENOTSUP);
@@ -1428,11 +1469,13 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                     int udp_port, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                     uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                     radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                    int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
+                    int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay,
+                    int interleave_depth)
 {
     vector<int> rx_fd;
     vector<string> wlans;
     vector<tags_item_t> tags;
+    add_interleave_depth_tag(tags, interleave_depth);
     unique_ptr<Transmitter> t;
 
     for(int i = 0; optind + i < argc; i++)
@@ -1477,6 +1520,7 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                                                                       inject_retries, inject_retry_delay));
     }
 
+    apply_interleave_fec_type(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1485,11 +1529,13 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
                      const char *unix_socket, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                      uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                      radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
+                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay,
+                     int interleave_depth)
 {
     vector<int> rx_fd;
     vector<string> wlans;
     vector<tags_item_t> tags;
+    add_interleave_depth_tag(tags, interleave_depth);
     unique_ptr<Transmitter> t;
 
     for(int i = 0; optind + i < argc; i++)
@@ -1521,6 +1567,7 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
                                                                       inject_retries, inject_retry_delay));
     }
 
+    apply_interleave_fec_type(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1530,7 +1577,8 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
                       int udp_port, int k, int n, const string &keypair, int fec_timeout,
                       uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                       radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                      int snd_buf_size)
+                      int snd_buf_size,
+                      int interleave_depth)
 {
     vector<int> rx_fd;
     vector<pair<string, vector<uint16_t>>> remote_hosts;
@@ -1593,10 +1641,12 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
     }
 
     vector<tags_item_t> tags;
+    add_interleave_depth_tag(tags, interleave_depth);
     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
+    apply_interleave_fec_type(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1606,7 +1656,8 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
                            const char* unix_socket, int k, int n, const string &keypair, int fec_timeout,
                            uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                            radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                           int snd_buf_size)
+                           int snd_buf_size,
+                           int interleave_depth)
 {
     vector<int> rx_fd;
     vector<pair<string, vector<uint16_t>>> remote_hosts;
@@ -1655,10 +1706,12 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
     IPC_MSG_SEND();
 
     vector<tags_item_t> tags;
+    add_interleave_depth_tag(tags, interleave_depth);
     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
+    apply_interleave_fec_type(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1696,8 +1749,9 @@ int main(int argc, char * const *argv)
     char *unix_socket = NULL;
     uint32_t inject_retries = 0;
     uint32_t inject_retry_delay = 5000; // 5ms
+    int interleave_depth = 1;  // Phase 1: 1 = no interleaving (byte-identical to master).
 
-    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
+    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:X:")) != -1) {
         switch (opt) {
         case 'I':
             tx_mode = INJECTOR;
@@ -1814,12 +1868,22 @@ int main(int argc, char * const *argv)
             inject_retry_delay = atoi(optarg);
             break;
 
+        case 'X':
+            // Phase 1 Step A: interleaver depth. Default 1 = no
+            // interleaving (wire-identical to master). Larger values
+            // switch fec_type to WFB_FEC_VDM_RS_INTERLEAVED and add a
+            // TLV_INTERLEAVE_DEPTH tag to SESSION. Phase 1 Step C
+            // actually implements the interleaver schedule; Step A
+            // just plumbs the flag.
+            interleave_depth = atoi(optarg);
+            break;
+
         default: /* '?' */
         show_usage:
             WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
                      "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                      "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
-                     "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n",
+                     "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] [-X interleave_depth] interface1 [interface2] ...\n",
                     argv[0]);
             WFB_INFO("TX distributor: %s -d [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-s snd_buf] [-p radio_port]\n"
                      "                      [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
@@ -1839,6 +1903,26 @@ int main(int argc, char * const *argv)
 
     if (optind >= argc) {
         goto show_usage;
+    }
+
+    // Phase 1 Step A: interleave-depth validation. These checks mirror
+    // the plan's §4.2 memory cap (fec_n > 32 would blow the RX ring)
+    // and §4.6 (fec_timeout mixed with interleaving is not supported).
+    // At interleave_depth == 1 none of this fires; the binary is
+    // wire-identical to master.
+    if (interleave_depth < 1 || interleave_depth > 255) {
+        WFB_ERR("Invalid interleave depth %d: must be in 1..255\n", interleave_depth);
+        return 1;
+    }
+    if (interleave_depth > 1 && n > 32) {
+        WFB_ERR("Refusing to start: interleave-depth > 1 requires fec_n <= 32 "
+                "(got n=%d). See plan §4.2.\n", n);
+        return 1;
+    }
+    if (interleave_depth > 1 && fec_timeout > 0) {
+        WFB_ERR("Refusing to start: interleave-depth > 1 is incompatible with "
+                "fec_timeout > 0 (got fec_timeout=%d). See plan §4.6.\n", fec_timeout);
+        return 1;
     }
 
     {
@@ -1880,7 +1964,8 @@ int main(int argc, char * const *argv)
                                 unix_socket, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
-                                snd_buf, inject_retries, inject_retry_delay);
+                                snd_buf, inject_retries, inject_retry_delay,
+                                interleave_depth);
             }
             else
             {
@@ -1888,7 +1973,8 @@ int main(int argc, char * const *argv)
                                udp_port, debug_port, k, n, keypair, fec_timeout,
                                epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                radiotap_header, frame_type, control_port, mirror,
-                               snd_buf, inject_retries, inject_retry_delay);
+                               snd_buf, inject_retries, inject_retry_delay,
+                               interleave_depth);
             }
             break;
 
@@ -1899,7 +1985,8 @@ int main(int argc, char * const *argv)
                                       unix_socket, k, n, keypair, fec_timeout,
                                       epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                       radiotap_header, frame_type, control_port, mirror,
-                                      snd_buf);
+                                      snd_buf,
+                                      interleave_depth);
             }
             else
             {
@@ -1907,7 +1994,8 @@ int main(int argc, char * const *argv)
                                  udp_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
-                                 snd_buf);
+                                 snd_buf,
+                                 interleave_depth);
             }
             break;
 

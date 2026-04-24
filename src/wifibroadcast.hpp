@@ -190,7 +190,26 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 #define WFB_PACKET_SESSION 0x2
 
 // FEC types
-#define WFB_FEC_VDM_RS  0x1  //Reed-Solomon on Vandermonde matrix
+// FEC codec types carried in wsession_data_t.fec_type.
+// Stock RX is expected to reject anything other than WFB_FEC_VDM_RS.
+// Phase 1 adds WFB_FEC_VDM_RS_INTERLEAVED (plan v2.1 R3, §4.1 B1):
+// same zfex Reed-Solomon codec, but fragments are emitted in block
+// interleaver order. A stock RX correctly rejects the session when
+// fec_type is unknown rather than silently scrambling primaries.
+#define WFB_FEC_VDM_RS              0x1  // Reed-Solomon on Vandermonde matrix (stock)
+#define WFB_FEC_VDM_RS_INTERLEAVED  0x2  // Phase 1: same codec, interleaved on-air
+
+// TLV attribute ids carried in wsession_data_t.tags[]. Stock code
+// walks the TLV list with Aggregator::get_tag() and skips unknown
+// ids harmlessly, so adding a new id here does not break a stock RX.
+#define TLV_INTERLEAVE_DEPTH        0x01  // uint8_t in 1..255
+
+// IPC_MSG SESSION record contract version. Plan §2.1 commits to
+// appending trailing fields without reordering; the version bumps
+// only on a breaking change. v1 was the stock master layout (no
+// trailing fields); v2 introduces the (interleave_depth,
+// contract_version) tail emitted by Phase 1 RX.
+#define WFB_IPC_CONTRACT_VERSION    2
 
 // packet flags
 #define WFB_PACKET_FEC_ONLY 0x1

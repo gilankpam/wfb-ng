@@ -78,6 +78,11 @@ public:
     void send_session_key(void);
     void init_session(int k, int n);
     void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
+    // Phase 1 Step A: allow main() to override the SESSION packet's
+    // fec_type before send_session_key() is first called. Stays
+    // WFB_FEC_VDM_RS unless interleaving is on. See §4.1 B1.
+    void set_fec_type(uint8_t t) { fec_type = t; }
+    uint8_t get_fec_type(void) const { return fec_type; }
     virtual void select_output(int idx) = 0;
     virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
     virtual void update_radiotap_header(radiotap_header_t &radiotap_header) = 0;
@@ -110,6 +115,11 @@ private:
     uint8_t session_packet[MAX_SESSION_PACKET_SIZE];
     uint16_t session_packet_size;
     std::vector<tags_item_t> tags;
+    // Broadcast in every SESSION packet. Initialized to the stock
+    // value in the constructor; set_fec_type() can raise it to
+    // WFB_FEC_VDM_RS_INTERLEAVED when interleaving is enabled. Change
+    // takes effect on the next send_session_key() call.
+    uint8_t fec_type;
 };
 
 

@@ -270,7 +270,10 @@ void Receiver::loop_iter(void)
 Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-    fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
+    count_bursts_recovered(0), count_holdoff_fired(0), count_late_after_deadline(0),
+    fec_p(NULL), fec_k(-1), fec_n(-1),
+    session_fec_type(WFB_FEC_VDM_RS), interleave_depth(1), session_established(false),
+    seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
     last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
 {
     memset(session_key, '\0', sizeof(session_key));
@@ -498,14 +501,34 @@ void Aggregator::dump_stats(void)
                 it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
     }
 
-    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
-            count_p_all, count_b_all,                    // incoming
-            count_p_dec_err,                             // decryption
-            count_p_session, count_p_data,               // classification
-            (uint32_t)count_p_uniq.size(),               // unique check
-            count_p_fec_recovered, count_p_lost,         // fec recovering
-            count_p_bad,                                 // internal errors
-            count_p_outgoing, count_b_outgoing);         // outgoing
+    // PKT line schema. Fields #1-#11 are the master layout.
+    // #12-#14 (Phase 1 Step A) are always appended; they sit at
+    // zero until Step D wires the deadline state machine. Parsers
+    // keyed on the first 11 fields remain compatible.
+    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
+            count_p_all, count_b_all,                    // incoming         #1-2
+            count_p_dec_err,                             // decryption       #3
+            count_p_session, count_p_data,               // classification   #4-5
+            (uint32_t)count_p_uniq.size(),               // unique check     #6
+            count_p_fec_recovered, count_p_lost,         // fec recovering   #7-8
+            count_p_bad,                                 // internal errors  #9
+            count_p_outgoing, count_b_outgoing,          // outgoing         #10-11
+            count_bursts_recovered,                      // Phase 1          #12
+            count_holdoff_fired,                         // Phase 1          #13
+            count_late_after_deadline);                  // Phase 1          #14
+
+    // Phase 1 Step A (plan §B2 bootstrap): re-emit SESSION once per
+    // log_interval so an adaptive daemon joining mid-stream can read
+    // (epoch, fec_type, k, n, depth, contract_version) without
+    // waiting for a session-key rotation. Master's on-change emit at
+    // SESSION_KEY arrival still fires as before; this one is
+    // additive.
+    if (session_established)
+    {
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n",
+                ts, epoch, session_fec_type, fec_k, fec_n,
+                interleave_depth, (unsigned)WFB_IPC_CONTRACT_VERSION);
+    }
     IPC_MSG_SEND();
 
     if(count_p_override)
@@ -683,6 +706,37 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         // of lost packets because session packets doesn't have any serial number and it is
         // too hard to calculate number of unique session packets
 
+        // Phase 1 Step A: record the fec_type the peer advertised and
+        // parse TLV_INTERLEAVE_DEPTH from the SESSION tags (if any).
+        // Step A does NOT accept WFB_FEC_VDM_RS_INTERLEAVED for data
+        // packet processing (the deadline state machine arrives in
+        // Step D); the check above at "Unsupported FEC codec type"
+        // still rejects 0x2. These fields are captured for the
+        // SESSION IPC line only.
+        session_fec_type = new_session_data->fec_type;
+        {
+            // The decrypted buffer starts at `session_tmp`, with
+            // total length `size - sizeof(wsession_hdr_t) -
+            // crypto_box_MACBYTES`. The fixed wsession_data_t header
+            // sits at the start; anything trailing is a TLV stream.
+            const size_t decrypted_len =
+                size - sizeof(wsession_hdr_t) - crypto_box_MACBYTES;
+            const uint8_t* tags_buf = (const uint8_t*)new_session_data + sizeof(wsession_data_t);
+            const size_t tags_size = (decrypted_len > sizeof(wsession_data_t))
+                ? decrypted_len - sizeof(wsession_data_t) : 0;
+            uint8_t advertised_depth = 1;
+            if (tags_size >= sizeof(tlv_hdr_t)) {
+                // get_tag() returns the TLV's len on match, -1 otherwise.
+                // At depth=1 no TLV is emitted by our TX, so this
+                // stays at the default of 1.
+                int rc = get_tag(tags_buf, tags_size,
+                                 TLV_INTERLEAVE_DEPTH,
+                                 &advertised_depth, sizeof(advertised_depth));
+                if (rc < 0) advertised_depth = 1;
+            }
+            interleave_depth = advertised_depth;
+        }
+
         if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
         {
             epoch = be64toh(new_session_data->epoch);
@@ -695,8 +749,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
             init_fec(new_session_data->k, new_session_data->n);
 
-            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
+            // Trailing fields #5 (interleave_depth) and #6
+            // (contract_version) are Phase 1 additions. Parsers
+            // that only read the first 4 (epoch, fec_type, k, n)
+            // stay compatible.
+            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n",
+                    get_time_ms(), epoch, session_fec_type, fec_k, fec_n,
+                    interleave_depth, (unsigned)WFB_IPC_CONTRACT_VERSION);
             IPC_MSG_SEND();
+            session_established = true;
         }
 
         // Cache already processed session
