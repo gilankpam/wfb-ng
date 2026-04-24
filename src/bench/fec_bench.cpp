@@ -52,6 +52,7 @@ extern "C" {
 }
 
 #include "bench/channel_model.hpp"
+#include "bench/interleaver.hpp"
 
 namespace {
 
@@ -139,9 +140,21 @@ struct Config {
     double param2 = 0.0; // ge: gap_mean; periodic: burst_len
     unsigned k = 8;
     unsigned n = 12;
+    unsigned depth = 1; // block interleaver depth. 1 = no interleaving.
     size_t block_size = 1466; // MAX_FEC_PAYLOAD-ish per plan §4.2
     uint64_t blocks = 10000;
     uint64_t seed = 0xC0FFEEull;
+
+    // Wire-timing assumptions used to compute the CSV `latency_ms`
+    // column. Defaults are the plan §4.2 reference operating point:
+    // 8812au, MCS7 40 MHz HT, ~8 Mb/s H.264. Override via
+    // --ipi-ms / --airtime-us / --slack-ms for other operating
+    // points. The harness itself does not *measure* latency --
+    // these values parametrize a theoretical model derived from
+    // §4.2's formula.
+    double ipi_ms = 1.4;       // inter-packet interval
+    double airtime_us = 80.0;  // per-packet wire airtime
+    double slack_ms = 5.0;     // plan §4.7 RX deadline slack
 };
 
 struct Result {
@@ -166,6 +179,22 @@ struct Result {
 
 // ---------------------------------------------------------------------------
 // run_config -- the heart of the harness
+//
+// Iterates D-frames. Within each D-frame:
+//   (1) encode all D blocks
+//   (2) walk the D*n emit slots in block-interleaver order, call
+//       channel.drop() at each (GE state sees emit-order events)
+//   (3) run per-block recovery + verification
+//
+// D = 1 is a pure degenerate of this loop: num_frames = num_blocks,
+// each frame has exactly one block, slot order is (b*n, b*n+1, ...,
+// b*n+n-1) -- identical to the old per-block loop. The D = 1 code
+// path is therefore bit-identical to the pre-interleaver harness.
+//
+// Memory ownership: every `frag[d][i]` buffer is posix_memalign'd to
+// ZFEX_SIMD_ALIGNMENT, owned by this function, freed at the bottom.
+// No pointers cross the function boundary. ASan under `--selftest`
+// must exit clean.
 // ---------------------------------------------------------------------------
 template <typename ChannelT>
 Result run_config(const Config& cfg, ChannelT& channel) {
@@ -173,6 +202,18 @@ Result run_config(const Config& cfg, ChannelT& channel) {
     // allocate the aligned-up-to-SIMD size so the SIMD kernel can
     // over-read the tail without going out of bounds.
     const size_t buf_size = ZFEX_ROUND_UP_SIMD(cfg.block_size);
+    const unsigned D = cfg.depth;
+    assert(D >= 1);
+
+    // Round the requested block count up to a multiple of D so every
+    // D-frame is complete. Callers that care about the exact value
+    // should read the `blocks` field of the Result back. The sweep
+    // driver always uses 10000 and 10000 is divisible by 1/2/4/8/16.
+    const uint64_t requested_blocks = cfg.blocks;
+    const uint64_t num_frames  = (requested_blocks + D - 1) / D;
+    const uint64_t total_blocks = num_frames * D;
+
+    fec_bench::BlockInterleaver interleaver(cfg.n, D);
 
     fec_t* fec_p = nullptr;
     if (fec_new(uint16_t(cfg.k), uint16_t(cfg.n), &fec_p) != ZFEX_SC_OK) {
@@ -180,193 +221,217 @@ Result run_config(const Config& cfg, ChannelT& channel) {
         std::exit(1);
     }
 
-    // n owned buffers: [0..k) = primaries, [k..n) = parity.
-    std::vector<uint8_t*> frag(cfg.n, nullptr);
-    for (unsigned i = 0; i < cfg.n; ++i) {
-        frag[i] = static_cast<uint8_t*>(xaligned_alloc(ZFEX_SIMD_ALIGNMENT, buf_size));
+    // D * n owned buffers. Outer index = block slot within a frame
+    // (0 .. D-1); inner = fragment index within the block (0 .. n-1).
+    // [d][0..k)  = primaries, [d][k..n) = parity.
+    std::vector<std::vector<uint8_t*>> frag(D, std::vector<uint8_t*>(cfg.n, nullptr));
+    for (unsigned d = 0; d < D; ++d) {
+        for (unsigned i = 0; i < cfg.n; ++i) {
+            frag[d][i] = static_cast<uint8_t*>(xaligned_alloc(ZFEX_SIMD_ALIGNMENT, buf_size));
+        }
     }
 
-    // Scratch buffer for reconstruction verification. We capture the
-    // original primary contents before decode writes into them, then
-    // compare byte-for-byte after decode. Aligned even though it's
-    // not strictly required -- keeps `memcpy` fast and symmetric.
+    // Scratch for pre-decode byte snapshotting (see step C(4) below).
     uint8_t* original_copy = static_cast<uint8_t*>(xaligned_alloc(ZFEX_SIMD_ALIGNMENT, buf_size));
 
     Result result;
-    result.encode_ns.reserve(cfg.blocks);
-    // decode_ns worst case is `blocks` samples too.
-    result.decode_ns.reserve(cfg.blocks);
+    result.encode_ns.reserve(total_blocks);
+    result.decode_ns.reserve(total_blocks);
 
     // Per-block working storage for fec_decode_simd argument marshalling.
+    // Reused across blocks; capacity never shrinks.
     std::vector<const uint8_t*> in_ptrs(cfg.k, nullptr);
-    std::vector<uint8_t*>       out_ptrs;
-    out_ptrs.reserve(cfg.k);
+    std::vector<uint8_t*>       out_ptrs;           out_ptrs.reserve(cfg.k);
     std::vector<unsigned>       idx_arr(cfg.k, 0);
-    // Records which *primary* positions are being reconstructed, so we
-    // can verify the reconstruction after decode.
-    std::vector<unsigned>       reconstruct_targets;
-    reconstruct_targets.reserve(cfg.k);
+    std::vector<unsigned>       reconstruct_targets; reconstruct_targets.reserve(cfg.k);
+    std::vector<unsigned>       empty_primary_slots; empty_primary_slots.reserve(cfg.k);
 
-    for (uint64_t b = 0; b < cfg.blocks; ++b) {
-        // ---- 1. Fill primaries with deterministic content. -------------
-        for (unsigned i = 0; i < cfg.k; ++i) {
-            fill_primary(frag[i], cfg.block_size, b, i);
-        }
-        // Zero tail bytes in the aligned-up region so the SIMD encode
-        // doesn't hash uninitialised memory into the parity.
-        if (buf_size > cfg.block_size) {
+    // survived[d][i] = did fragment i of block frame*D+d survive this frame.
+    // Reused across frames; reset to all-true at the top of each frame.
+    std::vector<std::vector<bool>> survived(D, std::vector<bool>(cfg.n, true));
+
+    for (uint64_t frame = 0; frame < num_frames; ++frame) {
+        // =============================================================
+        // A. Encode all D blocks in this frame.
+        // =============================================================
+        for (unsigned d = 0; d < D; ++d) {
+            const uint64_t b = frame * uint64_t(D) + d;
+
             for (unsigned i = 0; i < cfg.k; ++i) {
-                std::memset(frag[i] + cfg.block_size, 0, buf_size - cfg.block_size);
+                fill_primary(frag[d][i], cfg.block_size, b, i);
             }
-        }
-
-        // ---- 2. Encode (time it). --------------------------------------
-        const uint64_t t0 = now_ns();
-        const zfex_status_code_t enc_rc = fec_encode_simd(
-            fec_p,
-            reinterpret_cast<const gf* const*>(frag.data()),
-            reinterpret_cast<gf* const*>(frag.data() + cfg.k),
-            cfg.block_size);
-        const uint64_t t1 = now_ns();
-        if (enc_rc != ZFEX_SC_OK) {
-            std::fprintf(stderr, "fec_encode_simd failed at block %llu\n",
-                         (unsigned long long)b);
-            std::exit(1);
-        }
-        result.encode_ns.push_back(t1 - t0);
-
-        // ---- 3. Simulate the channel on all n fragments. ---------------
-        // Track which fragments survived and which were lost.
-        std::vector<bool> survived(cfg.n, true);
-        unsigned n_survived = 0;
-        for (unsigned i = 0; i < cfg.n; ++i) {
-            const size_t pkt_idx = b * cfg.n + i;
-            const bool dropped = channel.drop(pkt_idx);
-            survived[i] = !dropped;
-            if (!dropped) ++n_survived;
-        }
-
-        // ---- 4. Decide recovery outcome. -------------------------------
-        result.primary_packets_total += cfg.k;
-
-        if (n_survived < cfg.k) {
-            // Block is unrecoverable. Count any primaries we did
-            // receive as delivered; count the rest as lost.
-            //
-            // (An RX could still deliver surviving primaries without
-            // any FEC, matching current wfb_rx behaviour on a
-            // non-recoverable block. That's the conservative residual
-            // count.)
-            unsigned primaries_got = 0;
-            for (unsigned i = 0; i < cfg.k; ++i) if (survived[i]) ++primaries_got;
-            result.primary_packets_lost += (cfg.k - primaries_got);
-            result.blocks_lost += 1;
-            continue;
-        }
-
-        // Block is recoverable.
-        result.blocks_recovered += 1;
-
-        // Fast path: all primaries survived, no decode needed.
-        bool all_primaries_survived = true;
-        for (unsigned i = 0; i < cfg.k; ++i) {
-            if (!survived[i]) { all_primaries_survived = false; break; }
-        }
-        if (all_primaries_survived) {
-            // No decode call -- no timing sample. This matches
-            // wfb_rx's fast path (rx.cpp:774-792 in today's code).
-            continue;
-        }
-
-        // ---- 5. Build fec_decode_simd inputs. --------------------------
-        //
-        // Shape, per zfex.h:
-        //   - in_ptrs[i]: a surviving fragment buffer.
-        //   - idx_arr[i]: the fragment number of in_ptrs[i].
-        //   - For every primary i in [0..k) that survived, in_ptrs[i]
-        //     MUST be that primary's buffer and idx_arr[i] == i.
-        //   - Missing primary slots are substituted with surviving
-        //     parities. Those land at any free slot with idx_arr[slot]
-        //     >= k.
-        //   - out_ptrs lists buffers to write reconstructed primaries
-        //     into.
-        out_ptrs.clear();
-        reconstruct_targets.clear();
-
-        // First, fill slots 0..k-1 with surviving primaries.
-        std::vector<unsigned> empty_primary_slots;
-        empty_primary_slots.reserve(cfg.k);
-        for (unsigned i = 0; i < cfg.k; ++i) {
-            if (survived[i]) {
-                in_ptrs[i]  = frag[i];
-                idx_arr[i]  = i;
-            } else {
-                empty_primary_slots.push_back(i);
+            // Zero tail bytes in the aligned-up region so the SIMD
+            // encode doesn't hash uninitialised memory into the
+            // parity.
+            if (buf_size > cfg.block_size) {
+                for (unsigned i = 0; i < cfg.k; ++i) {
+                    std::memset(frag[d][i] + cfg.block_size, 0,
+                                buf_size - cfg.block_size);
+                }
             }
+
+            const uint64_t t0 = now_ns();
+            const zfex_status_code_t enc_rc = fec_encode_simd(
+                fec_p,
+                reinterpret_cast<const gf* const*>(frag[d].data()),
+                reinterpret_cast<gf* const*>(frag[d].data() + cfg.k),
+                cfg.block_size);
+            const uint64_t t1 = now_ns();
+            if (enc_rc != ZFEX_SC_OK) {
+                std::fprintf(stderr,
+                    "fec_encode_simd failed at block %llu\n",
+                    (unsigned long long)b);
+                std::exit(1);
+            }
+            result.encode_ns.push_back(t1 - t0);
         }
 
-        // Then walk the surviving parities and fill the empty slots.
-        unsigned parity_cursor = cfg.k;
-        for (unsigned slot : empty_primary_slots) {
-            while (parity_cursor < cfg.n && !survived[parity_cursor]) ++parity_cursor;
-            // Can't run out: n_survived >= k, so we always have enough.
-            assert(parity_cursor < cfg.n);
+        // =============================================================
+        // B. Walk the D*n emit slots of this frame in INTERLEAVER
+        //    order; invoke the channel at each slot. This is what
+        //    makes GE / periodic see emit-time ordering rather than
+        //    block-at-a-time ordering -- the whole reason we buffered
+        //    D blocks before emitting.
+        // =============================================================
+        for (unsigned d = 0; d < D; ++d) {
+            std::fill(survived[d].begin(), survived[d].end(), true);
+        }
+        const uint64_t slots_per_frame = uint64_t(D) * uint64_t(cfg.n);
+        const uint64_t frame_base_slot = frame * slots_per_frame;
 
-            in_ptrs[slot] = frag[parity_cursor];
-            idx_arr[slot] = parity_cursor;
-            ++parity_cursor;
+        for (uint64_t s = 0; s < slots_per_frame; ++s) {
+            const uint64_t absolute_slot = frame_base_slot + s;
+            // Ask the reference interleaver which (b, f) this slot
+            // carries, then map back into frame-local (d, f).
+            const auto bf = interleaver.fragment_at(absolute_slot);
+            const uint64_t b = bf.first;
+            const unsigned f = bf.second;
+            assert(b / D == frame);                 // same frame
+            const unsigned d = unsigned(b - frame * uint64_t(D));
 
-            // The missing primary at position `slot` is the one we'll
-            // reconstruct into frag[slot]. Capture the original bytes
-            // for verification, then zero the buffer (so any
-            // not-written byte is a visible bug, not a stale value).
-            std::memcpy(original_copy, frag[slot], buf_size);
-            std::memset(frag[slot], 0, buf_size);
-            out_ptrs.push_back(frag[slot]);
-            reconstruct_targets.push_back(slot);
+            const bool dropped = channel.drop(absolute_slot);
+            survived[d][f] = !dropped;
         }
 
-        // ---- 6. Decode (time it). --------------------------------------
-        const uint64_t d0 = now_ns();
-        const zfex_status_code_t dec_rc = fec_decode_simd(
-            fec_p,
-            reinterpret_cast<const gf**>(in_ptrs.data()),
-            reinterpret_cast<gf* const*>(out_ptrs.data()),
-            idx_arr.data(),
-            cfg.block_size);
-        const uint64_t d1 = now_ns();
-        if (dec_rc != ZFEX_SC_OK) {
-            std::fprintf(stderr, "fec_decode_simd failed at block %llu\n",
-                         (unsigned long long)b);
-            std::exit(1);
-        }
-        result.decode_ns.push_back(d1 - d0);
+        // =============================================================
+        // C. Per-block recovery + verification. Independent across
+        //    the D blocks of this frame.
+        // =============================================================
+        for (unsigned d = 0; d < D; ++d) {
+            const uint64_t b = frame * uint64_t(D) + d;
+            uint8_t** block_frag = frag[d].data();
+            const std::vector<bool>& surv = survived[d];
 
-        // ---- 7. Verify reconstruction. Correctness gate. ---------------
-        for (size_t r = 0; r < reconstruct_targets.size(); ++r) {
-            const unsigned slot = reconstruct_targets[r];
-            for (size_t j = 0; j < cfg.block_size; ++j) {
-                const uint8_t want = expected_byte(b, slot, j);
-                if (frag[slot][j] != want) {
-                    std::fprintf(stderr,
-                        "decode verify mismatch: block=%llu slot=%u byte=%zu "
-                        "got=0x%02x want=0x%02x\n",
-                        (unsigned long long)b, slot, j, frag[slot][j], want);
-                    std::exit(1);
+            result.primary_packets_total += cfg.k;
+
+            unsigned n_survived = 0;
+            for (unsigned i = 0; i < cfg.n; ++i) if (surv[i]) ++n_survived;
+
+            if (n_survived < cfg.k) {
+                // Unrecoverable. Count any surviving primaries as
+                // delivered; count the rest as lost. (RX could in
+                // principle still forward surviving primaries even
+                // without FEC, matching current wfb_rx behavior.)
+                unsigned primaries_got = 0;
+                for (unsigned i = 0; i < cfg.k; ++i) if (surv[i]) ++primaries_got;
+                result.primary_packets_lost += (cfg.k - primaries_got);
+                result.blocks_lost += 1;
+                continue;
+            }
+
+            result.blocks_recovered += 1;
+
+            // Fast path: all primaries survived, no decode needed.
+            bool all_primaries_survived = true;
+            for (unsigned i = 0; i < cfg.k; ++i) {
+                if (!surv[i]) { all_primaries_survived = false; break; }
+            }
+            if (all_primaries_survived) continue;
+
+            // ---- Build fec_decode_simd inputs. ----------------------
+            // Shape, per zfex.h:
+            //   in_ptrs[i]: a surviving fragment buffer.
+            //   idx_arr[i]: the fragment number of in_ptrs[i].
+            //   If primary i survived, in_ptrs[i] must be that primary
+            //   and idx_arr[i] == i. Empty primary slots get filled
+            //   with surviving parities (idx >= k). out_ptrs lists
+            //   buffers to reconstruct missing primaries into.
+            out_ptrs.clear();
+            reconstruct_targets.clear();
+            empty_primary_slots.clear();
+
+            for (unsigned i = 0; i < cfg.k; ++i) {
+                if (surv[i]) {
+                    in_ptrs[i] = block_frag[i];
+                    idx_arr[i] = i;
+                } else {
+                    empty_primary_slots.push_back(i);
+                }
+            }
+
+            unsigned parity_cursor = cfg.k;
+            for (unsigned slot : empty_primary_slots) {
+                while (parity_cursor < cfg.n && !surv[parity_cursor]) ++parity_cursor;
+                assert(parity_cursor < cfg.n);
+
+                in_ptrs[slot] = block_frag[parity_cursor];
+                idx_arr[slot] = parity_cursor;
+                ++parity_cursor;
+
+                // Snapshot original bytes for post-decode byte
+                // verification, then zero the buffer so any
+                // unreconstructed byte stands out.
+                std::memcpy(original_copy, block_frag[slot], buf_size);
+                std::memset(block_frag[slot], 0, buf_size);
+                out_ptrs.push_back(block_frag[slot]);
+                reconstruct_targets.push_back(slot);
+            }
+
+            const uint64_t d0 = now_ns();
+            const zfex_status_code_t dec_rc = fec_decode_simd(
+                fec_p,
+                reinterpret_cast<const gf**>(in_ptrs.data()),
+                reinterpret_cast<gf* const*>(out_ptrs.data()),
+                idx_arr.data(),
+                cfg.block_size);
+            const uint64_t d1 = now_ns();
+            if (dec_rc != ZFEX_SC_OK) {
+                std::fprintf(stderr,
+                    "fec_decode_simd failed at block %llu\n",
+                    (unsigned long long)b);
+                std::exit(1);
+            }
+            result.decode_ns.push_back(d1 - d0);
+
+            // Byte-exact verification of reconstructed primaries.
+            for (size_t r = 0; r < reconstruct_targets.size(); ++r) {
+                const unsigned slot = reconstruct_targets[r];
+                for (size_t j = 0; j < cfg.block_size; ++j) {
+                    const uint8_t want = expected_byte(b, slot, j);
+                    if (block_frag[slot][j] != want) {
+                        std::fprintf(stderr,
+                            "decode verify mismatch: block=%llu slot=%u "
+                            "byte=%zu got=0x%02x want=0x%02x\n",
+                            (unsigned long long)b, slot, j,
+                            block_frag[slot][j], want);
+                        std::exit(1);
+                    }
                 }
             }
         }
     }
 
     // Free per-config storage.
-    for (unsigned i = 0; i < cfg.n; ++i) free(frag[i]);
+    for (unsigned d = 0; d < D; ++d) {
+        for (unsigned i = 0; i < cfg.n; ++i) free(frag[d][i]);
+    }
     free(original_copy);
     fec_free(fec_p);
 
     result.peak_mem_bytes =
-        uint64_t(cfg.n) * uint64_t(buf_size)
-      + uint64_t(buf_size) // original_copy
-      + uint64_t(cfg.blocks) * sizeof(uint64_t) * 2; // encode_ns+decode_ns caps
+        uint64_t(D) * uint64_t(cfg.n) * uint64_t(buf_size) // frag buffers
+      + uint64_t(buf_size)                                  // original_copy
+      + uint64_t(total_blocks) * sizeof(uint64_t) * 2;      // timing vectors
     return result;
 }
 
@@ -397,19 +462,26 @@ Result run_config_dispatch(const Config& cfg) {
 // CSV output
 // ---------------------------------------------------------------------------
 
+// CSV schema. `depth` sits between `n` and `blocks` per plan §3.4
+// (rebased into v2.1). `latency_ms` (v2.1 addition) is computed from
+// a theoretical model at the plan §4.2 reference operating point;
+// see `Config` for the assumed IPI/airtime/slack.
+// The old Phase 0 baseline.csv (without depth and latency columns)
+// is still readable by bench_summary.py.
 const char* CSV_HEADER =
-    "channel_model,param1,param2,k,n,blocks,seed,"
+    "channel_model,param1,param2,k,n,depth,blocks,seed,"
     "block_recovery_rate,residual_packet_loss,"
     "encode_us_mean,encode_us_p99,"
     "decode_us_mean,decode_us_p99,"
-    "peak_mem_bytes";
+    "peak_mem_bytes,latency_ms";
 
 void write_csv_header(FILE* out) {
     std::fprintf(out, "%s\n", CSV_HEADER);
 }
 
 void write_csv_row(FILE* out, const Config& cfg, Result& res) {
-    const uint64_t total_blocks = cfg.blocks;
+    // Effective blocks run -- run_config rounds up to a multiple of D.
+    const uint64_t total_blocks = res.blocks_recovered + res.blocks_lost;
     const double recovery_rate = total_blocks > 0
         ? double(res.blocks_recovered) / double(total_blocks) : 0.0;
     const double residual_loss = res.primary_packets_total > 0
@@ -444,21 +516,34 @@ void write_csv_row(FILE* out, const Config& cfg, Result& res) {
         dec_p99_buf[0]  = '\0';
     }
 
+    // Plan §4.2 latency model:
+    //   block_duration_ms = k * ipi_ms + n * airtime_ms
+    //   latency_ms        = D * block_duration_ms + slack_ms
+    // Decode time is not folded in -- it is sub-millisecond per §3.6
+    // measurements and adds noise across seeds. The CSV's
+    // decode_us_mean column shows that cost separately.
+    const double airtime_ms        = cfg.airtime_us / 1000.0;
+    const double block_duration_ms = double(cfg.k) * cfg.ipi_ms
+                                   + double(cfg.n) * airtime_ms;
+    const double latency_ms        = double(cfg.depth) * block_duration_ms
+                                   + cfg.slack_ms;
+
     std::fprintf(out,
-        "%s,%.6g,%s,%u,%u,%llu,%llu,"
+        "%s,%.6g,%s,%u,%u,%u,%llu,%llu,"
         "%.6f,%.6f,"
         "%.3f,%.3f,"
         "%s,%s,"
-        "%llu\n",
+        "%llu,%.3f\n",
         model_name(cfg.model),
         cfg.param1, p2buf,
-        cfg.k, cfg.n,
-        (unsigned long long)cfg.blocks,
+        cfg.k, cfg.n, cfg.depth,
+        (unsigned long long)total_blocks,
         (unsigned long long)cfg.seed,
         recovery_rate, residual_loss,
         enc_mean_us, enc_p99_us,
         dec_mean_buf, dec_p99_buf,
-        (unsigned long long)res.peak_mem_bytes);
+        (unsigned long long)res.peak_mem_bytes,
+        latency_ms);
     std::fflush(out);
 }
 
@@ -470,17 +555,18 @@ void write_csv_row(FILE* out, const Config& cfg, Result& res) {
 //             Intended for CI and local sanity checks. Seconds to run.
 //   full   -- full Cartesian product per plan §3.5: four (k,n) pairs,
 //             three channel models at their full parameter sweeps,
-//             three seeds per config, 10000 blocks each.
-//
-// Phase 0 does NOT iterate over `depth` because no interleaver exists
-// yet. The Phase 1 PR will extend both presets to include depth and
-// the CSV will gain a depth column then.
+//             three seeds per config, 10000 blocks each, depths
+//             {1,2,4,8}. (v2.1: depth 16 dropped from the baseline
+//             sweep -- it sits well above plan §4.2's depth ceiling
+//             for every stream type and is of regression-test
+//             interest only. Add with --single to spot-check.)
 //
 // Progress is printed to stderr so --output /dev/stdout remains clean.
 // ---------------------------------------------------------------------------
 
 struct SweepGrid {
     std::vector<std::pair<unsigned, unsigned>> kn_pairs;   // (k, n)
+    std::vector<unsigned> depths;                          // interleaver depth axis
     std::vector<double> uniform_losses;                    // per uniform
     std::vector<std::pair<double, double>> ge_params;      // (burst, gap)
     std::vector<std::pair<size_t, size_t>> periodic_params;// (period, burst_len)
@@ -491,6 +577,7 @@ struct SweepGrid {
 SweepGrid make_grid_small() {
     SweepGrid g;
     g.kn_pairs       = { {8, 12} };
+    g.depths         = { 1, 2, 4 };
     g.uniform_losses = { 0.0, 0.05, 0.20 };
     g.ge_params      = { {5.0, 100.0} };
     g.periodic_params= { {10, 1} };
@@ -502,6 +589,7 @@ SweepGrid make_grid_small() {
 SweepGrid make_grid_full() {
     SweepGrid g;
     g.kn_pairs       = { {8, 12}, {4, 8}, {4, 12}, {16, 20} };
+    g.depths         = { 1, 2, 4, 8 };
     g.uniform_losses = { 0.01, 0.05, 0.10, 0.20, 0.30 };
     g.ge_params      = {
         {2.0, 100.0}, {5.0, 100.0}, {10.0, 100.0}, {20.0, 100.0},
@@ -514,11 +602,11 @@ SweepGrid make_grid_full() {
 }
 
 size_t count_configs(const SweepGrid& g) {
-    size_t per_kn =
+    const size_t per_kn =
         g.uniform_losses.size()
       + g.ge_params.size()
       + g.periodic_params.size();
-    return g.kn_pairs.size() * per_kn * g.seeds_per_config;
+    return g.kn_pairs.size() * g.depths.size() * per_kn * g.seeds_per_config;
 }
 
 void run_and_emit(FILE* out, const Config& cfg) {
@@ -526,7 +614,7 @@ void run_and_emit(FILE* out, const Config& cfg) {
     write_csv_row(out, cfg, res);
 }
 
-void run_sweep(FILE* out, const SweepGrid& g, uint64_t master_seed) {
+void run_sweep(FILE* out, const SweepGrid& g, const Config& tmpl) {
     const size_t total = count_configs(g);
     size_t done = 0;
     uint64_t ctr = 0; // monotonic counter across all configs; mixed into seed
@@ -534,31 +622,38 @@ void run_sweep(FILE* out, const SweepGrid& g, uint64_t master_seed) {
     std::fprintf(stderr, "[sweep] %zu configs to run, %llu blocks each\n",
                  total, (unsigned long long)g.blocks);
 
-    auto emit = [&](Model m, double p1, double p2, unsigned k, unsigned n) {
+    auto emit = [&](Model m, double p1, double p2,
+                    unsigned k, unsigned n, unsigned D) {
         for (unsigned s = 0; s < g.seeds_per_config; ++s) {
-            Config cfg;
+            // Start from the top-level template so timing overrides
+            // (--ipi-ms / --airtime-us / --slack-ms, --block-size)
+            // propagate into every row.
+            Config cfg = tmpl;
             cfg.model = m;
             cfg.param1 = p1;
             cfg.param2 = p2;
-            cfg.k = k; cfg.n = n;
+            cfg.k = k; cfg.n = n; cfg.depth = D;
             cfg.blocks = g.blocks;
-            cfg.seed = splitmix64(master_seed + ctr++);
+            cfg.seed = splitmix64(tmpl.seed + ctr++);
 
             run_and_emit(out, cfg);
             ++done;
-            std::fprintf(stderr, "[sweep] %zu/%zu (%s k=%u n=%u p1=%.4g p2=%.4g)\n",
-                         done, total, model_name(m), k, n, p1, p2);
+            std::fprintf(stderr,
+                "[sweep] %zu/%zu (%s k=%u n=%u D=%u p1=%.4g p2=%.4g)\n",
+                done, total, model_name(m), k, n, D, p1, p2);
         }
     };
 
     for (const auto& kn : g.kn_pairs) {
         const unsigned k = kn.first;
         const unsigned n = kn.second;
-        for (double p : g.uniform_losses)            emit(Model::Uniform, p, 0.0, k, n);
-        for (const auto& gp : g.ge_params)           emit(Model::GE, gp.first, gp.second, k, n);
-        for (const auto& pp : g.periodic_params)     emit(Model::Periodic,
-                                                          double(pp.first),
-                                                          double(pp.second), k, n);
+        for (unsigned D : g.depths) {
+            for (double p : g.uniform_losses)     emit(Model::Uniform,  p,   0.0, k, n, D);
+            for (const auto& gp : g.ge_params)    emit(Model::GE, gp.first, gp.second, k, n, D);
+            for (const auto& pp : g.periodic_params) emit(Model::Periodic,
+                                                         double(pp.first),
+                                                         double(pp.second), k, n, D);
+        }
     }
 }
 
@@ -582,8 +677,15 @@ void run_sweep(FILE* out, const SweepGrid& g, uint64_t master_seed) {
         "      --burst-mean M --gap-mean G    (ge)\n"
         "      --period P --burst-len L       (periodic)\n"
         "      --k K --n N\n"
-        "      --blocks N          (default 10000)\n"
+        "      --interleave-depth D  (default 1 = no interleaving)\n"
+        "      --blocks N          (default 10000; rounded up to a multiple of D)\n"
         "      --block-size BYTES  (default 1466)\n"
+        "      --ipi-ms F          inter-packet interval, ms  (default 1.4)\n"
+        "      --airtime-us F      per-packet airtime, µs     (default 80)\n"
+        "      --slack-ms F        RX deadline slack, ms       (default 5)\n"
+        "                          (timing flags parametrize the CSV's\n"
+        "                           latency_ms column; they do not affect\n"
+        "                           the recovery measurement itself.)\n"
         "  --selftest              Run built-in correctness gates and exit.\n"
         "\n"
         "Common:\n"
@@ -690,6 +792,62 @@ bool selftest() {
         std::fprintf(stderr, "  ok\n");
     }
 
+    std::fprintf(stderr, "[selftest] 5. interleaver actually disperses bursts:\n"
+                         "            periodic burst_len=5 (> parity 4) at D=1 should fail;\n"
+                         "            same burst at D=4 should recover.\n");
+    {
+        // Construct a periodic 5-in-17 loss pattern. At (k,n)=(8,12),
+        // parity budget is 4, so a 5-fragment burst falling inside a
+        // single block is unrecoverable. Picking period=17 (coprime
+        // with n=12) avoids fluke alignment with the D=4 interleaver
+        // schedule -- at D=4, each block sees ≤ 4 losses per frame,
+        // recoverable at the edge.
+        Config a; a.model = Model::Periodic;
+        a.param1 = 17; a.param2 = 5;
+        a.k = 8; a.n = 12; a.depth = 1;
+        a.blocks = 1024; a.block_size = 1466; a.seed = 5;
+        Result ra = run_config_dispatch(a);
+
+        Config b = a; b.depth = 4;
+        Result rb = run_config_dispatch(b);
+
+        if (ra.blocks_lost == 0) {
+            std::fprintf(stderr,
+                "  FAIL: D=1 lost 0 blocks -- the test premise is wrong\n");
+            return false;
+        }
+        if (rb.blocks_lost != 0) {
+            std::fprintf(stderr,
+                "  FAIL: D=4 lost %llu blocks, expected 0\n",
+                (unsigned long long)rb.blocks_lost);
+            return false;
+        }
+        std::fprintf(stderr, "  ok: D=1 lost %llu/%llu; D=4 lost 0\n",
+                     (unsigned long long)ra.blocks_lost,
+                     (unsigned long long)a.blocks);
+    }
+
+    std::fprintf(stderr, "[selftest] 6. D=1 reduces to pre-interleaver behavior:\n"
+                         "            block counts identical to pre-refactor harness at D=1.\n");
+    {
+        // This one is a regression canary for the run_config rewrite:
+        // at D=1, uniform p=0.10, seed=3, k=8, n=12, 500 blocks --
+        // the same numbers Step B's selftest #3 recorded.
+        Config c; c.model = Model::Uniform; c.param1 = 0.10;
+        c.k = 8; c.n = 12; c.depth = 1;
+        c.blocks = 500; c.block_size = 1466; c.seed = 3;
+        Result r = run_config_dispatch(c);
+        // Step B's run of this config produced blocks_recovered=498.
+        // Anything different means the D=1 path changed semantics.
+        if (r.blocks_recovered != 498) {
+            std::fprintf(stderr,
+                "  FAIL: recovered=%llu, expected 498 (the pre-refactor Step B number)\n",
+                (unsigned long long)r.blocks_recovered);
+            return false;
+        }
+        std::fprintf(stderr, "  ok: D=1 recovered=498/500 matches Step B exactly\n");
+    }
+
     std::fprintf(stderr, "[selftest] all passed\n");
     return true;
 }
@@ -738,6 +896,18 @@ int main(int argc, char** argv) {
             cfg.param1 = std::atof(eat(i, argc, argv, a));
         } else if (!std::strcmp(a, "--burst-len")) {
             cfg.param2 = std::atof(eat(i, argc, argv, a));
+        } else if (!std::strcmp(a, "--interleave-depth")) {
+            cfg.depth = unsigned(std::atoi(eat(i, argc, argv, a)));
+            if (cfg.depth < 1) {
+                std::fprintf(stderr, "--interleave-depth must be >= 1\n");
+                usage(2);
+            }
+        } else if (!std::strcmp(a, "--ipi-ms")) {
+            cfg.ipi_ms = std::atof(eat(i, argc, argv, a));
+        } else if (!std::strcmp(a, "--airtime-us")) {
+            cfg.airtime_us = std::atof(eat(i, argc, argv, a));
+        } else if (!std::strcmp(a, "--slack-ms")) {
+            cfg.slack_ms = std::atof(eat(i, argc, argv, a));
         } else if (!std::strcmp(a, "--k")) {
             cfg.k = unsigned(std::atoi(eat(i, argc, argv, a)));
         } else if (!std::strcmp(a, "--n")) {
@@ -783,7 +953,7 @@ int main(int argc, char** argv) {
             }
         }
         if (!append) write_csv_header(out);
-        run_sweep(out, g, cfg.seed);
+        run_sweep(out, g, cfg);
         if (out != stdout) std::fclose(out);
         return 0;
     }

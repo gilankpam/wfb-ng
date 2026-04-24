@@ -59,11 +59,18 @@ fec_test: src/fec_test.cpp src/zfex.o
 
 # Phase 0 benchmark harness. Deliberately not in `all` / `test` --
 # opt-in per doc/design/fec-enhancements-v2.md §5.2.
-fec_bench: src/bench/fec_bench.cpp src/bench/channel_model.hpp src/zfex.o
+fec_bench: src/bench/fec_bench.cpp src/bench/channel_model.hpp src/bench/interleaver.hpp src/zfex.o
 	$(CXX) $(_CFLAGS) -std=gnu++11 -Isrc -o $@ src/bench/fec_bench.cpp src/zfex.o $(LDFLAGS) -lrt
 
-# Runs the full baseline sweep and writes bench/baseline.csv. Slow
-# (minutes); not a default target.
+# Catch2 unit test pinning the reference interleaver schedule. In the
+# Phase 1 PR this same test will be extended to also exercise the
+# production src/interleaver.cpp and assert bit-identical output.
+interleaver_schedule_test: src/bench/interleaver_schedule_test.cpp src/bench/interleaver.hpp
+	$(CXX) $(_CFLAGS) -std=gnu++17 -Isrc -o $@ src/bench/interleaver_schedule_test.cpp $(LDFLAGS) $(shell pkg-config --libs catch2-with-main)
+
+# Runs the full baseline sweep (depths 1,2,4,8 × 4 (k,n) × 3 seeds ×
+# all channel models) and writes bench/baseline.csv. Several minutes;
+# not a default target.
 bench_baseline: fec_bench
 	@mkdir -p bench
 	./fec_bench --sweep full --output bench/baseline.csv
@@ -113,7 +120,7 @@ pylint:
 	pylint --disable=R,C wfb_ng/*.py
 
 clean:
-	rm -rf env wfb_rx wfb_tx wfb_tx_cmd wfb_tun wfb_rtsp wfb_keygen dist deb_dist build wfb_ng.egg-info wfb_ng-*.tar.gz _trial_temp *~ src/*.o fec_test libsodium_test fec_bench bench/baseline.csv
+	rm -rf env wfb_rx wfb_tx wfb_tx_cmd wfb_tun wfb_rtsp wfb_keygen dist deb_dist build wfb_ng.egg-info wfb_ng-*.tar.gz _trial_temp *~ src/*.o fec_test libsodium_test fec_bench interleaver_schedule_test bench/baseline.csv
 
 deb_docker:  /opt/qemu/bin
 	@if ! [ -d /opt/qemu ]; then echo "Docker cross build requires patched QEMU!\nApply ./scripts/qemu/qemu.patch to qemu-7.2.0 and build it:\n  ./configure --prefix=/opt/qemu --static --disable-system && make && sudo make install"; exit 1; fi

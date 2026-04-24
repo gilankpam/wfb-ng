@@ -1,12 +1,19 @@
 # fec_bench — FEC benchmark harness
 
-Phase 0 of [fec-enhancements-v2.md](../doc/design/fec-enhancements-v2.md).
-Measures the stock FEC (the one `wfb_tx` and `wfb_rx` use today) under
+Phase 0.5 of [fec-enhancements-v2.md](../doc/design/fec-enhancements-v2.md)
+(v2.1 revision block). Measures the stock FEC (the one `wfb_tx` and
+`wfb_rx` use today) plus a **reference block interleaver** across
 three channel loss models, so we have a reproducible baseline to
-compare Phase 1's interleaver against.
+compare Phase 1's production interleaver against.
 
 This directory holds the committed baseline CSV. The harness source
-is at [../src/bench/](../src/bench/).
+is at [../src/bench/](../src/bench/). The reference interleaver
+schedule lives in
+[../src/bench/interleaver.hpp](../src/bench/interleaver.hpp); the
+schedule is pinned by the Catch2 test in
+[../src/bench/interleaver_schedule_test.cpp](../src/bench/interleaver_schedule_test.cpp),
+which the Phase 1 production code in `src/interleaver.cpp` will have
+to pass bit-for-bit.
 
 ## TL;DR
 
@@ -14,10 +21,13 @@ is at [../src/bench/](../src/bench/).
 # Build the harness.
 make fec_bench
 
-# Sanity-check the harness itself (built-in correctness gates).
+# Sanity-check the harness itself (correctness gates at D=1 and D>1).
 ./fec_bench --selftest
 
-# Re-generate the committed baseline on this machine (~1 minute).
+# Schedule unit test for the reference interleaver.
+make interleaver_schedule_test && ./interleaver_schedule_test
+
+# Re-generate the committed baseline on this machine (~3 min).
 make bench_baseline
 
 # Read the numbers.
@@ -31,11 +41,12 @@ python3 scripts/bench_summary.py bench/baseline.csv
 
 Targets:
 
-- `make fec_bench` — builds `./fec_bench`. Depends on `src/zfex.o` (the
-  same object `wfb_tx` / `wfb_rx` use — no fork of the FEC code).
+- `make fec_bench` — builds `./fec_bench`. Depends on `src/zfex.o` and
+  the reference interleaver header.
+- `make interleaver_schedule_test` — builds the Catch2 schedule test.
 - `make bench_baseline` — builds `fec_bench`, then runs
   `./fec_bench --sweep full --output bench/baseline.csv`.
-- `make clean` — removes `./fec_bench` and `bench/baseline.csv`.
+- `make clean` — removes the above binaries and `bench/baseline.csv`.
 
 No other existing target is changed.
 
@@ -51,143 +62,226 @@ make CFLAGS="-g -fno-omit-frame-pointer \
   -fsanitize=address -fsanitize=undefined \
   -fsanitize=pointer-compare -fsanitize=pointer-subtract \
   -fsanitize=leak -fsanitize-address-use-after-scope" \
-     fec_bench
+     fec_bench interleaver_schedule_test
 ./fec_bench --selftest
+./interleaver_schedule_test
 ```
 
-Must exit 0 with no sanitizer output. (These are the exact flags the
-`check:` target in the root `Makefile` uses for the rest of the tree.)
+Both binaries must exit 0 with no sanitizer output. The selftest
+exercises both D=1 and D>1 code paths.
 
 ## Running
 
 Three modes, mutually exclusive:
 
-- `--selftest` — runs four built-in correctness gates (0% loss →
-  100% recovery; 100% loss → 0% recovery; mid-loss → decode runs and
-  byte-verify passes; same seed → same counts). Exits non-zero on any
-  gate failure.
+- `--selftest` — six built-in correctness gates:
+  1. 0% uniform loss → 100% recovery.
+  2. 100% uniform loss → 0% recovery.
+  3. Mid-loss → decode runs and byte-verify passes.
+  4. Same seed → same counts.
+  5. Interleaver disperses bursts: `burst_len=5` at D=1 fails, at D=4 recovers.
+  6. D=1 matches Step B's pre-refactor harness exactly (regression canary).
 - `--sweep <preset>` — runs a preset and writes one CSV row per
   configuration. Presets:
-  - `small` — 5 configs, 1000 blocks each, one seed. For quick smoke
-    checks (~seconds). Only the `(k, n) = (8, 12)` point.
-  - `full` — 192 configs, 10 000 blocks each, 3 seeds per config.
-    The committed baseline. ~1 minute on a laptop.
-- `--single` — one config, for debugging a specific row. See
-  `./fec_bench --help` for the parameter flags.
+  - `small` — ~15 configs (one `(k, n)`, depths `{1,2,4}`, one seed).
+    For quick smoke (~1 s).
+  - `full` — 768 configs: 4 `(k, n)` × 4 depths `{1,2,4,8}` × 3 seeds
+    × (5 uniform + 8 GE + 3 periodic). ~3 min on a laptop.
+- `--single` — one config, for debugging a specific row. Required
+  flags include `--channel`, `--interleave-depth D`, `--k K --n N`,
+  and the relevant `--loss / --burst-mean / --gap-mean / --period /
+  --burst-len` for the channel.
 
 Common flags:
 
 - `--output PATH` — CSV output (default stdout). Progress goes to
-  stderr either way, so `--output bench/baseline.csv` leaves a clean
-  CSV even while the progress counter scrolls past on your terminal.
-- `--seed N` — master seed (default `0xC0FFEE`). Every other seed used
-  in a sweep is derived deterministically from this one; changing it
-  shifts all RNG streams together, not pairwise.
+  stderr so `--output bench/baseline.csv` writes a clean CSV.
+- `--seed N` — master seed (default `0xC0FFEE`). Child seeds are
+  derived deterministically; change this to shift all RNG streams.
 - `--append` — append to `--output` without re-writing the header.
 
 ## CSV schema
 
 One header row, one data row per configuration. Columns:
 
-| column                  | what                                                                |
-|-------------------------|---------------------------------------------------------------------|
-| `channel_model`         | `uniform` \| `ge` \| `periodic`                                      |
-| `param1`, `param2`      | model-dependent, see below                                          |
-| `k`, `n`                | FEC parameters passed to `fec_new(k, n)`                            |
-| `blocks`                | how many blocks this config simulated                               |
-| `seed`                  | the exact seed value that reproduces this row                       |
-| `block_recovery_rate`   | fraction of blocks where `≥k` of `n` fragments survived the channel |
-| `residual_packet_loss`  | fraction of primary packets the simulated RX could not deliver      |
-| `encode_us_mean`        | mean `fec_encode_simd` time, microseconds                           |
-| `encode_us_p99`         | 99th-percentile encode time, microseconds                           |
-| `decode_us_mean`        | mean `fec_decode_simd` time, microseconds (empty if no decode ran)  |
-| `decode_us_p99`         | 99th-percentile decode time, microseconds (empty if no decode ran)  |
-| `peak_mem_bytes`        | sum of explicit heap this config allocated (deterministic)          |
+| column                  | what                                                                        |
+|-------------------------|-----------------------------------------------------------------------------|
+| `channel_model`         | `uniform` \| `ge` \| `periodic`                                              |
+| `param1`, `param2`      | model-dependent, see below                                                  |
+| `k`, `n`                | FEC parameters passed to `fec_new(k, n)`                                    |
+| `depth`                 | block interleaver depth. `1` = no interleaving (v2.1 R4)                    |
+| `blocks`                | how many blocks this config simulated (rounded up to a multiple of `depth`) |
+| `seed`                  | the exact seed value that reproduces this row                               |
+| `block_recovery_rate`   | fraction of blocks where `≥k` of `n` fragments survived the channel         |
+| `residual_packet_loss`  | fraction of primary packets the simulated RX could not deliver              |
+| `encode_us_mean`        | mean `fec_encode_simd` time, microseconds                                   |
+| `encode_us_p99`         | 99th-percentile encode time, microseconds                                   |
+| `decode_us_mean`        | mean `fec_decode_simd` time (empty if no decode ran)                        |
+| `decode_us_p99`         | 99th-percentile decode time (empty if no decode ran)                        |
+| `peak_mem_bytes`        | sum of explicit heap this config allocated: `D·n·buf + buf + 16·blocks`     |
+| `latency_ms`            | modeled delivery latency per plan §4.2 (see "Latency model" below)          |
 
 `param1` / `param2` meaning:
 
-| model      | `param1`       | `param2`                |
-|------------|----------------|-------------------------|
-| `uniform`  | loss probability (0..1) | (empty)      |
+| model      | `param1`                    | `param2`                  |
+|------------|-----------------------------|---------------------------|
+| `uniform`  | loss probability (0..1)     | (empty)                   |
 | `ge`       | mean burst length (packets) | mean gap length (packets) |
-| `periodic` | period in packets | burst length in packets |
+| `periodic` | period in packets           | burst length in packets   |
 
-Reproducing a single row: grab its `channel_model`, `param1`, `param2`,
-`k`, `n`, `blocks`, and `seed` from the CSV, then:
+Reproducing a single row: grab its channel+params+k+n+depth+seed and run:
 
 ```sh
 ./fec_bench --single --channel <model> --<param-flag> <v> ... \
-            --k <k> --n <n> --blocks <blocks> --seed <seed>
+            --k <k> --n <n> --interleave-depth <D> \
+            --blocks <blocks> --seed <seed>
 ```
 
-Recovery and residual loss numbers will match exactly; timing
-numbers will differ (wall-clock jitter, not a determinism bug).
+Recovery and residual numbers will match exactly; timing differs
+(wall-clock jitter, not a determinism bug).
+
+### Old-schema compatibility
+
+CSVs without the `depth` column (e.g. the original Phase 0
+baseline.csv) are loadable by the summary script — every row is
+treated as `depth=1`.
 
 ## Interpreting
 
-What each metric is telling you:
+- **`block_recovery_rate`** — primary metric. Pessimistic: a block
+  with 6 primaries surviving out of k=8 with no FEC-recoverable
+  parity counts as "not recovered", even though RX could still
+  forward the 6 primaries. See `residual_packet_loss` for the
+  packet-level angle.
+- **`residual_packet_loss`** — fraction of the original `k · blocks`
+  primary packets that the simulated RX could not deliver.
+- **Encode / decode timings** — `CLOCK_MONOTONIC`, per call. Sanitizer
+  builds disable zfex's SIMD kernel, so ASan timing is ~5-10× slower
+  than production and not comparable to the committed baseline.
+- **`peak_mem_bytes`** — constant given `(k, n, D, blocks)`. Scales
+  as `D · n · buf_size`; at `D=8, n=20, buf≈1472`: ~235 KB.
 
-- **`block_recovery_rate`** — primary metric. This is what the RX
-  user-space actually cares about: did we deliver an intact block?
-  It's a pessimistic count: a block with 6 primaries out of k=8
-  plus 0 parity survivors is NOT "recovered" here, even though the
-  6 primaries would still reach userspace. See `residual_packet_loss`
-  for the other angle.
-- **`residual_packet_loss`** — fraction of the original k primaries
-  that the RX couldn't deliver. Counts the 6-of-8 example above as
-  2/8 lost.
-- **`encode_us_*` / `decode_us_*`** — wall-clock measured with
-  `CLOCK_MONOTONIC`, per call, over ≥1000 samples per config.
-  Sanitizer builds of zfex disable the SIMD kernel (zfex-side config),
-  so numbers from an ASan run are ~5-10x slower than production and
-  not comparable to the baseline CSV.
-- **`peak_mem_bytes`** — the explicit heap allocations the harness
-  made for this config: `n × aligned(block_size)` fragment buffers
-  plus bookkeeping. Constant given `(k, n, block_size, blocks)`.
-  Phase 0 only. Becomes interesting in Phase 1 when the interleaver
-  ring buffer is introduced.
+### What this harness does NOT measure
 
-### What Phase 0 does NOT measure
+- **Realized delivery latency / tail jitter.** The `latency_ms`
+  column is a theoretical model (see "Latency model" below), not a
+  measurement. Phase 1's RX deadline state machine (§4.7) will
+  produce real measured latency.
+- **Session rekey / drain cost.** See plan v2.1 R1: under the 1C
+  design, refresh cost is ≤ 1 block-duration and is
+  operationally small. Not modeled here.
+- **On-ARM numbers.** x86-64 laptop substrate. Plan §3.5 originally
+  required SSC338Q and Radxa Zero 3W runs; v2.1 R6 defers them. If
+  ARM measurement changes the picture, the plan is revised then.
+- **Actual UDP output.** The channel runs in-process. Phase 1 adds
+  an on-wire byte-identity test for the `depth=1` path.
 
-- **Delivery latency.** Without an interleaver, delivery latency is
-  `fec_decode_time + a fixed function of the channel model` — it
-  doesn't move when we change anything interesting. The columns
-  will be added in the Phase 1 PR, where they start carrying signal.
-- **Interleaver depth.** Doesn't exist yet. No `depth` column yet.
-- **On-ARM numbers.** This harness runs on x86 in CI and on the
-  branch owner's laptop. Plan §3.5 calls for running it on the
-  SSC338Q (drone TX SoC) and Radxa Zero 3W (ground-station RX SBC)
-  too; that's a hardware step taken outside this PR.
-- **Actual UDP output.** The channel models run in-process. The
-  Phase 1 PR adds a pcap replay test to pin the wire format at
-  `depth == 1` byte-for-byte against `master`.
+## Latency model (plan §4.2)
+
+The `latency_ms` column carries a **theoretical** end-to-end
+delivery latency, computed per the plan §4.2 formula:
+
+```
+block_duration_ms = k × ipi_ms + n × airtime_ms
+latency_ms        = depth × block_duration_ms + slack_ms
+```
+
+`ipi_ms` is the inter-packet interval (how often TX gets a new
+primary from upstream), `airtime_ms` is per-packet wire-time at
+the configured MCS, `slack_ms` is the plan §4.7 RX deadline
+hold-off slack. The decode-time term is folded out of the model:
+every harness run has `decode_us_mean ≤ 30 µs` in the CSV, which
+is ~0.2% of the smallest `block_duration` we care about.
+
+Default values match the plan §4.2 reference operating point
+(8812au radio, MCS7, 40 MHz HT, ~8 Mb/s H.264):
+
+| parameter    | default | meaning                        |
+|--------------|---------|--------------------------------|
+| `--ipi-ms`   | 1.4     | IPI between primaries from upstream encoder |
+| `--airtime-us` | 80    | per-packet airtime at the reference MCS |
+| `--slack-ms` | 5.0     | RX deadline slack (§4.7)       |
+
+Override via CLI flags if the deployment target uses a different
+radio config. The `latency_ms` column re-computes accordingly; no
+channel behavior changes.
+
+**Budget (§4.2):**
+
+| Tier          | Budget | Meaning                   |
+|---------------|--------|---------------------------|
+| Target        | ≤ 20 ms | one frame at 60 fps      |
+| Degraded      | ≤ 30 ms | two frames at 60 fps     |
+| Hard cap      | ≤ 50 ms | pilot starts feeling lag |
+
+### Pre-computed at defaults for the swept (k, n, D)
+
+From `bench/baseline.csv`'s `latency_ms` column:
+
+| (k, n)    | block_duration | D=1       | D=2       | D=4        | D=8         |
+|-----------|----------------|-----------|-----------|------------|-------------|
+| (4, 8)    | 6.2 ms         | **11 ms** | **17 ms** | 30 ms      | **55 ms** ⚠️ |
+| (4, 12)   | 6.6 ms         | **12 ms** | **18 ms** | 31 ms      | **57 ms** ⚠️ |
+| (8, 12)   | 12.2 ms        | **17 ms** | 29 ms     | 54 ms ⚠️   | **102 ms** ⚠️⚠️ |
+| (16, 20)  | 24.0 ms        | 29 ms     | 53 ms ⚠️  | **101 ms** ⚠️⚠️ | **197 ms** ⚠️⚠️ |
+
+Cells over the 50 ms cap are marked. D=8 is above the cap for every
+codec swept and is retained only for regression tracking, not as an
+operating depth. D=4 is usable for the narrow codecs (4, 8) and
+(4, 12); marginal at (8, 12); over cap at (16, 20).
+
+### Reading latency together with recovery
+
+The adaptive daemon (Phase 3) picks an operating point by
+crossing recovery (from `block_recovery_rate`) and latency
+(from `latency_ms`) at the current observed channel. Two patterns
+show up in the committed baseline:
+
+1. **D>1 helps a lot when bursts fit within D × parity.** Example:
+   (8, 12) on GE burst=5, gap=100:
+   - D=1: 95.26% recovery at 17 ms
+   - D=4: 98.77% recovery at 54 ms
+   - D=8: 99.84% recovery at 102 ms
+   The operator picks the smallest D that meets the recovery floor
+   they need, subject to the latency cap.
+
+2. **D>1 *hurts* when bursts exceed D × parity.** Example:
+   (16, 20) on GE burst=20, gap=100:
+   - D=1: 76.50% recovery at 29 ms
+   - D=4: 70.28% recovery at 101 ms (both worse AND over cap)
+
+   At heavy bursts the interleaver converts "some bad blocks" into
+   "more mediocre blocks." Adaptive daemon must detect long-burst
+   conditions and NOT raise D in response.
 
 ## The `scripts/bench_summary.py` report
 
-Stdlib-only Python 3 (no pandas / numpy). Prints:
+Stdlib-only Python 3. Prints:
 
-1. Recovery rate by uniform loss rate (per `(k, n)`).
-2. Recovery rate by Gilbert-Elliott burst length (per gap × per `(k, n)`).
-3. Recovery rate by periodic period (per burst_len × per `(k, n)`).
-4. CPU cost per block (encode/decode mean + max p99 per `(k, n)`).
-5. Peak explicit heap per config per `(k, n)`.
+1. Recovery rate by uniform loss rate, per `(k, n, D)`.
+2. Recovery rate by GE burst length, one sub-table per gap value,
+   per `(k, n, D)`.
+3. Recovery rate by periodic period, one sub-table per burst-length,
+   per `(k, n, D)`.
+4. CPU cost per block, per `(k, n, D)`.
+5. Modeled delivery latency, per `(k, n, D)`.
+6. Peak explicit heap per config, per `(k, n, D)`.
+7. **Plan §3.6 Y_burst indicator:** at GE (burst=5, gap=100), shows
+   loss(D=1), loss(D=4), and `loss(D=1) / loss(D=4)` ratio. Plan's
+   bar says ratio ≥ 3× for PASS.
 
 Reads one CSV. Does not persist anything.
 
-## How a future PR compares against this baseline
+## How Phase 1 will compare against this baseline
 
-The Phase 1 PR will:
+When Phase 1 lands:
 
-1. Add a `depth` column to the CSV schema (appended at the end, so
-   Phase 0 readers keep working).
-2. Extend both sweep presets to iterate depth ∈ {1, 2, 4, 8, 16}.
-3. Re-run `make bench_baseline` and overwrite `bench/baseline.csv`
-   with the new grid (which is a strict superset at `depth == 1`).
-4. Extend `scripts/bench_summary.py` to take two CSVs and print
-   recovery-rate delta and CPU-cost delta per configuration — the
-   A/B report the plan's §3.6 go/no-go gates key on.
-
-At that point `bench/baseline.csv` starts functioning as a
-regression gate: CI runs the sweep against the branch build, diffs
-against the committed baseline, and fails on any row that regresses
-beyond the plan's tolerances.
+1. The production interleaver in `src/interleaver.cpp` must pass
+   `interleaver_schedule_test` bit-for-bit alongside the reference.
+2. Phase 1 re-runs `make bench_baseline`. A separate diff script
+   (Phase 1 scope) will compare the Phase 1 CSV against this
+   committed baseline config-by-config and assert no regression.
+3. Expected directionally identical numbers: the reference and
+   production interleavers emit the same schedule, so recovery
+   rates must match. CPU cost is the only axis where the two
+   implementations can differ.

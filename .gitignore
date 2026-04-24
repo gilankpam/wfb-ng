@@ -15,6 +15,7 @@ gs.key
 drone.key
 wfb_keygen
 fec_bench
+interleaver_schedule_test
 wfb_ng/conf/site.cfg
 wfb_ng/conf/local.cfg
 .vscode/
