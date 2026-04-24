@@ -59,8 +59,11 @@ fec_test: src/fec_test.cpp src/zfex.o
 
 # Phase 0 benchmark harness. Deliberately not in `all` / `test` --
 # opt-in per doc/design/fec-enhancements-v2.md §5.2.
-fec_bench: src/bench/fec_bench.cpp src/bench/channel_model.hpp src/bench/interleaver.hpp src/zfex.o
-	$(CXX) $(_CFLAGS) -std=gnu++11 -Isrc -o $@ src/bench/fec_bench.cpp src/zfex.o $(LDFLAGS) -lrt
+# Phase 1 Step E: links src/interleaver.o so the harness can
+# optionally route fragments through the production interleaver
+# (--use-prod-interleaver) and measure real push+drain CPU cost.
+fec_bench: src/bench/fec_bench.cpp src/bench/channel_model.hpp src/bench/interleaver.hpp src/interleaver.hpp src/zfex.o src/interleaver.o
+	$(CXX) $(_CFLAGS) -std=gnu++11 -Isrc -o $@ src/bench/fec_bench.cpp src/zfex.o src/interleaver.o $(LDFLAGS) -lrt
 
 # Catch2 unit test pinning the interleaver schedule. Exercises both
 # the Phase 0.5 reference (src/bench/interleaver.hpp) and the Phase 1
@@ -75,6 +78,14 @@ interleaver_schedule_test: src/bench/interleaver_schedule_test.cpp src/bench/int
 bench_baseline: fec_bench
 	@mkdir -p bench
 	./fec_bench --sweep full --output bench/baseline.csv
+
+# Phase 1 Step E: same sweep, but routes fragments through the
+# production wfb::BlockInterleaver (src/interleaver.cpp). Writes
+# bench/phase1.csv. Diff against baseline via scripts/bench_summary.py
+# --compare. Recovery rates MUST be bit-identical (schedule equality).
+bench_phase1: fec_bench
+	@mkdir -p bench
+	./fec_bench --sweep full --output bench/phase1.csv --use-prod-interleaver
 
 libsodium_test: src/libsodium_test.cpp
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) -lsodium $(shell pkg-config --libs catch2-with-main)
@@ -121,7 +132,7 @@ pylint:
 	pylint --disable=R,C wfb_ng/*.py
 
 clean:
-	rm -rf env wfb_rx wfb_tx wfb_tx_cmd wfb_tun wfb_rtsp wfb_keygen dist deb_dist build wfb_ng.egg-info wfb_ng-*.tar.gz _trial_temp *~ src/*.o fec_test libsodium_test fec_bench interleaver_schedule_test bench/baseline.csv
+	rm -rf env wfb_rx wfb_tx wfb_tx_cmd wfb_tun wfb_rtsp wfb_keygen dist deb_dist build wfb_ng.egg-info wfb_ng-*.tar.gz _trial_temp *~ src/*.o fec_test libsodium_test fec_bench interleaver_schedule_test bench/baseline.csv bench/phase1.csv
 
 deb_docker:  /opt/qemu/bin
 	@if ! [ -d /opt/qemu ]; then echo "Docker cross build requires patched QEMU!\nApply ./scripts/qemu/qemu.patch to qemu-7.2.0 and build it:\n  ./configure --prefix=/opt/qemu --static --disable-system && make && sudo make install"; exit 1; fi

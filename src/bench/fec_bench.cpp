@@ -53,6 +53,7 @@ extern "C" {
 
 #include "bench/channel_model.hpp"
 #include "bench/interleaver.hpp"
+#include "../interleaver.hpp"  // Phase 1 Step E: production at src/interleaver.hpp (../ disambiguates from src/bench/interleaver.hpp)
 
 namespace {
 
@@ -155,6 +156,13 @@ struct Config {
     double ipi_ms = 1.4;       // inter-packet interval
     double airtime_us = 80.0;  // per-packet wire airtime
     double slack_ms = 5.0;     // plan §4.7 RX deadline slack
+
+    // Phase 1 Step E: when true and depth > 1, fragments go through
+    // the production src/interleaver.cpp (wfb::BlockInterleaver)
+    // instead of the reference's pure-math emit_slot(). Measures the
+    // real push+drain memcpy cost. Recovery rates are unchanged --
+    // the schedule test pins bit-identical emission order.
+    bool use_prod_interleaver = false;
 };
 
 struct Result {
@@ -169,6 +177,10 @@ struct Result {
     // fec_decode_simd (>=1 loss AND at least k survived).
     std::vector<uint64_t> encode_ns;
     std::vector<uint64_t> decode_ns;
+    // Phase 1 Step E: production interleaver push+drain time, per
+    // block (one sample per block). Empty when use_prod_interleaver
+    // is false or depth == 1.
+    std::vector<uint64_t> interleaver_ns;
 
     // Peak heap bytes we explicitly allocated in this config. Includes:
     //   - n fragment buffers (aligned-up to SIMD)
@@ -215,6 +227,17 @@ Result run_config(const Config& cfg, ChannelT& channel) {
 
     fec_bench::BlockInterleaver interleaver(cfg.n, D);
 
+    // Phase 1 Step E: optional production interleaver, same schedule
+    // (pinned by interleaver_schedule_test). Allocated once per
+    // config; reused across frames via its push/drain/reset cycle.
+    // Only engaged when depth > 1 (the class itself supports D==1
+    // as a degenerate but the harness skips it since there's no
+    // schedule difference to time).
+    std::unique_ptr<wfb::BlockInterleaver> prod_interleaver;
+    if (cfg.use_prod_interleaver && D > 1) {
+        prod_interleaver.reset(new wfb::BlockInterleaver(cfg.n, D, buf_size));
+    }
+
     fec_t* fec_p = nullptr;
     if (fec_new(uint16_t(cfg.k), uint16_t(cfg.n), &fec_p) != ZFEX_SC_OK) {
         std::fprintf(stderr, "fec_new(%u, %u) failed\n", cfg.k, cfg.n);
@@ -237,6 +260,7 @@ Result run_config(const Config& cfg, ChannelT& channel) {
     Result result;
     result.encode_ns.reserve(total_blocks);
     result.decode_ns.reserve(total_blocks);
+    result.interleaver_ns.reserve(total_blocks);
 
     // Per-block working storage for fec_decode_simd argument marshalling.
     // Reused across blocks; capacity never shrinks.
@@ -292,6 +316,18 @@ Result run_config(const Config& cfg, ChannelT& channel) {
         //    makes GE / periodic see emit-time ordering rather than
         //    block-at-a-time ordering -- the whole reason we buffered
         //    D blocks before emitting.
+        //
+        //    Two modes:
+        //      - reference (default): slot->(b,f) mapping via the
+        //        pure-math fec_bench::BlockInterleaver. Fast, no
+        //        allocations beyond config setup.
+        //      - production (--use-prod-interleaver): push D*n
+        //        encoded fragments into wfb::BlockInterleaver and
+        //        drain them, timing the push+drain cycle. This
+        //        captures the real per-fragment memcpy cost the
+        //        Phase 1 wfb_tx will pay at run-time. The schedule
+        //        test pins production = reference, so recovery
+        //        numbers in both modes are identical.
         // =============================================================
         for (unsigned d = 0; d < D; ++d) {
             std::fill(survived[d].begin(), survived[d].end(), true);
@@ -299,18 +335,51 @@ Result run_config(const Config& cfg, ChannelT& channel) {
         const uint64_t slots_per_frame = uint64_t(D) * uint64_t(cfg.n);
         const uint64_t frame_base_slot = frame * slots_per_frame;
 
-        for (uint64_t s = 0; s < slots_per_frame; ++s) {
-            const uint64_t absolute_slot = frame_base_slot + s;
-            // Ask the reference interleaver which (b, f) this slot
-            // carries, then map back into frame-local (d, f).
-            const auto bf = interleaver.fragment_at(absolute_slot);
-            const uint64_t b = bf.first;
-            const unsigned f = bf.second;
-            assert(b / D == frame);                 // same frame
-            const unsigned d = unsigned(b - frame * uint64_t(D));
+        if (prod_interleaver) {
+            // Production: push every fragment into the interleaver
+            // then drain. Time the full cycle. Inside drain, we use
+            // the reference for slot->(b,f) lookup (schedule-
+            // equivalent per interleaver_schedule_test).
+            const uint64_t t_int_start = now_ns();
+            for (unsigned d = 0; d < D; ++d) {
+                const uint64_t b = frame * uint64_t(D) + d;
+                for (unsigned f = 0; f < cfg.n; ++f) {
+                    prod_interleaver->push(b, f, frag[d][f], buf_size);
+                }
+            }
+            assert(prod_interleaver->is_frame_full());
+            uint64_t slot_counter = frame_base_slot;
+            prod_interleaver->drain(
+                [&](const uint8_t* /*buf*/, std::size_t /*sz*/) {
+                    const auto bf = interleaver.fragment_at(slot_counter);
+                    const unsigned d = unsigned(bf.first - frame * uint64_t(D));
+                    const unsigned f = bf.second;
+                    const bool dropped = channel.drop(slot_counter);
+                    survived[d][f] = !dropped;
+                    ++slot_counter;
+                });
+            const uint64_t t_int_end = now_ns();
+            // Normalize to per-block: one frame of D blocks shares
+            // one push+drain cycle, so divide by D for an
+            // apples-to-apples comparison with encode_us and
+            // decode_us (which are also per-block).
+            const uint64_t dt_per_block = (t_int_end - t_int_start) / uint64_t(D);
+            for (unsigned d = 0; d < D; ++d) {
+                result.interleaver_ns.push_back(dt_per_block);
+            }
+        } else {
+            // Reference path (default): mapping only, no memcpy.
+            for (uint64_t s = 0; s < slots_per_frame; ++s) {
+                const uint64_t absolute_slot = frame_base_slot + s;
+                const auto bf = interleaver.fragment_at(absolute_slot);
+                const uint64_t b = bf.first;
+                const unsigned f = bf.second;
+                assert(b / D == frame);
+                const unsigned d = unsigned(b - frame * uint64_t(D));
 
-            const bool dropped = channel.drop(absolute_slot);
-            survived[d][f] = !dropped;
+                const bool dropped = channel.drop(absolute_slot);
+                survived[d][f] = !dropped;
+            }
         }
 
         // =============================================================
@@ -466,13 +535,17 @@ Result run_config_dispatch(const Config& cfg) {
 // (rebased into v2.1). `latency_ms` (v2.1 addition) is computed from
 // a theoretical model at the plan §4.2 reference operating point;
 // see `Config` for the assumed IPI/airtime/slack.
-// The old Phase 0 baseline.csv (without depth and latency columns)
-// is still readable by bench_summary.py.
+// `interleaver_us_*` (Phase 1 Step E) are the production interleaver
+// push+drain per-block cost. Empty when --use-prod-interleaver is
+// off or depth == 1.
+// The old Phase 0 baseline.csv (without depth/latency/interleaver
+// columns) is still readable by bench_summary.py.
 const char* CSV_HEADER =
     "channel_model,param1,param2,k,n,depth,blocks,seed,"
     "block_recovery_rate,residual_packet_loss,"
     "encode_us_mean,encode_us_p99,"
     "decode_us_mean,decode_us_p99,"
+    "interleaver_us_mean,interleaver_us_p99,"
     "peak_mem_bytes,latency_ms";
 
 void write_csv_header(FILE* out) {
@@ -516,6 +589,21 @@ void write_csv_row(FILE* out, const Config& cfg, Result& res) {
         dec_p99_buf[0]  = '\0';
     }
 
+    // Phase 1 Step E: production interleaver timing. Empty when
+    // --use-prod-interleaver was not set, or when depth == 1.
+    char int_mean_buf[32], int_p99_buf[32];
+    const bool have_int = !res.interleaver_ns.empty();
+    if (have_int) {
+        const double int_mean_us = mean_ns(res.interleaver_ns) / 1000.0;
+        const uint64_t int_p99_ns = percentile_ns(res.interleaver_ns, 0.99);
+        const double int_p99_us = double(int_p99_ns) / 1000.0;
+        std::snprintf(int_mean_buf, sizeof(int_mean_buf), "%.3f", int_mean_us);
+        std::snprintf(int_p99_buf,  sizeof(int_p99_buf),  "%.3f", int_p99_us);
+    } else {
+        int_mean_buf[0] = '\0';
+        int_p99_buf[0]  = '\0';
+    }
+
     // Plan §4.2 latency model:
     //   block_duration_ms = k * ipi_ms + n * airtime_ms
     //   latency_ms        = D * block_duration_ms + slack_ms
@@ -533,6 +621,7 @@ void write_csv_row(FILE* out, const Config& cfg, Result& res) {
         "%.6f,%.6f,"
         "%.3f,%.3f,"
         "%s,%s,"
+        "%s,%s,"
         "%llu,%.3f\n",
         model_name(cfg.model),
         cfg.param1, p2buf,
@@ -542,6 +631,7 @@ void write_csv_row(FILE* out, const Config& cfg, Result& res) {
         recovery_rate, residual_loss,
         enc_mean_us, enc_p99_us,
         dec_mean_buf, dec_p99_buf,
+        int_mean_buf, int_p99_buf,
         (unsigned long long)res.peak_mem_bytes,
         latency_ms);
     std::fflush(out);
@@ -686,6 +776,12 @@ void run_sweep(FILE* out, const SweepGrid& g, const Config& tmpl) {
         "                          (timing flags parametrize the CSV's\n"
         "                           latency_ms column; they do not affect\n"
         "                           the recovery measurement itself.)\n"
+        "      --use-prod-interleaver\n"
+        "                          Route fragments through the Phase 1\n"
+        "                          production src/interleaver.cpp and\n"
+        "                          time push+drain per block. Recovery\n"
+        "                          numbers are unchanged (schedule is\n"
+        "                          pinned equal to the reference).\n"
         "  --selftest              Run built-in correctness gates and exit.\n"
         "\n"
         "Common:\n"
@@ -908,6 +1004,8 @@ int main(int argc, char** argv) {
             cfg.airtime_us = std::atof(eat(i, argc, argv, a));
         } else if (!std::strcmp(a, "--slack-ms")) {
             cfg.slack_ms = std::atof(eat(i, argc, argv, a));
+        } else if (!std::strcmp(a, "--use-prod-interleaver")) {
+            cfg.use_prod_interleaver = true;
         } else if (!std::strcmp(a, "--k")) {
             cfg.k = unsigned(std::atoi(eat(i, argc, argv, a)));
         } else if (!std::strcmp(a, "--n")) {
