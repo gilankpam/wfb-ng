@@ -62,11 +62,12 @@ fec_test: src/fec_test.cpp src/zfex.o
 fec_bench: src/bench/fec_bench.cpp src/bench/channel_model.hpp src/bench/interleaver.hpp src/zfex.o
 	$(CXX) $(_CFLAGS) -std=gnu++11 -Isrc -o $@ src/bench/fec_bench.cpp src/zfex.o $(LDFLAGS) -lrt
 
-# Catch2 unit test pinning the reference interleaver schedule. In the
-# Phase 1 PR this same test will be extended to also exercise the
-# production src/interleaver.cpp and assert bit-identical output.
-interleaver_schedule_test: src/bench/interleaver_schedule_test.cpp src/bench/interleaver.hpp
-	$(CXX) $(_CFLAGS) -std=gnu++17 -Isrc -o $@ src/bench/interleaver_schedule_test.cpp $(LDFLAGS) $(shell pkg-config --libs catch2-with-main)
+# Catch2 unit test pinning the interleaver schedule. Exercises both
+# the Phase 0.5 reference (src/bench/interleaver.hpp) and the Phase 1
+# production implementation (src/interleaver.cpp) against the same
+# expected schedule vectors.
+interleaver_schedule_test: src/bench/interleaver_schedule_test.cpp src/bench/interleaver.hpp src/interleaver.hpp src/interleaver.o
+	$(CXX) $(_CFLAGS) -std=gnu++17 -Isrc -o $@ src/bench/interleaver_schedule_test.cpp src/interleaver.o $(LDFLAGS) $(shell pkg-config --libs catch2-with-main)
 
 # Runs the full baseline sweep (depths 1,2,4,8 × 4 (k,n) × 3 seeds ×
 # all channel models) and writes bench/baseline.csv. Several minutes;
