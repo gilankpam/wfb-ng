@@ -79,6 +79,7 @@ int send_command(int port, cmd_req_t req, size_t req_size, cmd_resp_t *resp)
     {
     case CMD_SET_FEC:
     case CMD_SET_RADIO:
+    case CMD_SET_INTERLEAVE_DEPTH:
         resp_payload_size = 0;
         break;
 
@@ -88,6 +89,10 @@ int send_command(int port, cmd_req_t req, size_t req_size, cmd_resp_t *resp)
 
     case CMD_GET_RADIO:
         resp_payload_size = sizeof(resp->u.cmd_get_radio);
+        break;
+
+    case CMD_GET_INTERLEAVE_DEPTH:
+        resp_payload_size = sizeof(resp->u.cmd_get_interleave_depth);
         break;
 
     default:
@@ -241,6 +246,58 @@ int get_fec(char *progname, int port, int argc, char **argv)
     return rc;
 }
 
+int set_interleave_depth(char *progname, int port, int argc, char **argv)
+{
+    int opt;
+    int depth = 1;
+    cmd_req_t req = { .req_id = htonl(rand()), .cmd_id = CMD_SET_INTERLEAVE_DEPTH };
+    cmd_resp_t resp;
+
+    while ((opt = getopt(argc, argv, "d:h")) != -1)
+    {
+        switch (opt)
+        {
+        case 'd':
+            depth = atoi(optarg);
+            break;
+
+        default: /* '?' */
+            fprintf(stderr, "Usage: %s <port> %s -d <depth>\n", progname, argv[0]);
+            fprintf(stderr, "  depth: 1..255. 1 = no interleaving (master-compatible).\n");
+            fprintf(stderr, "  depth > 1 requires fec_n <= 32 and fec_timeout == 0 on the TX side.\n");
+            fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
+            return 1;
+        }
+    }
+
+    if (depth < 1 || depth > 255)
+    {
+        fprintf(stderr, "Invalid depth %d: must be in 1..255\n", depth);
+        return 1;
+    }
+
+    req.u.cmd_set_interleave_depth.depth = (uint8_t)depth;
+
+    return send_command(port, req,
+                        offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_interleave_depth),
+                        &resp);
+}
+
+int get_interleave_depth(char *progname, int port, int argc, char **argv)
+{
+    cmd_req_t req = { .req_id = htonl(rand()), .cmd_id = CMD_GET_INTERLEAVE_DEPTH };
+    cmd_resp_t resp;
+
+    int rc = send_command(port, req, offsetof(cmd_req_t, u), &resp);
+
+    if (rc == 0)
+    {
+        printf("depth=%u\n", resp.u.cmd_get_interleave_depth.depth);
+    }
+
+    return rc;
+}
+
 int get_radio(char *progname, int port, int argc, char **argv)
 {
     cmd_req_t req = { .req_id = htonl(rand()), .cmd_id = CMD_GET_RADIO };
@@ -285,7 +342,8 @@ int main(int argc, char **argv)
 
     if (argc < 3)
     {
-        fprintf(stderr, "Usage: %s <port> {set_fec | set_radio | get_fec | get_radio } ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s <port> {set_fec | set_radio | get_fec | get_radio | "
+                        "set_interleave_depth | get_interleave_depth } ...\n", argv[0]);
         fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
         fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
         return 1;
@@ -310,6 +368,14 @@ int main(int argc, char **argv)
     else if (strcmp(command, "get_radio") == 0)
     {
         return get_radio(argv[0], port, argc - 2, argv + 2);
+    }
+    else if (strcmp(command, "set_interleave_depth") == 0)
+    {
+        return set_interleave_depth(argv[0], port, argc - 2, argv + 2);
+    }
+    else if (strcmp(command, "get_interleave_depth") == 0)
+    {
+        return get_interleave_depth(argv[0], port, argc - 2, argv + 2);
     }
     else
     {

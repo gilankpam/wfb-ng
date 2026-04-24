@@ -100,10 +100,16 @@ def init_udp_direct_tx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
         raise Exception('%s: unsupported peer address: %s' % (service_name, cfg.peer))
 
 
+    # Phase 1 Step F (integration): the -X flag activates the block
+    # interleaver on the TX side. Default interleave_depth == 1 means
+    # "-X 1" which is wire-identical to master. Set > 1 in master.cfg
+    # to enable interleaving for this stream. getattr is used for
+    # forward-compat with config files that predate the key.
+    interleave_depth = getattr(cfg, 'interleave_depth', 1)
     cmd = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d %(conn_str)s -K %(key)s '\
            '-B %(bw)d -G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
            '%(mirror)s%(force_vht)s%(qdisc)s '\
-           '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d '\
+           '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -X %(interleave_depth)d -i %(link_id)d '\
            '-R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d '\
            '-J %(injection_retries)d -E %(injection_retry_delay)d' % \
            dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_tx'),
@@ -125,6 +131,7 @@ def init_udp_direct_tx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
                 fec_n=cfg.fec_n,
                 fec_timeout=cfg.fec_timeout,
                 fec_delay=cfg.fec_delay,
+                interleave_depth=interleave_depth,
                 link_id=link_id,
                 log_interval=settings.common.log_interval,
                 rcv_buf_size=settings.common.tx_rcv_buf_size,
@@ -259,10 +266,12 @@ def init_mavlink(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_on
                    link_id=link_id)).split() + (wlans if not is_cluster else [])
 
     tx_socket_path = '%s-tx-%s' % (service_name, os.urandom(4).hex())
+    # Phase 1 Step F: -X interleave_depth. See init_udp_direct_tx for the rationale.
+    interleave_depth = getattr(cfg, 'interleave_depth', 1)
     cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d '\
               '-G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
               '%(mirror)s%(force_vht)s%(qdisc)s '\
-              '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
+              '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -X %(interleave_depth)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
               dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_tx'),
                    cluster=' -d' if is_cluster else '',
                    frame_type=cfg.frame_type,
@@ -282,6 +291,7 @@ def init_mavlink(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_on
                    fec_n=cfg.fec_n,
                    fec_timeout=cfg.fec_timeout,
                    fec_delay=cfg.fec_delay,
+                   interleave_depth=interleave_depth,
                    link_id=link_id,
                    log_interval=settings.common.log_interval,
                    rcv_buf_size=settings.common.tx_rcv_buf_size,
@@ -373,10 +383,12 @@ def init_tunnel(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_onl
                    link_id=link_id)).split() + (wlans if not is_cluster else [])
 
     tx_socket_path = '%s-tx-%s' % (service_name, os.urandom(4).hex())
+    # Phase 1 Step F: -X interleave_depth. See init_udp_direct_tx.
+    interleave_depth = getattr(cfg, 'interleave_depth', 1)
     cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d -G %(gi)s '\
               '-S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
               '%(mirror)s%(force_vht)s%(qdisc)s '\
-              '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
+              '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -X %(interleave_depth)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
               dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_tx'),
                    cluster=' -d' if is_cluster else '',
                    frame_type=cfg.frame_type,
@@ -396,6 +408,7 @@ def init_tunnel(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_onl
                    fec_n=cfg.fec_n,
                    fec_timeout=cfg.fec_timeout,
                    fec_delay=cfg.fec_delay,
+                   interleave_depth=interleave_depth,
                    link_id=link_id,
                    log_interval=settings.common.log_interval,
                    rcv_buf_size=settings.common.tx_rcv_buf_size,
@@ -496,10 +509,12 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
 
     if cfg.stream_tx is not None:
         tx_socket_path = '%s-tx-%s' % (service_name, os.urandom(4).hex())
+        # Phase 1 Step F: -X interleave_depth. See init_udp_direct_tx.
+        interleave_depth = getattr(cfg, 'interleave_depth', 1)
         cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d '\
                   '-G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
                   '%(mirror)s%(force_vht)s%(qdisc)s '\
-                  '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
+                  '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -X %(interleave_depth)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
                   dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_tx'),
                        cluster=' -d' if is_cluster else '',
                        frame_type=cfg.frame_type,
@@ -519,6 +534,7 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
                        fec_n=cfg.fec_n,
                        fec_timeout=cfg.fec_timeout,
                        fec_delay=cfg.fec_delay,
+                       interleave_depth=interleave_depth,
                        link_id=link_id,
                        log_interval=settings.common.log_interval,
                        rcv_buf_size=settings.common.tx_rcv_buf_size,

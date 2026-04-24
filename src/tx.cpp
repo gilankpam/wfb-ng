@@ -1035,6 +1035,19 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         continue;
                     }
 
+                    // Plan §4.2: with interleaving active (depth > 1)
+                    // the RX ring memory footprint is bounded by
+                    // fec_n <= 32. Enforce at runtime so a 1C refresh
+                    // can't break the startup invariant.
+                    if (t->get_interleave_depth() > 1 && new_fec_n > 32)
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("Rejecting FEC=%d/%d: depth=%u requires n<=32 (plan §4.2)\n",
+                                new_fec_k, new_fec_n, t->get_interleave_depth());
+                        continue;
+                    }
+
                     // Plan v2.1 R1 (1C): close + drain + reconfigure +
                     // rebroadcast SESSION on the EXISTING session_key.
                     // refresh_session preserves block_idx (nonce
