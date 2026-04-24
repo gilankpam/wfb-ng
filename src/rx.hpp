@@ -81,10 +81,40 @@ typedef struct {
     size_t *fragment_map;
     uint8_t fragment_to_send_idx;
     uint8_t has_fragments;
+    // Phase 1 Step D (plan §4.7). At interleave_depth == 1, both are
+    // untouched and the master flush path runs unchanged.
+    //   deadline_ms == 0: no deadline set (default; also used as the
+    //       "never trip" value when interleaving is off).
+    //   deadline_ms  > 0: CLOCK_MONOTONIC ms wall-time by which this
+    //       block must be emitted (whatever primaries we have by then).
+    //   ready:        true once the block has all k primaries
+    //       available (either directly received or FEC-recovered).
+    uint64_t deadline_ms;
+    bool ready;
 } rx_ring_item_t;
 
 
-#define RX_RING_SIZE 40
+// Plan §4.2 / §4.7: RX_RING_SIZE bumped from master's 40 -> 64 to
+// accommodate D up to 8 (a D-frame contains D blocks, plus slack).
+// Valid at every supported depth. Memory budget quantified in
+// plan §4.2: worst case fec_n=32 -> 64 * 32 * 1466 ~= 3 MB.
+// Startup refuses fec_n > 32 when depth > 1, bounding the memory.
+#define RX_RING_SIZE 64
+#define MAX_INTERLEAVE_DEPTH 8  // ceiling per plan §4.2 bulk@60fps
+static_assert(RX_RING_SIZE >= MAX_INTERLEAVE_DEPTH * 4,
+              "RX_RING_SIZE must be at least 4x max interleaver depth");
+
+// Defaults for plan §4.7 deadline computation. IPI is conservative
+// for FPV operating points (MCS1..MCS7 at typical video bitrates).
+// Slack covers OS scheduling jitter. Both are hard-coded for Phase 1;
+// a future Phase 3 adaptive daemon may drive them through the
+// control socket.
+//
+//   hold_off_ms = (fec_n - 1) * depth * IPI_MS + SLACK_MS
+//
+// At D=4, n=12: (12-1) * 4 * 2 + 5 = 93 ms.
+#define WFB_RX_HOLDOFF_IPI_MS   2
+#define WFB_RX_HOLDOFF_SLACK_MS 5
 
 static inline int modN(int x, int base)
 {
@@ -233,6 +263,19 @@ private:
     void deinit_fec(void);
     void send_packet(int ring_idx, int fragment_idx);
     void apply_fec(int ring_idx);
+    // Phase 1 Step D (plan §4.7):
+    //   recompute_hold_off_ms_: called after SESSION parse updates
+    //       (fec_n, interleave_depth); sets hold_off_ms to 0 at D==1
+    //       (so deadline_ms comparisons never trip under master-
+    //       compatible depth).
+    //   advance_front_interleaved_: emits and drops the oldest ring
+    //       slots while they're either already `ready` (all k
+    //       primaries decodable) or their deadline has passed.
+    //       Stops at the first slot that is neither ready nor
+    //       expired. Called from process_packet AND dump_stats so
+    //       deadlines fire even when traffic stalls.
+    void recompute_hold_off_ms_(void);
+    void advance_front_interleaved_(uint64_t now_ms);
     void log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi,
                   const int8_t *noise, uint16_t freq, uint8_t mcs_index, uint8_t bandwidth);
     int get_block_ring_idx(uint64_t block_idx);
@@ -246,6 +289,11 @@ private:
     uint8_t session_fec_type;  // plan §4.1 B1: stock RX would reject anything non-WFB_FEC_VDM_RS
     uint8_t interleave_depth;  // TLV_INTERLEAVE_DEPTH from last SESSION; 1 = no interleaving
     bool session_established;  // true once first valid SESSION has been seen
+    // Phase 1 Step D (plan §4.7) hold-off duration for fragment
+    // gathering under D > 1. 0 means "no deadline path" (D == 1,
+    // master-compatible). Recomputed in recompute_hold_off_ms_
+    // after every SESSION parse.
+    uint32_t hold_off_ms;
     uint8_t session_hash[crypto_generichash_BYTES];
 
     uint32_t seq;
