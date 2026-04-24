@@ -47,27 +47,26 @@ using namespace std;
 
 #include "wifibroadcast.hpp"
 #include "tx.hpp"
+#include "interleaver.hpp"   // Phase 1 Step C: TX-side block interleaver.
 
 namespace {
-// Phase 1 Step A helpers. At interleave_depth == 1 (default) both
-// are no-ops, so the wire is byte-identical to master. When depth > 1
-// we append a TLV so RX can discover the depth from SESSION, and we
-// raise fec_type to WFB_FEC_VDM_RS_INTERLEAVED so stock RX rejects
-// the session cleanly (plan §4.1 B1) rather than silently mis-
-// decoding.
-void add_interleave_depth_tag(vector<tags_item_t>& tags, int interleave_depth)
-{
-    if (interleave_depth <= 1) return;
-    tags_item_t tag;
-    tag.id = TLV_INTERLEAVE_DEPTH;
-    tag.value.push_back((uint8_t)interleave_depth);
-    tags.push_back(tag);
-}
-
-void apply_interleave_fec_type(unique_ptr<Transmitter>& t, int interleave_depth)
+// Phase 1 Step C: single-shot SESSION-layer setup after a Transmitter
+// is constructed. At interleave_depth == 1 this is a no-op and the
+// wire is byte-identical to master. At depth > 1 it raises fec_type
+// to WFB_FEC_VDM_RS_INTERLEAVED (plan §4.1 B1) and installs the
+// TX-side interleaver + TLV_INTERLEAVE_DEPTH tag, which rebuilds the
+// cached session_packet so the first send_session_key() ships with
+// the correct fec_type/tags.
+//
+// The pre-ctor tag-seeding helper from Step A was removed: the
+// Transmitter now owns the TLV_INTERLEAVE_DEPTH lifecycle via
+// install_interleave_depth_tag_() so that CMD_SET_INTERLEAVE_DEPTH
+// refresh does not double-tag.
+void apply_interleave_setup(unique_ptr<Transmitter>& t, int interleave_depth)
 {
     if (interleave_depth <= 1) return;
     t->set_fec_type(WFB_FEC_VDM_RS_INTERLEAVED);
+    t->set_interleave_depth(unsigned(interleave_depth));
 }
 } // namespace
 
@@ -84,7 +83,9 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     session_packet{},
     session_packet_size(0),
     tags(tags),
-    fec_type(WFB_FEC_VDM_RS)
+    fec_type(WFB_FEC_VDM_RS),
+    interleave_depth_(1),
+    interleaver_(nullptr)
 {
 
     FILE *fp;
@@ -134,8 +135,13 @@ void Transmitter::deinit_session(void)
     fec_n = -1;
 }
 
-void Transmitter::init_session(int k, int n)
+void Transmitter::reconfigure_fec_(int k, int n)
 {
+    // Factored out of init_session for Phase 1 Step C. Owns only the
+    // FEC-related side of a (k, n) change: deinit old fec state,
+    // allocate new fec state, reset per-block counters. Does NOT
+    // touch session_key or block_idx -- those stay constant across
+    // a 1C refresh to keep nonce uniqueness (plan v2.1 R1).
     if (fec_p != NULL)
     {
         deinit_session();
@@ -160,19 +166,23 @@ void Transmitter::init_session(int k, int n)
         assert(_rc == 0);
     }
 
-    block_idx = 0;
     fragment_idx = 0;
+    max_packet_size = 0;
+}
 
-    // init session key
-    randombytes_buf(session_key, sizeof(session_key));
+void Transmitter::build_session_packet_(void)
+{
+    // Factored out of init_session. Rebuilds the cached session_packet
+    // from current (fec_type, fec_k, fec_n, session_key, tags). Called
+    // at session init AND on every SESSION-layer mutation
+    // (set_fec_type / set_interleave_depth / refresh_session), so the
+    // next send_session_key() always ships the current config.
+    assert(fec_p != NULL);
 
-    // fill packet header
     wsession_hdr_t *session_hdr = (wsession_hdr_t *)session_packet;
     session_hdr->packet_type = WFB_PACKET_SESSION;
 
     randombytes_buf(session_hdr->session_nonce, sizeof(session_hdr->session_nonce));
-
-    // fill packet contents
 
     uint8_t tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
 
@@ -183,7 +193,7 @@ void Transmitter::init_session(int k, int n)
 
         session_data->epoch = htobe64(epoch);
         session_data->channel_id = htobe32(channel_id);
-        session_data->fec_type = fec_type;   // set via set_fec_type(); defaults to WFB_FEC_VDM_RS
+        session_data->fec_type = fec_type;
         session_data->k = (uint8_t)fec_k;
         session_data->n = (uint8_t)fec_n;
 
@@ -192,7 +202,6 @@ void Transmitter::init_session(int k, int n)
     }
 
     // Fill optional Tags
-
     uint32_t session_data_size = sizeof(wsession_data_t);
     for(auto it = tags.begin(); it != tags.end(); it++)
     {
@@ -214,6 +223,115 @@ void Transmitter::init_session(int k, int n)
 
     session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
     assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
+}
+
+void Transmitter::init_session(int k, int n)
+{
+    // Phase 1 refactor: the FEC bring-up and session_packet build
+    // have been factored out so refresh_session() can reuse them
+    // without regenerating session_key. init_session() remains the
+    // "fresh process start" path -- it DOES regenerate session_key
+    // and reset block_idx to 0, because at process start there is
+    // no nonce history to preserve.
+    reconfigure_fec_(k, n);
+
+    block_idx = 0;
+
+    // init session key (this is the ONE place we regenerate it
+    // under the 1C design; see plan v2.1 R1 §4.8 accepted risk).
+    randombytes_buf(session_key, sizeof(session_key));
+
+    build_session_packet_();
+}
+
+void Transmitter::set_fec_type(uint8_t t)
+{
+    fec_type = t;
+    // Rebuild the cached session_packet so the new fec_type hits
+    // the wire on the next send_session_key(). Fixes a Step A bug
+    // where the setter only updated the member.
+    if (fec_p != NULL) build_session_packet_();
+}
+
+void Transmitter::install_interleave_depth_tag_(unsigned D)
+{
+    // Drop any existing TLV_INTERLEAVE_DEPTH entry; tags may
+    // originally have been seeded by the loop function or by a
+    // previous call to this method.
+    for (auto it = tags.begin(); it != tags.end(); /* no ++ */) {
+        if (it->id == TLV_INTERLEAVE_DEPTH) {
+            it = tags.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (D > 1) {
+        tags_item_t tag;
+        tag.id = TLV_INTERLEAVE_DEPTH;
+        tag.value.push_back((uint8_t)D);
+        tags.push_back(tag);
+    }
+}
+
+void Transmitter::set_interleave_depth(unsigned D)
+{
+    assert(D >= 1);
+    interleave_depth_ = D;
+    if (D > 1)
+    {
+        // Allocate (or reallocate if D/n changed) the TX-side
+        // interleaver. max_frag_size is the largest ciphertext we
+        // will ever push, bounded by MAX_FORWARDER_PACKET_SIZE.
+        assert(fec_n >= 1);
+        interleaver_.reset(new wfb::BlockInterleaver(
+            (unsigned)fec_n, D, MAX_FORWARDER_PACKET_SIZE));
+    }
+    else
+    {
+        interleaver_.reset();
+    }
+
+    install_interleave_depth_tag_(D);
+
+    if (fec_p != NULL) build_session_packet_();
+}
+
+void Transmitter::refresh_session(int new_k, int new_n, unsigned new_D)
+{
+    // Plan v2.1 R1 (1C) refresh. Called by CMD_SET_FEC and
+    // CMD_SET_INTERLEAVE_DEPTH handlers. Does NOT call init_session
+    // and does NOT regenerate session_key.
+
+    // (a) Close the currently-open FEC block with FEC-only closers.
+    // send_packet(NULL, 0, FEC_ONLY) returns false when fragment_idx
+    // is 0 (no open block), so the while-loop is self-terminating.
+    while (send_packet(NULL, 0, WFB_PACKET_FEC_ONLY)) { }
+
+    // (b) Discard any partial D-frame in the current interleaver.
+    // Up to (D-1) blocks of in-flight data are dropped here. RX's
+    // Step D deadline state machine absorbs that -- those blocks
+    // will time out without recovery. Expected cost per refresh:
+    // ~(D-1) * block_duration of discarded data, rare at 200 ms+
+    // refresh intervals (see plan v2.1 R1 cost analysis).
+    if (interleaver_) interleaver_->flush();
+
+    // (c) Reconfigure FEC. block_idx is preserved (same
+    // session_key means nonces must not repeat).
+    assert(new_k >= 1 && new_n >= 1 && new_n < 256 && new_k <= new_n);
+    reconfigure_fec_(new_k, new_n);
+
+    // (d) Reconfigure interleaver + fec_type + TLV. fec_type is
+    // fully a function of D under Phase 1: interleaved iff D > 1.
+    fec_type = (new_D > 1) ? WFB_FEC_VDM_RS_INTERLEAVED : WFB_FEC_VDM_RS;
+    set_interleave_depth(new_D);  // rebuilds session_packet as a side-effect
+
+    // (e) Re-broadcast SESSION. Same cadence as master's init_session
+    // post-step (close + send fec_n - fec_k + 1 copies so late-
+    // joining RXen catch it). No new session_key.
+    for (int i = 0; i < fec_n - fec_k + 1; i++)
+    {
+        send_session_key();
+    }
 }
 
 
@@ -663,7 +781,30 @@ void Transmitter::send_block_fragment(size_t packet_size)
         throw runtime_error("Unable to encrypt packet!");
     }
 
-    inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
+    const size_t wire_size = sizeof(wblock_hdr_t) + ciphertext_len;
+
+    // Phase 1 Step C: block interleaver, gated on depth > 1. At
+    // depth == 1 interleaver_ is nullptr and we inject directly --
+    // byte-identical to master. At depth > 1 we push the freshly-
+    // encrypted ciphertext into the interleaver (a memcpy into the
+    // interleaver's owned aligned slot; our stack `ciphertext` is
+    // safe to go out of scope after push returns). Once a full
+    // D-frame has accumulated, drain() iterates in schedule order
+    // and calls inject_packet for each fragment.
+    if (interleaver_)
+    {
+        interleaver_->push(block_idx, fragment_idx, ciphertext, wire_size);
+        if (interleaver_->is_frame_full())
+        {
+            interleaver_->drain([this](const uint8_t* buf, size_t sz) {
+                this->inject_packet(buf, sz);
+            });
+        }
+    }
+    else
+    {
+        inject_packet(ciphertext, wire_size);
+    }
 }
 
 void Transmitter::send_session_key(void)
@@ -883,10 +1024,10 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         continue;
                     }
 
-                    int fec_k = req.u.cmd_set_fec.k;
-                    int fec_n = req.u.cmd_set_fec.n;
+                    int new_fec_k = req.u.cmd_set_fec.k;
+                    int new_fec_n = req.u.cmd_set_fec.n;
 
-                    if(!(fec_k <= fec_n && fec_k >=1 && fec_n >= 1 && fec_n < 256))
+                    if(!(new_fec_k <= new_fec_n && new_fec_k >=1 && new_fec_n >= 1 && new_fec_n < 256))
                     {
                         resp.rc = htonl(EINVAL);
                         sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
@@ -894,19 +1035,23 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         continue;
                     }
 
-                    // Close open FEC block if any
-                    while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
-
-                    t->init_session(fec_k, fec_n);
-
-                    // Emulate FEC for initial session key distribution
-                    for(int i = 0; i < fec_n - fec_k + 1; i++)
-                    {
-                        t->send_session_key();
+                    // Plan v2.1 R1 (1C): close + drain + reconfigure +
+                    // rebroadcast SESSION on the EXISTING session_key.
+                    // refresh_session preserves block_idx (nonce
+                    // uniqueness) and depth, so changing only (k, n)
+                    // leaves depth unchanged.
+                    try {
+                        t->refresh_session(new_fec_k, new_fec_n, t->get_interleave_depth());
+                    } catch (std::exception &e) {
+                        resp.rc = htonl(EIO);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("refresh_session failed: %s\n", e.what());
+                        continue;
                     }
 
                     sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    WFB_INFO("Session restarted with FEC %d/%d\n", fec_k, fec_n);
+                    WFB_INFO("Session refreshed: FEC=%d/%d, depth=%u\n",
+                             new_fec_k, new_fec_n, t->get_interleave_depth());
                 }
                 break;
 
@@ -993,20 +1138,74 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                 }
                 break;
 
-                // Phase 1 Step A: the SET/GET_INTERLEAVE_DEPTH cmd
-                // IDs are reserved so the control socket wire format
-                // stabilises now, but the runtime semantics arrive in
-                // Step C (close open block, drain interleaver,
-                // re-broadcast SESSION on the same session_key --
-                // plan v2.1 R1). Step A handlers reject with EINVAL
-                // so no operator can accidentally rely on them.
+                // Phase 1 Step C: interleaver-depth runtime control.
+                // SET: close the current block, drain interleaver,
+                // reconfigure FEC (unchanged k/n) + interleaver (new
+                // D), re-broadcast SESSION on the SAME session_key
+                // (plan v2.1 R1 / 1C).
                 case CMD_SET_INTERLEAVE_DEPTH:
+                {
+                    if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_interleave_depth))
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        continue;
+                    }
+
+                    const uint8_t new_D = req.u.cmd_set_interleave_depth.depth;
+                    if (new_D < 1)
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("Rejecting interleave depth %u\n", (unsigned)new_D);
+                        continue;
+                    }
+
+                    int cur_k, cur_n;
+                    t->get_fec(cur_k, cur_n);
+
+                    // Startup validations from main() also apply at
+                    // runtime: refuse D>1 with n>32 (plan §4.2) or
+                    // fec_timeout>0 (plan §4.6). Surface as EINVAL.
+                    if (new_D > 1 && cur_n > 32)
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("Refusing depth=%u with n=%d (> 32)\n", (unsigned)new_D, cur_n);
+                        continue;
+                    }
+                    if (new_D > 1 && fec_timeout > 0)
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("Refusing depth=%u with fec_timeout=%d (>0)\n",
+                                (unsigned)new_D, fec_timeout);
+                        continue;
+                    }
+
+                    try {
+                        t->refresh_session(cur_k, cur_n, (unsigned)new_D);
+                    } catch (std::exception &e) {
+                        resp.rc = htonl(EIO);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("refresh_session failed: %s\n", e.what());
+                        continue;
+                    }
+
+                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                    WFB_INFO("Session refreshed: FEC=%d/%d, depth=%u\n",
+                             cur_k, cur_n, (unsigned)new_D);
+                }
+                break;
+
                 case CMD_GET_INTERLEAVE_DEPTH:
                 {
-                    resp.rc = htonl(EINVAL);
-                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    WFB_ERR("CMD_(SET|GET)_INTERLEAVE_DEPTH not implemented at Step A\n");
-                    continue;
+                    resp.rc = htonl(0);
+                    resp.u.cmd_get_interleave_depth.depth =
+                        (uint8_t)t->get_interleave_depth();
+                    sendto(fd, &resp,
+                           offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_interleave_depth),
+                           MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
                 }
                 break;
 
@@ -1475,7 +1674,6 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
     vector<int> rx_fd;
     vector<string> wlans;
     vector<tags_item_t> tags;
-    add_interleave_depth_tag(tags, interleave_depth);
     unique_ptr<Transmitter> t;
 
     for(int i = 0; optind + i < argc; i++)
@@ -1520,7 +1718,7 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                                                                       inject_retries, inject_retry_delay));
     }
 
-    apply_interleave_fec_type(t, interleave_depth);
+    apply_interleave_setup(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1535,7 +1733,6 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
     vector<int> rx_fd;
     vector<string> wlans;
     vector<tags_item_t> tags;
-    add_interleave_depth_tag(tags, interleave_depth);
     unique_ptr<Transmitter> t;
 
     for(int i = 0; optind + i < argc; i++)
@@ -1567,7 +1764,7 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
                                                                       inject_retries, inject_retry_delay));
     }
 
-    apply_interleave_fec_type(t, interleave_depth);
+    apply_interleave_setup(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1641,12 +1838,11 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
     }
 
     vector<tags_item_t> tags;
-    add_interleave_depth_tag(tags, interleave_depth);
     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
-    apply_interleave_fec_type(t, interleave_depth);
+    apply_interleave_setup(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1706,12 +1902,11 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
     IPC_MSG_SEND();
 
     vector<tags_item_t> tags;
-    add_interleave_depth_tag(tags, interleave_depth);
     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
-    apply_interleave_fec_type(t, interleave_depth);
+    apply_interleave_setup(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }

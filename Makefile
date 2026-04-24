@@ -51,7 +51,7 @@ src/%.o: src/%.cpp src/*.hpp src/*.h
 wfb_rx: src/rx.o src/radiotap.o src/zfex.o src/wifibroadcast.o
 	$(CXX) -o $@ $^ $(_LDFLAGS) -lpcap
 
-wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o
+wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o src/interleaver.o
 	$(CXX) -o $@ $^ $(_LDFLAGS)
 
 fec_test: src/fec_test.cpp src/zfex.o

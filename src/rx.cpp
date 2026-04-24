@@ -739,6 +739,9 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
         if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
         {
+            // Full rekey path (unchanged from master): new
+            // session_key means a fresh Transmitter process or a
+            // (pre-1C-era) init_session. Reset FEC and epoch.
             epoch = be64toh(new_session_data->epoch);
             memcpy(session_key, new_session_data->session_key, sizeof(session_key));
 
@@ -758,6 +761,27 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                     interleave_depth, (unsigned)WFB_IPC_CONTRACT_VERSION);
             IPC_MSG_SEND();
             session_established = true;
+        }
+        else if (fec_p != NULL &&
+                 (fec_k != (int)new_session_data->k ||
+                  fec_n != (int)new_session_data->n))
+        {
+            // Plan v2.1 R1 (1C) refresh: same session_key, but the
+            // peer advertised a new (k, n). Reinitialize our FEC
+            // state to the new parameters. block_idx keeps going
+            // (the TX preserves it too for nonce uniqueness), so
+            // old in-flight blocks in the rx ring may be
+            // unrecoverable if they had the old codec mid-way --
+            // RX's deadline sweep in Step D will age them out; at
+            // Step C they're discarded implicitly when init_fec
+            // wipes rx_ring state via deinit_fec().
+            deinit_fec();
+            init_fec(new_session_data->k, new_session_data->n);
+
+            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n",
+                    get_time_ms(), epoch, session_fec_type, fec_k, fec_n,
+                    interleave_depth, (unsigned)WFB_IPC_CONTRACT_VERSION);
+            IPC_MSG_SEND();
         }
 
         // Cache already processed session
