@@ -270,7 +270,11 @@ void Receiver::loop_iter(void)
 Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-    fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
+    count_bursts_recovered(0), count_holdoff_fired(0), count_late_after_deadline(0),
+    fec_p(NULL), fec_k(-1), fec_n(-1),
+    session_fec_type(WFB_FEC_VDM_RS), interleave_depth(1), session_established(false),
+    hold_off_ms(0),
+    seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
     last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
 {
     memset(session_key, '\0', sizeof(session_key));
@@ -327,6 +331,8 @@ void Aggregator::init_fec(int k, int n)
         rx_ring[ring_idx].block_idx = 0;
         rx_ring[ring_idx].fragment_to_send_idx = 0;
         rx_ring[ring_idx].has_fragments = 0;
+        rx_ring[ring_idx].deadline_ms = 0;   // Phase 1 Step D
+        rx_ring[ring_idx].ready = false;     // Phase 1 Step D
         rx_ring[ring_idx].fragments = new uint8_t*[fec_n];
         for(int i=0; i < fec_n; i++)
         {
@@ -335,6 +341,27 @@ void Aggregator::init_fec(int k, int n)
         }
         rx_ring[ring_idx].fragment_map = new size_t[fec_n];
         memset(rx_ring[ring_idx].fragment_map, '\0', fec_n * sizeof(size_t));
+    }
+    // interleave_depth may have been captured earlier (during the
+    // same SESSION parse); recompute hold_off_ms with the new fec_n.
+    recompute_hold_off_ms_();
+}
+
+void Aggregator::recompute_hold_off_ms_(void)
+{
+    // Plan §4.7: hold_off = (fec_n - 1) * depth * IPI_MS + SLACK_MS.
+    // At depth == 1 we keep hold_off_ms at 0 so the deadline_ms
+    // comparison in advance_front_interleaved_ never trips -- the
+    // D=1 path goes through the existing master-compatible flush
+    // logic.
+    if (interleave_depth <= 1 || fec_n < 1)
+    {
+        hold_off_ms = 0;
+    }
+    else
+    {
+        hold_off_ms = (uint32_t)((fec_n - 1) * interleave_depth * WFB_RX_HOLDOFF_IPI_MS)
+                    + (uint32_t)WFB_RX_HOLDOFF_SLACK_MS;
     }
 }
 
@@ -474,12 +501,23 @@ int Aggregator::get_block_ring_idx(uint64_t block_idx)
     last_known_block = block_idx;
     int ring_idx = -1;
 
+    const uint64_t now_ms = get_time_ms();
     for(int i = 0; i < new_blocks; i++)
     {
         ring_idx = rx_ring_push();
         rx_ring[ring_idx].block_idx = block_idx + i + 1 - new_blocks;
         rx_ring[ring_idx].fragment_to_send_idx = 0;
         rx_ring[ring_idx].has_fragments = 0;
+        rx_ring[ring_idx].ready = false;
+        // Phase 1 Step D: set the deadline on creation when
+        // interleaving is active. Plan §4.7 says "first fragment
+        // arrival" but new_blocks > 1 happens when the RX jumps
+        // forward past gaps; those jumped-past slots never see a
+        // fragment, so anchoring the deadline at creation gives
+        // them a way to age out. At hold_off_ms == 0 (D == 1) the
+        // field stays 0 and the master-compatible flush path runs
+        // unchanged.
+        rx_ring[ring_idx].deadline_ms = (hold_off_ms > 0) ? now_ms + hold_off_ms : 0;
         memset(rx_ring[ring_idx].fragment_map, '\0', fec_n * sizeof(size_t));
     }
     return ring_idx;
@@ -490,6 +528,17 @@ void Aggregator::dump_stats(void)
     //timestamp in ms
     uint64_t ts = get_time_ms();
 
+    // Phase 1 Step D: no-traffic fallback for deadline-driven
+    // emission. At D == 1 this is a no-op (hold_off_ms == 0 keeps
+    // the deadline check from tripping); at D > 1 it guarantees
+    // pending blocks emit within ~log_interval of their deadline
+    // even if no new fragments arrive to drive the sweep via
+    // process_packet.
+    if (interleave_depth > 1)
+    {
+        advance_front_interleaved_(ts);
+    }
+
     for(auto it = antenna_stat.begin(); it != antenna_stat.end(); it++)
     {
         IPC_MSG("%" PRIu64 "\tRX_ANT\t%u:%u:%u\t%" PRIx64 "\t%d" ":%d:%d:%d" ":%d:%d:%d\n",
@@ -498,14 +547,34 @@ void Aggregator::dump_stats(void)
                 it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
     }
 
-    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
-            count_p_all, count_b_all,                    // incoming
-            count_p_dec_err,                             // decryption
-            count_p_session, count_p_data,               // classification
-            (uint32_t)count_p_uniq.size(),               // unique check
-            count_p_fec_recovered, count_p_lost,         // fec recovering
-            count_p_bad,                                 // internal errors
-            count_p_outgoing, count_b_outgoing);         // outgoing
+    // PKT line schema. Fields #1-#11 are the master layout.
+    // #12-#14 (Phase 1 Step A) are always appended; they sit at
+    // zero until Step D wires the deadline state machine. Parsers
+    // keyed on the first 11 fields remain compatible.
+    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
+            count_p_all, count_b_all,                    // incoming         #1-2
+            count_p_dec_err,                             // decryption       #3
+            count_p_session, count_p_data,               // classification   #4-5
+            (uint32_t)count_p_uniq.size(),               // unique check     #6
+            count_p_fec_recovered, count_p_lost,         // fec recovering   #7-8
+            count_p_bad,                                 // internal errors  #9
+            count_p_outgoing, count_b_outgoing,          // outgoing         #10-11
+            count_bursts_recovered,                      // Phase 1          #12
+            count_holdoff_fired,                         // Phase 1          #13
+            count_late_after_deadline);                  // Phase 1          #14
+
+    // Phase 1 Step A (plan §B2 bootstrap): re-emit SESSION once per
+    // log_interval so an adaptive daemon joining mid-stream can read
+    // (epoch, fec_type, k, n, depth, contract_version) without
+    // waiting for a session-key rotation. Master's on-change emit at
+    // SESSION_KEY arrival still fires as before; this one is
+    // additive.
+    if (session_established)
+    {
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n",
+                ts, epoch, session_fec_type, fec_k, fec_n,
+                interleave_depth, (unsigned)WFB_IPC_CONTRACT_VERSION);
+    }
     IPC_MSG_SEND();
 
     if(count_p_override)
@@ -656,7 +725,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             return;
         }
 
-        if (new_session_data->fec_type != WFB_FEC_VDM_RS)
+        // Phase 1 Step D: accept the interleaved variant (plan §4.1
+        // B1 / v2.1 R3). Fully supported on this RX because the
+        // deadline state machine below handles D > 1.
+        if (new_session_data->fec_type != WFB_FEC_VDM_RS &&
+            new_session_data->fec_type != WFB_FEC_VDM_RS_INTERLEAVED)
         {
             WFB_ERR("Unsupported FEC codec type: %d\n", new_session_data->fec_type);
             count_p_dec_err += 1;
@@ -683,8 +756,49 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         // of lost packets because session packets doesn't have any serial number and it is
         // too hard to calculate number of unique session packets
 
+        // Phase 1 Step A: record the fec_type the peer advertised and
+        // parse TLV_INTERLEAVE_DEPTH from the SESSION tags (if any).
+        // Step A does NOT accept WFB_FEC_VDM_RS_INTERLEAVED for data
+        // packet processing (the deadline state machine arrives in
+        // Step D); the check above at "Unsupported FEC codec type"
+        // still rejects 0x2. These fields are captured for the
+        // SESSION IPC line only.
+        session_fec_type = new_session_data->fec_type;
+        {
+            // The decrypted buffer starts at `session_tmp`, with
+            // total length `size - sizeof(wsession_hdr_t) -
+            // crypto_box_MACBYTES`. The fixed wsession_data_t header
+            // sits at the start; anything trailing is a TLV stream.
+            const size_t decrypted_len =
+                size - sizeof(wsession_hdr_t) - crypto_box_MACBYTES;
+            const uint8_t* tags_buf = (const uint8_t*)new_session_data + sizeof(wsession_data_t);
+            const size_t tags_size = (decrypted_len > sizeof(wsession_data_t))
+                ? decrypted_len - sizeof(wsession_data_t) : 0;
+            uint8_t advertised_depth = 1;
+            if (tags_size >= sizeof(tlv_hdr_t)) {
+                // get_tag() returns the TLV's len on match, -1 otherwise.
+                // At depth=1 no TLV is emitted by our TX, so this
+                // stays at the default of 1.
+                int rc = get_tag(tags_buf, tags_size,
+                                 TLV_INTERLEAVE_DEPTH,
+                                 &advertised_depth, sizeof(advertised_depth));
+                if (rc < 0) advertised_depth = 1;
+            }
+            interleave_depth = advertised_depth;
+        }
+        // Phase 1 Step D: depth may have changed (either initial
+        // session or a 1C refresh). Recompute hold_off_ms so
+        // advance_front_interleaved_ uses the new deadline window.
+        // If fec_n isn't yet set (very first session), init_fec
+        // will call recompute_hold_off_ms_ again with the actual
+        // fec_n.
+        recompute_hold_off_ms_();
+
         if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
         {
+            // Full rekey path (unchanged from master): new
+            // session_key means a fresh Transmitter process or a
+            // (pre-1C-era) init_session. Reset FEC and epoch.
             epoch = be64toh(new_session_data->epoch);
             memcpy(session_key, new_session_data->session_key, sizeof(session_key));
 
@@ -695,7 +809,35 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
             init_fec(new_session_data->k, new_session_data->n);
 
-            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
+            // Trailing fields #5 (interleave_depth) and #6
+            // (contract_version) are Phase 1 additions. Parsers
+            // that only read the first 4 (epoch, fec_type, k, n)
+            // stay compatible.
+            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n",
+                    get_time_ms(), epoch, session_fec_type, fec_k, fec_n,
+                    interleave_depth, (unsigned)WFB_IPC_CONTRACT_VERSION);
+            IPC_MSG_SEND();
+            session_established = true;
+        }
+        else if (fec_p != NULL &&
+                 (fec_k != (int)new_session_data->k ||
+                  fec_n != (int)new_session_data->n))
+        {
+            // Plan v2.1 R1 (1C) refresh: same session_key, but the
+            // peer advertised a new (k, n). Reinitialize our FEC
+            // state to the new parameters. block_idx keeps going
+            // (the TX preserves it too for nonce uniqueness), so
+            // old in-flight blocks in the rx ring may be
+            // unrecoverable if they had the old codec mid-way --
+            // RX's deadline sweep in Step D will age them out; at
+            // Step C they're discarded implicitly when init_fec
+            // wipes rx_ring state via deinit_fec().
+            deinit_fec();
+            init_fec(new_session_data->k, new_session_data->n);
+
+            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n",
+                    get_time_ms(), epoch, session_fec_type, fec_k, fec_n,
+                    interleave_depth, (unsigned)WFB_IPC_CONTRACT_VERSION);
             IPC_MSG_SEND();
         }
 
@@ -755,7 +897,20 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     int ring_idx = get_block_ring_idx(block_idx);
 
     //ignore already processed blocks
-    if (ring_idx < 0) return;
+    if (ring_idx < 0)
+    {
+        // Phase 1 Step D: a fragment arriving for a block that has
+        // already been retired from the ring. Under D == 1 the
+        // master behaviour is "already flushed via force-flush";
+        // under D > 1 it is "arrived after our deadline expired."
+        // The counter captures the latter; at D == 1 we keep it at
+        // 0 to not change the visible IPC numbers.
+        if (interleave_depth > 1)
+        {
+            count_late_after_deadline += 1;
+        }
+        return;
+    }
 
     rx_ring_item_t *p = &rx_ring[ring_idx];
 
@@ -768,91 +923,211 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     p->fragment_map[fragment_idx] = decrypted_len;
     p->has_fragments += 1;
 
-    // Check if we use current (oldest) block
-    // then we can optimize and don't wait for all K fragments
-    // and send packets if there are no gaps in fragments from the beginning of this block
-    if(ring_idx == rx_ring_front)
+    // =================================================================
+    // Phase 1 Step D branch point (plan §4.7).
+    //
+    // At interleave_depth == 1 the master block-emit logic runs
+    // unchanged: early-emit fast path when ring_idx == front; force-
+    // flush older blocks when a later block reaches k fragments.
+    // This is Invariant A from plan §1.1 and the critical "wire-
+    // identical to master" property for the default configuration.
+    //
+    // At interleave_depth > 1 the early-emit fast path is disabled
+    // (fragments of earlier blocks are in-flight out of their
+    // natural order -- emitting fragment f of the front block does
+    // NOT mean the block is complete). Instead:
+    //   - on k-fragment completion, FEC-recover any missing
+    //     primaries and mark the slot `ready`;
+    //   - call advance_front_interleaved_ to drain any consecutive
+    //     run of ready slots from the front, AND any slots whose
+    //     deadline has expired.
+    // This preserves in-order delivery (blocks emitted in
+    // block_idx order) while the block interleaver shuffles
+    // fragments on the wire.
+    // =================================================================
+    if (interleave_depth == 1)
     {
-        // check if there are any packets without gaps
-        // and send them immediately
-        while(p->fragment_to_send_idx < fec_k && p->fragment_map[p->fragment_to_send_idx])
+        // ----- MASTER PATH (unchanged from rx.cpp:891-942 prior) -----
+        // Check if we use current (oldest) block
+        // then we can optimize and don't wait for all K fragments
+        // and send packets if there are no gaps in fragments from the beginning of this block
+        if(ring_idx == rx_ring_front)
         {
-            send_packet(ring_idx, p->fragment_to_send_idx);
-            p->fragment_to_send_idx += 1;
+            // check if there are any packets without gaps
+            // and send them immediately
+            while(p->fragment_to_send_idx < fec_k && p->fragment_map[p->fragment_to_send_idx])
+            {
+                send_packet(ring_idx, p->fragment_to_send_idx);
+                p->fragment_to_send_idx += 1;
+            }
+
+            // remove block if all K elements (without gaps) were sent
+            if(p->fragment_to_send_idx == fec_k)
+            {
+                rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
+                rx_ring_alloc -= 1;
+                assert(rx_ring_alloc >= 0);
+                return;
+            }
         }
 
-        // remove block if all K elements (without gaps) were sent
-        if(p->fragment_to_send_idx == fec_k)
+        // Check that this block has K elements (with gaps) and can be recovered via FEC
+        if(p->fragment_to_send_idx < fec_k && p->has_fragments == fec_k)
         {
+            // send all queued packets in all unfinished blocks before current
+            // and then remove that blocks
+            int nrm = modN(ring_idx - rx_ring_front, RX_RING_SIZE);
+
+            while(nrm > 0)
+            {
+                for(int f_idx=rx_ring[rx_ring_front].fragment_to_send_idx; f_idx < fec_k; f_idx++)
+                {
+                    if(rx_ring[rx_ring_front].fragment_map[f_idx])
+                    {
+                        send_packet(rx_ring_front, f_idx);
+                    }
+                }
+                rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
+                rx_ring_alloc -= 1;
+                nrm -= 1;
+            }
+
+            assert(rx_ring_alloc > 0);
+            assert(ring_idx == rx_ring_front);
+
+            // Search for missed data fragments and apply FEC only if needed
+            for(int f_idx=p->fragment_to_send_idx; f_idx < fec_k; f_idx++)
+            {
+                if(! p->fragment_map[f_idx])
+                {
+                    uint32_t fec_count = 0;
+
+                    //Recover missed fragments using FEC
+                    apply_fec(ring_idx);
+
+                    // Count total number of recovered fragments
+                    for(; f_idx < fec_k; f_idx++)
+                    {
+                        if(! p->fragment_map[f_idx])
+                        {
+                            fec_count += 1;
+                        }
+                    }
+
+                    if(fec_count)
+                    {
+                        count_p_fec_recovered += fec_count;
+                        WFB_DBG("FEC recovered %u packets\n", fec_count);
+                    }
+                    break;
+                }
+            }
+
+            while(p->fragment_to_send_idx < fec_k)
+            {
+                send_packet(ring_idx, p->fragment_to_send_idx);
+                p->fragment_to_send_idx += 1;
+            }
+
+            // remove block
             rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
             rx_ring_alloc -= 1;
             assert(rx_ring_alloc >= 0);
-            return;
         }
+        return;
     }
 
-    // Check that this block has K elements (with gaps) and can be recovered via FEC
-    if(p->fragment_to_send_idx < fec_k && p->has_fragments == fec_k)
+    // ----- INTERLEAVED PATH (plan §4.7 state machine) -----
+    //
+    // Block-complete detection: the first time this block reaches
+    // has_fragments == fec_k, recover any missing primaries and
+    // mark the slot ready. Subsequent fragment arrivals (extra
+    // parity beyond k) do not re-trigger this branch because ready
+    // latches once set. Re-processing would be wasted work AND
+    // could double-count fec_recovered metrics.
+    if (!p->ready && p->has_fragments == (uint8_t)fec_k)
     {
-        // send all queued packets in all unfinished blocks before current
-        // and then remove that blocks
-        int nrm = modN(ring_idx - rx_ring_front, RX_RING_SIZE);
-
-        while(nrm > 0)
+        // Check which primaries are missing; if any, apply_fec.
+        int missing_primaries = 0;
+        for (int f = 0; f < fec_k; f++)
         {
-            for(int f_idx=rx_ring[rx_ring_front].fragment_to_send_idx; f_idx < fec_k; f_idx++)
+            if (!p->fragment_map[f]) missing_primaries += 1;
+        }
+        if (missing_primaries > 0)
+        {
+            apply_fec(ring_idx);
+            count_p_fec_recovered += missing_primaries;
+            // Plan §3.7 non-blocking #3: count a block as a
+            // "burst recovery" when FEC recovered at least half of
+            // the parity budget worth of primaries in one block --
+            // a proxy for "recovered a burst hit." Threshold
+            // matches the plan's ceil((n-k)/2) definition.
+            if (missing_primaries >= (fec_n - fec_k + 1) / 2)
             {
-                if(rx_ring[rx_ring_front].fragment_map[f_idx])
+                count_bursts_recovered += 1;
+            }
+            WFB_DBG("FEC recovered %d packets (D>1)\n", missing_primaries);
+        }
+        p->ready = true;
+    }
+
+    // Try to drain any consecutive ready-or-expired slots from the
+    // front. Called here so a block completing mid-ring can emit
+    // itself as soon as the front catches up. Called again on
+    // dump_stats and at process_packet entry for the no-traffic /
+    // mid-gap cases.
+    advance_front_interleaved_(get_time_ms());
+}
+
+void Aggregator::advance_front_interleaved_(uint64_t now_ms)
+{
+    // Plan §4.7 periodic sweep + in-order emit. Walks the ring from
+    // rx_ring_front forward. For each slot:
+    //   - READY: FEC recovery already ran (or block had all
+    //     primaries natively). Emit remaining primaries, advance
+    //     front.
+    //   - DEADLINE EXPIRED: emit whatever primaries we have (no
+    //     FEC; we're past the reasonable wait window), bump
+    //     count_holdoff_fired, advance front.
+    //   - OTHERWISE: stop -- the slot is still accumulating and
+    //     hasn't aged out yet.
+    // Emissions remain in block_idx order even though the TX has
+    // interleaved their fragment emissions.
+    while (rx_ring_alloc > 0)
+    {
+        rx_ring_item_t& fp = rx_ring[rx_ring_front];
+
+        if (fp.ready)
+        {
+            // Block is complete and ready to emit.
+            while (fp.fragment_to_send_idx < fec_k)
+            {
+                send_packet(rx_ring_front, fp.fragment_to_send_idx);
+                fp.fragment_to_send_idx += 1;
+            }
+        }
+        else if (fp.deadline_ms != 0 && now_ms >= fp.deadline_ms)
+        {
+            // Holdoff expired before block completion. Emit what
+            // primaries we have; rest are lost.
+            for (int f = fp.fragment_to_send_idx; f < fec_k; f++)
+            {
+                if (fp.fragment_map[f])
                 {
-                    send_packet(rx_ring_front, f_idx);
+                    send_packet(rx_ring_front, f);
                 }
             }
-            rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
-            rx_ring_alloc -= 1;
-            nrm -= 1;
+            count_holdoff_fired += 1;
         }
-
-        assert(rx_ring_alloc > 0);
-        assert(ring_idx == rx_ring_front);
-
-        // Search for missed data fragments and apply FEC only if needed
-        for(int f_idx=p->fragment_to_send_idx; f_idx < fec_k; f_idx++)
+        else
         {
-            if(! p->fragment_map[f_idx])
-            {
-                uint32_t fec_count = 0;
-
-                //Recover missed fragments using FEC
-                apply_fec(ring_idx);
-
-                // Count total number of recovered fragments
-                for(; f_idx < fec_k; f_idx++)
-                {
-                    if(! p->fragment_map[f_idx])
-                    {
-                        fec_count += 1;
-                    }
-                }
-
-                if(fec_count)
-                {
-                    count_p_fec_recovered += fec_count;
-                    WFB_DBG("FEC recovered %u packets\n", fec_count);
-                }
-                break;
-            }
+            // Neither ready nor expired. Stop.
+            break;
         }
 
-        while(p->fragment_to_send_idx < fec_k)
-        {
-            send_packet(ring_idx, p->fragment_to_send_idx);
-            p->fragment_to_send_idx += 1;
-        }
-
-        // remove block
+        // Advance front.
         rx_ring_front = modN(rx_ring_front + 1, RX_RING_SIZE);
         rx_ring_alloc -= 1;
-        assert(rx_ring_alloc >= 0);
     }
 }
 

@@ -47,6 +47,28 @@ using namespace std;
 
 #include "wifibroadcast.hpp"
 #include "tx.hpp"
+#include "interleaver.hpp"   // Phase 1 Step C: TX-side block interleaver.
+
+namespace {
+// Phase 1 Step C: single-shot SESSION-layer setup after a Transmitter
+// is constructed. At interleave_depth == 1 this is a no-op and the
+// wire is byte-identical to master. At depth > 1 it raises fec_type
+// to WFB_FEC_VDM_RS_INTERLEAVED (plan §4.1 B1) and installs the
+// TX-side interleaver + TLV_INTERLEAVE_DEPTH tag, which rebuilds the
+// cached session_packet so the first send_session_key() ships with
+// the correct fec_type/tags.
+//
+// The pre-ctor tag-seeding helper from Step A was removed: the
+// Transmitter now owns the TLV_INTERLEAVE_DEPTH lifecycle via
+// install_interleave_depth_tag_() so that CMD_SET_INTERLEAVE_DEPTH
+// refresh does not double-tag.
+void apply_interleave_setup(unique_ptr<Transmitter>& t, int interleave_depth)
+{
+    if (interleave_depth <= 1) return;
+    t->set_fec_type(WFB_FEC_VDM_RS_INTERLEAVED);
+    t->set_interleave_depth(unsigned(interleave_depth));
+}
+} // namespace
 
 Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
     fec_p(NULL), fec_k(-1), fec_n(-1),
@@ -60,7 +82,10 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     session_key{},
     session_packet{},
     session_packet_size(0),
-    tags(tags)
+    tags(tags),
+    fec_type(WFB_FEC_VDM_RS),
+    interleave_depth_(1),
+    interleaver_(nullptr)
 {
 
     FILE *fp;
@@ -110,8 +135,13 @@ void Transmitter::deinit_session(void)
     fec_n = -1;
 }
 
-void Transmitter::init_session(int k, int n)
+void Transmitter::reconfigure_fec_(int k, int n)
 {
+    // Factored out of init_session for Phase 1 Step C. Owns only the
+    // FEC-related side of a (k, n) change: deinit old fec state,
+    // allocate new fec state, reset per-block counters. Does NOT
+    // touch session_key or block_idx -- those stay constant across
+    // a 1C refresh to keep nonce uniqueness (plan v2.1 R1).
     if (fec_p != NULL)
     {
         deinit_session();
@@ -136,19 +166,23 @@ void Transmitter::init_session(int k, int n)
         assert(_rc == 0);
     }
 
-    block_idx = 0;
     fragment_idx = 0;
+    max_packet_size = 0;
+}
 
-    // init session key
-    randombytes_buf(session_key, sizeof(session_key));
+void Transmitter::build_session_packet_(void)
+{
+    // Factored out of init_session. Rebuilds the cached session_packet
+    // from current (fec_type, fec_k, fec_n, session_key, tags). Called
+    // at session init AND on every SESSION-layer mutation
+    // (set_fec_type / set_interleave_depth / refresh_session), so the
+    // next send_session_key() always ships the current config.
+    assert(fec_p != NULL);
 
-    // fill packet header
     wsession_hdr_t *session_hdr = (wsession_hdr_t *)session_packet;
     session_hdr->packet_type = WFB_PACKET_SESSION;
 
     randombytes_buf(session_hdr->session_nonce, sizeof(session_hdr->session_nonce));
-
-    // fill packet contents
 
     uint8_t tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
 
@@ -159,7 +193,7 @@ void Transmitter::init_session(int k, int n)
 
         session_data->epoch = htobe64(epoch);
         session_data->channel_id = htobe32(channel_id);
-        session_data->fec_type = WFB_FEC_VDM_RS;
+        session_data->fec_type = fec_type;
         session_data->k = (uint8_t)fec_k;
         session_data->n = (uint8_t)fec_n;
 
@@ -168,7 +202,6 @@ void Transmitter::init_session(int k, int n)
     }
 
     // Fill optional Tags
-
     uint32_t session_data_size = sizeof(wsession_data_t);
     for(auto it = tags.begin(); it != tags.end(); it++)
     {
@@ -190,6 +223,130 @@ void Transmitter::init_session(int k, int n)
 
     session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
     assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
+}
+
+void Transmitter::init_session(int k, int n)
+{
+    // Phase 1 refactor: the FEC bring-up and session_packet build
+    // have been factored out so refresh_session() can reuse them
+    // without regenerating session_key. init_session() remains the
+    // "fresh process start" path -- it DOES regenerate session_key
+    // and reset block_idx to 0, because at process start there is
+    // no nonce history to preserve.
+    reconfigure_fec_(k, n);
+
+    block_idx = 0;
+
+    // init session key (this is the ONE place we regenerate it
+    // under the 1C design; see plan v2.1 R1 §4.8 accepted risk).
+    randombytes_buf(session_key, sizeof(session_key));
+
+    build_session_packet_();
+}
+
+void Transmitter::set_fec_type(uint8_t t)
+{
+    fec_type = t;
+    // Rebuild the cached session_packet so the new fec_type hits
+    // the wire on the next send_session_key(). Fixes a Step A bug
+    // where the setter only updated the member.
+    if (fec_p != NULL) build_session_packet_();
+}
+
+void Transmitter::install_interleave_depth_tag_(unsigned D)
+{
+    // Drop any existing TLV_INTERLEAVE_DEPTH entry; tags may
+    // originally have been seeded by the loop function or by a
+    // previous call to this method.
+    for (auto it = tags.begin(); it != tags.end(); /* no ++ */) {
+        if (it->id == TLV_INTERLEAVE_DEPTH) {
+            it = tags.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (D > 1) {
+        tags_item_t tag;
+        tag.id = TLV_INTERLEAVE_DEPTH;
+        tag.value.push_back((uint8_t)D);
+        tags.push_back(tag);
+    }
+}
+
+void Transmitter::set_interleave_depth(unsigned D)
+{
+    assert(D >= 1);
+    interleave_depth_ = D;
+    if (D > 1)
+    {
+        // Allocate (or reallocate if D/n changed) the TX-side
+        // interleaver. max_frag_size is the largest ciphertext we
+        // will ever push, bounded by MAX_FORWARDER_PACKET_SIZE.
+        assert(fec_n >= 1);
+        interleaver_.reset(new wfb::BlockInterleaver(
+            (unsigned)fec_n, D, MAX_FORWARDER_PACKET_SIZE));
+    }
+    else
+    {
+        interleaver_.reset();
+    }
+
+    install_interleave_depth_tag_(D);
+
+    if (fec_p != NULL) build_session_packet_();
+}
+
+void Transmitter::refresh_session(int new_k, int new_n, unsigned new_D)
+{
+    // Plan v2.1 R1 (1C) refresh. Called by CMD_SET_FEC and
+    // CMD_SET_INTERLEAVE_DEPTH handlers. Does NOT call init_session
+    // and does NOT regenerate session_key.
+
+    // (a) Close the currently-open FEC block with FEC-only closers.
+    // send_packet(NULL, 0, FEC_ONLY) returns false when fragment_idx
+    // is 0 (no open block), so the while-loop is self-terminating.
+    while (send_packet(NULL, 0, WFB_PACKET_FEC_ONLY)) { }
+
+    // (b) Discard any partial D-frame in the current interleaver.
+    // Up to (D-1) blocks of in-flight data are dropped here. RX's
+    // Step D deadline state machine absorbs that -- those blocks
+    // will time out without recovery. Expected cost per refresh:
+    // ~(D-1) * block_duration of discarded data, rare at 200 ms+
+    // refresh intervals (see plan v2.1 R1 cost analysis).
+    if (interleaver_) interleaver_->flush();
+
+    // (b.1) Align block_idx to a new_D-frame boundary. The fresh
+    // BlockInterleaver created in step (d) anchors its frame on the
+    // first push() and uses d = block_idx % D as the column slot;
+    // if block_idx is not a multiple of new_D, columns 0..d-1 of the
+    // first frame are never filled, is_frame_full() never returns
+    // true, and the next frame transition trips the cross-frame
+    // assertion in BlockInterleaver::push(). Skipping up to (new_D-1)
+    // block_idx values is safe: nonces stay strictly increasing
+    // (chacha20-poly1305 uniqueness preserved) and RX treats the gap
+    // as ordinary loss.
+    if (new_D > 1 && (block_idx % new_D) != 0)
+    {
+        block_idx += (new_D - (block_idx % new_D));
+    }
+
+    // (c) Reconfigure FEC. block_idx is preserved (same
+    // session_key means nonces must not repeat).
+    assert(new_k >= 1 && new_n >= 1 && new_n < 256 && new_k <= new_n);
+    reconfigure_fec_(new_k, new_n);
+
+    // (d) Reconfigure interleaver + fec_type + TLV. fec_type is
+    // fully a function of D under Phase 1: interleaved iff D > 1.
+    fec_type = (new_D > 1) ? WFB_FEC_VDM_RS_INTERLEAVED : WFB_FEC_VDM_RS;
+    set_interleave_depth(new_D);  // rebuilds session_packet as a side-effect
+
+    // (e) Re-broadcast SESSION. Same cadence as master's init_session
+    // post-step (close + send fec_n - fec_k + 1 copies so late-
+    // joining RXen catch it). No new session_key.
+    for (int i = 0; i < fec_n - fec_k + 1; i++)
+    {
+        send_session_key();
+    }
 }
 
 
@@ -639,7 +796,30 @@ void Transmitter::send_block_fragment(size_t packet_size)
         throw runtime_error("Unable to encrypt packet!");
     }
 
-    inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
+    const size_t wire_size = sizeof(wblock_hdr_t) + ciphertext_len;
+
+    // Phase 1 Step C: block interleaver, gated on depth > 1. At
+    // depth == 1 interleaver_ is nullptr and we inject directly --
+    // byte-identical to master. At depth > 1 we push the freshly-
+    // encrypted ciphertext into the interleaver (a memcpy into the
+    // interleaver's owned aligned slot; our stack `ciphertext` is
+    // safe to go out of scope after push returns). Once a full
+    // D-frame has accumulated, drain() iterates in schedule order
+    // and calls inject_packet for each fragment.
+    if (interleaver_)
+    {
+        interleaver_->push(block_idx, fragment_idx, ciphertext, wire_size);
+        if (interleaver_->is_frame_full())
+        {
+            interleaver_->drain([this](const uint8_t* buf, size_t sz) {
+                this->inject_packet(buf, sz);
+            });
+        }
+    }
+    else
+    {
+        inject_packet(ciphertext, wire_size);
+    }
 }
 
 void Transmitter::send_session_key(void)
@@ -859,10 +1039,10 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         continue;
                     }
 
-                    int fec_k = req.u.cmd_set_fec.k;
-                    int fec_n = req.u.cmd_set_fec.n;
+                    int new_fec_k = req.u.cmd_set_fec.k;
+                    int new_fec_n = req.u.cmd_set_fec.n;
 
-                    if(!(fec_k <= fec_n && fec_k >=1 && fec_n >= 1 && fec_n < 256))
+                    if(!(new_fec_k <= new_fec_n && new_fec_k >=1 && new_fec_n >= 1 && new_fec_n < 256))
                     {
                         resp.rc = htonl(EINVAL);
                         sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
@@ -870,19 +1050,36 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         continue;
                     }
 
-                    // Close open FEC block if any
-                    while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
-
-                    t->init_session(fec_k, fec_n);
-
-                    // Emulate FEC for initial session key distribution
-                    for(int i = 0; i < fec_n - fec_k + 1; i++)
+                    // Plan §4.2: with interleaving active (depth > 1)
+                    // the RX ring memory footprint is bounded by
+                    // fec_n <= 32. Enforce at runtime so a 1C refresh
+                    // can't break the startup invariant.
+                    if (t->get_interleave_depth() > 1 && new_fec_n > 32)
                     {
-                        t->send_session_key();
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("Rejecting FEC=%d/%d: depth=%u requires n<=32 (plan §4.2)\n",
+                                new_fec_k, new_fec_n, t->get_interleave_depth());
+                        continue;
+                    }
+
+                    // Plan v2.1 R1 (1C): close + drain + reconfigure +
+                    // rebroadcast SESSION on the EXISTING session_key.
+                    // refresh_session preserves block_idx (nonce
+                    // uniqueness) and depth, so changing only (k, n)
+                    // leaves depth unchanged.
+                    try {
+                        t->refresh_session(new_fec_k, new_fec_n, t->get_interleave_depth());
+                    } catch (std::exception &e) {
+                        resp.rc = htonl(EIO);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("refresh_session failed: %s\n", e.what());
+                        continue;
                     }
 
                     sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    WFB_INFO("Session restarted with FEC %d/%d\n", fec_k, fec_n);
+                    WFB_INFO("Session refreshed: FEC=%d/%d, depth=%u\n",
+                             new_fec_k, new_fec_n, t->get_interleave_depth());
                 }
                 break;
 
@@ -966,6 +1163,77 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                     resp.u.cmd_get_radio.vht_nss = hdr.vht_nss;
 
                     sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_radio), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                }
+                break;
+
+                // Phase 1 Step C: interleaver-depth runtime control.
+                // SET: close the current block, drain interleaver,
+                // reconfigure FEC (unchanged k/n) + interleaver (new
+                // D), re-broadcast SESSION on the SAME session_key
+                // (plan v2.1 R1 / 1C).
+                case CMD_SET_INTERLEAVE_DEPTH:
+                {
+                    if (rsize != offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_interleave_depth))
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        continue;
+                    }
+
+                    const uint8_t new_D = req.u.cmd_set_interleave_depth.depth;
+                    if (new_D < 1)
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("Rejecting interleave depth %u\n", (unsigned)new_D);
+                        continue;
+                    }
+
+                    int cur_k, cur_n;
+                    t->get_fec(cur_k, cur_n);
+
+                    // Startup validations from main() also apply at
+                    // runtime: refuse D>1 with n>32 (plan §4.2) or
+                    // fec_timeout>0 (plan §4.6). Surface as EINVAL.
+                    if (new_D > 1 && cur_n > 32)
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("Refusing depth=%u with n=%d (> 32)\n", (unsigned)new_D, cur_n);
+                        continue;
+                    }
+                    if (new_D > 1 && fec_timeout > 0)
+                    {
+                        resp.rc = htonl(EINVAL);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("Refusing depth=%u with fec_timeout=%d (>0)\n",
+                                (unsigned)new_D, fec_timeout);
+                        continue;
+                    }
+
+                    try {
+                        t->refresh_session(cur_k, cur_n, (unsigned)new_D);
+                    } catch (std::exception &e) {
+                        resp.rc = htonl(EIO);
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_ERR("refresh_session failed: %s\n", e.what());
+                        continue;
+                    }
+
+                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                    WFB_INFO("Session refreshed: FEC=%d/%d, depth=%u\n",
+                             cur_k, cur_n, (unsigned)new_D);
+                }
+                break;
+
+                case CMD_GET_INTERLEAVE_DEPTH:
+                {
+                    resp.rc = htonl(0);
+                    resp.u.cmd_get_interleave_depth.depth =
+                        (uint8_t)t->get_interleave_depth();
+                    sendto(fd, &resp,
+                           offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_interleave_depth),
+                           MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
                 }
                 break;
 
@@ -1428,7 +1696,8 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                     int udp_port, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                     uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                     radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                    int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
+                    int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay,
+                    int interleave_depth)
 {
     vector<int> rx_fd;
     vector<string> wlans;
@@ -1477,6 +1746,7 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                                                                       inject_retries, inject_retry_delay));
     }
 
+    apply_interleave_setup(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1485,7 +1755,8 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
                      const char *unix_socket, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                      uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                      radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
+                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay,
+                     int interleave_depth)
 {
     vector<int> rx_fd;
     vector<string> wlans;
@@ -1521,6 +1792,7 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
                                                                       inject_retries, inject_retry_delay));
     }
 
+    apply_interleave_setup(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1530,7 +1802,8 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
                       int udp_port, int k, int n, const string &keypair, int fec_timeout,
                       uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                       radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                      int snd_buf_size)
+                      int snd_buf_size,
+                      int interleave_depth)
 {
     vector<int> rx_fd;
     vector<pair<string, vector<uint16_t>>> remote_hosts;
@@ -1597,6 +1870,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
+    apply_interleave_setup(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1606,7 +1880,8 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
                            const char* unix_socket, int k, int n, const string &keypair, int fec_timeout,
                            uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                            radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                           int snd_buf_size)
+                           int snd_buf_size,
+                           int interleave_depth)
 {
     vector<int> rx_fd;
     vector<pair<string, vector<uint16_t>>> remote_hosts;
@@ -1659,6 +1934,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
+    apply_interleave_setup(t, interleave_depth);
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
@@ -1696,8 +1972,9 @@ int main(int argc, char * const *argv)
     char *unix_socket = NULL;
     uint32_t inject_retries = 0;
     uint32_t inject_retry_delay = 5000; // 5ms
+    int interleave_depth = 1;  // Phase 1: 1 = no interleaving (byte-identical to master).
 
-    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
+    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:X:")) != -1) {
         switch (opt) {
         case 'I':
             tx_mode = INJECTOR;
@@ -1814,12 +2091,22 @@ int main(int argc, char * const *argv)
             inject_retry_delay = atoi(optarg);
             break;
 
+        case 'X':
+            // Phase 1 Step A: interleaver depth. Default 1 = no
+            // interleaving (wire-identical to master). Larger values
+            // switch fec_type to WFB_FEC_VDM_RS_INTERLEAVED and add a
+            // TLV_INTERLEAVE_DEPTH tag to SESSION. Phase 1 Step C
+            // actually implements the interleaver schedule; Step A
+            // just plumbs the flag.
+            interleave_depth = atoi(optarg);
+            break;
+
         default: /* '?' */
         show_usage:
             WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
                      "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                      "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
-                     "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n",
+                     "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] [-X interleave_depth] interface1 [interface2] ...\n",
                     argv[0]);
             WFB_INFO("TX distributor: %s -d [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-s snd_buf] [-p radio_port]\n"
                      "                      [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
@@ -1839,6 +2126,26 @@ int main(int argc, char * const *argv)
 
     if (optind >= argc) {
         goto show_usage;
+    }
+
+    // Phase 1 Step A: interleave-depth validation. These checks mirror
+    // the plan's §4.2 memory cap (fec_n > 32 would blow the RX ring)
+    // and §4.6 (fec_timeout mixed with interleaving is not supported).
+    // At interleave_depth == 1 none of this fires; the binary is
+    // wire-identical to master.
+    if (interleave_depth < 1 || interleave_depth > 255) {
+        WFB_ERR("Invalid interleave depth %d: must be in 1..255\n", interleave_depth);
+        return 1;
+    }
+    if (interleave_depth > 1 && n > 32) {
+        WFB_ERR("Refusing to start: interleave-depth > 1 requires fec_n <= 32 "
+                "(got n=%d). See plan §4.2.\n", n);
+        return 1;
+    }
+    if (interleave_depth > 1 && fec_timeout > 0) {
+        WFB_ERR("Refusing to start: interleave-depth > 1 is incompatible with "
+                "fec_timeout > 0 (got fec_timeout=%d). See plan §4.6.\n", fec_timeout);
+        return 1;
     }
 
     {
@@ -1880,7 +2187,8 @@ int main(int argc, char * const *argv)
                                 unix_socket, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
-                                snd_buf, inject_retries, inject_retry_delay);
+                                snd_buf, inject_retries, inject_retry_delay,
+                                interleave_depth);
             }
             else
             {
@@ -1888,7 +2196,8 @@ int main(int argc, char * const *argv)
                                udp_port, debug_port, k, n, keypair, fec_timeout,
                                epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                radiotap_header, frame_type, control_port, mirror,
-                               snd_buf, inject_retries, inject_retry_delay);
+                               snd_buf, inject_retries, inject_retry_delay,
+                               interleave_depth);
             }
             break;
 
@@ -1899,7 +2208,8 @@ int main(int argc, char * const *argv)
                                       unix_socket, k, n, keypair, fec_timeout,
                                       epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                       radiotap_header, frame_type, control_port, mirror,
-                                      snd_buf);
+                                      snd_buf,
+                                      interleave_depth);
             }
             else
             {
@@ -1907,7 +2217,8 @@ int main(int argc, char * const *argv)
                                  udp_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
-                                 snd_buf);
+                                 snd_buf,
+                                 interleave_depth);
             }
             break;
 

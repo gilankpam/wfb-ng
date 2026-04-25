@@ -27,11 +27,14 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <string.h>
 #include <stdexcept>
 
 #include "wifibroadcast.hpp"
 #include "tx_cmd.h"
+
+namespace wfb { class BlockInterleaver; }  // fwd-decl, see src/interleaver.hpp
 
 
 // Tags item
@@ -78,6 +81,26 @@ public:
     void send_session_key(void);
     void init_session(int k, int n);
     void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
+    // Phase 1: allow main()/CMD handlers to mutate SESSION-layer
+    // configuration. Each mutator re-builds the cached session_packet
+    // so the next send_session_key() call ships the new values.
+    // Fixes a latent Step A bug where set_fec_type() updated the
+    // member but not the pre-built session_packet.
+    void set_fec_type(uint8_t t);
+    uint8_t get_fec_type(void) const { return fec_type; }
+    // Phase 1 Step C: interleaver depth. D == 1 destroys any
+    // existing interleaver (direct inject path, byte-identical to
+    // master). D > 1 installs a wfb::BlockInterleaver sized for the
+    // current fec_n. Updates the TLV_INTERLEAVE_DEPTH entry in tags.
+    void set_interleave_depth(unsigned D);
+    unsigned get_interleave_depth(void) const { return interleave_depth_; }
+    // Phase 1 Step C / plan v2.1 R1 (option 1C): in-place FEC +
+    // interleaver refresh. Closes the currently-open block with
+    // FEC-only closers, flushes any partial D-frame, reconfigures
+    // FEC to (new_k, new_n), reconfigures interleaver to new_D,
+    // rebuilds session_packet and re-broadcasts -- all on the SAME
+    // session_key. block_idx is preserved (nonce uniqueness).
+    void refresh_session(int new_k, int new_n, unsigned new_D);
     virtual void select_output(int idx) = 0;
     virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
     virtual void update_radiotap_header(radiotap_header_t &radiotap_header) = 0;
@@ -91,6 +114,19 @@ private:
     Transmitter& operator=(const Transmitter&);
     void send_block_fragment(size_t packet_size);
     void deinit_session(void);
+    // Extracted from init_session(). Rebuilds session_packet from
+    // (fec_type, fec_k, fec_n, session_key, tags) into the internal
+    // session_packet buffer. Does NOT regenerate session_key.
+    void build_session_packet_(void);
+    // Reconfigure FEC state in place. Free old fec/block buffers,
+    // fec_new with (k, n), reallocate block buffers, reset
+    // fragment_idx + max_packet_size. Preserves block_idx and
+    // session_key (plan v2.1 R1).
+    void reconfigure_fec_(int k, int n);
+    // Idempotent: remove any existing TLV_INTERLEAVE_DEPTH entry in
+    // tags, then push a new one if D > 1. Caller is responsible for
+    // build_session_packet_() after.
+    void install_interleave_depth_tag_(unsigned D);
 
     fec_t* fec_p;
     int fec_k;  // RS number of primary fragments in block
@@ -110,6 +146,19 @@ private:
     uint8_t session_packet[MAX_SESSION_PACKET_SIZE];
     uint16_t session_packet_size;
     std::vector<tags_item_t> tags;
+    // Broadcast in every SESSION packet. Initialized to the stock
+    // value in the constructor; set_fec_type() can raise it to
+    // WFB_FEC_VDM_RS_INTERLEAVED when interleaving is enabled. Change
+    // takes effect on the next send_session_key() call.
+    uint8_t fec_type;
+    // Phase 1 Step C: interleaver depth + TX-side buffer. At depth
+    // == 1 `interleaver_` is nullptr and `send_block_fragment` goes
+    // straight to inject_packet() -- wire-identical to master. At
+    // depth > 1 `interleaver_` owns a D*n aligned fragment grid;
+    // send_block_fragment pushes into it and drains to inject_packet
+    // in block-interleaver schedule order (see src/interleaver.hpp).
+    unsigned interleave_depth_;
+    std::unique_ptr<wfb::BlockInterleaver> interleaver_;
 };
 
 

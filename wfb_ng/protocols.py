@@ -409,9 +409,22 @@ class RXAntennaProtocol(LineReceiver):
                 if len(cols) != 3:
                     raise BadTelemetry()
 
-                k_tuple = ('all', 'all_bytes', 'dec_err', 'session', 'data', 'uniq', 'fec_rec', 'lost', 'bad', 'out', 'out_bytes')
+                # Fields #1-#11 are the stock (pre-Phase-1) layout.
+                # Fields #12-#14 are Phase 1 Step A additions
+                # (bursts_recovered, holdoff_fired, late_after_deadline).
+                # Per plan §2.1 stability commitment, we accept either
+                # 11-field or 14-field (or longer) PKT lines; any
+                # trailing fields beyond what we know about are ignored.
+                k_tuple = ('all', 'all_bytes', 'dec_err', 'session', 'data', 'uniq',
+                           'fec_rec', 'lost', 'bad', 'out', 'out_bytes',
+                           'bursts_rec', 'holdoff', 'late_deadline')
                 counters = tuple(int(i) for i in cols[2].split(':'))
-                assert len(counters) == len(k_tuple)
+                if len(counters) < 11:
+                    raise BadTelemetry()
+                if len(counters) < len(k_tuple):
+                    counters = counters + (0,) * (len(k_tuple) - len(counters))
+                elif len(counters) > len(k_tuple):
+                    counters = counters[:len(k_tuple)]
 
                 if not self.count_all:
                     self.count_all = counters
@@ -430,12 +443,34 @@ class RXAntennaProtocol(LineReceiver):
                 if len(cols) != 3:
                     raise BadTelemetry()
 
-                epoch, fec_type, fec_k, fec_n = list(int(i) for i in cols[2].split(':'))
-                self.session = dict(fec_type=fec_types.get(fec_type, 'Unknown'), fec_k=fec_k, fec_n=fec_n, epoch=epoch)
-                log.msg('New session detected [%s]: FEC=%s K=%d, N=%d, epoch=%d' % (self.rx_id, fec_types.get(fec_type, 'Unknown'), fec_k, fec_n, epoch))
+                # Phase 1 Step A adds trailing (interleave_depth,
+                # contract_version) fields. Stock master emitted 4
+                # fields (epoch, fec_type, k, n); Phase 1 emits 6.
+                # Accept either shape; missing fields default.
+                parts = list(int(i) for i in cols[2].split(':'))
+                if len(parts) < 4:
+                    raise BadTelemetry()
+                epoch, fec_type, fec_k, fec_n = parts[:4]
+                interleave_depth = parts[4] if len(parts) > 4 else 1
+                contract_version = parts[5] if len(parts) > 5 else 1
 
-                if self.ant_stat_cb is not None:
-                    self.ant_stat_cb.process_new_session(self.rx_id, self.session)
+                new_session = dict(fec_type=fec_types.get(fec_type, 'Unknown'),
+                                   fec_k=fec_k, fec_n=fec_n, epoch=epoch,
+                                   interleave_depth=interleave_depth,
+                                   contract_version=contract_version)
+
+                # Phase 1 Step A bootstrap: SESSION is now emitted once
+                # per log_interval in addition to on-change. Only log
+                # + notify aggregators when the SESSION contents
+                # actually changed.
+                if new_session != self.session:
+                    self.session = new_session
+                    log.msg('New session detected [%s]: FEC=%s K=%d, N=%d, epoch=%d, D=%d' % (
+                        self.rx_id, fec_types.get(fec_type, 'Unknown'),
+                        fec_k, fec_n, epoch, interleave_depth))
+
+                    if self.ant_stat_cb is not None:
+                        self.ant_stat_cb.process_new_session(self.rx_id, self.session)
             else:
                 raise BadTelemetry()
         except BadTelemetry:
