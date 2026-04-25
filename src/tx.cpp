@@ -315,6 +315,21 @@ void Transmitter::refresh_session(int new_k, int new_n, unsigned new_D)
     // refresh intervals (see plan v2.1 R1 cost analysis).
     if (interleaver_) interleaver_->flush();
 
+    // (b.1) Align block_idx to a new_D-frame boundary. The fresh
+    // BlockInterleaver created in step (d) anchors its frame on the
+    // first push() and uses d = block_idx % D as the column slot;
+    // if block_idx is not a multiple of new_D, columns 0..d-1 of the
+    // first frame are never filled, is_frame_full() never returns
+    // true, and the next frame transition trips the cross-frame
+    // assertion in BlockInterleaver::push(). Skipping up to (new_D-1)
+    // block_idx values is safe: nonces stay strictly increasing
+    // (chacha20-poly1305 uniqueness preserved) and RX treats the gap
+    // as ordinary loss.
+    if (new_D > 1 && (block_idx % new_D) != 0)
+    {
+        block_idx += (new_D - (block_idx % new_D));
+    }
+
     // (c) Reconfigure FEC. block_idx is preserved (same
     // session_key means nonces must not repeat).
     assert(new_k >= 1 && new_n >= 1 && new_n < 256 && new_k <= new_n);
