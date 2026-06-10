@@ -167,7 +167,7 @@ static inline void swfec_put_be16(uint8_t* p, uint16_t v) {
 // Monotonic clock in microseconds — shared by tx.cpp and rx.cpp
 static inline uint64_t monotonic_us(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 

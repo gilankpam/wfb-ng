@@ -683,6 +683,8 @@ bool Transmitter::swfec_send(const uint8_t *buf, size_t size, uint8_t flags)
         if (size > SWFEC_MAX_INPUT)
         {
             swfec_oversize += 1;
+            if (swfec_oversize == 1)
+                WFB_ERR("swfec: packet too large (%zu > %zu), dropping\n", size, (size_t)SWFEC_MAX_INPUT);
             return false;
         }
         swfec_enc->push_source(buf, size, swfec::monotonic_us(), pkts);
@@ -716,13 +718,20 @@ void Transmitter::send_swfec_wire(const uint8_t *data, size_t size)
     inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
 
     if (swfec_nonce > MAX_BLOCK_IDX)   // never in practice; keeps rekey hygiene
+    {
         init_session(fec_k, fec_n);
+        send_session_key();
+    }
 }
 
 void Transmitter::swfec_set_params(int overhead_pct, int deadline_ms)
 {
+    assert(use_swfec && swfec_enc != NULL);
     swfec_enc->set_overhead(overhead_pct / 100.0f);
     fec_k = overhead_pct;
+    // overhead is TX-only: the RX decoder learns each repair's window from the
+    // wire packet itself and never reads session 'k', so an overhead change
+    // needs no re-announce. Only a deadline change (below) re-announces.
     if (deadline_ms != fec_n)
     {
         fec_n = deadline_ms;
