@@ -32,6 +32,11 @@
 
 #include "wifibroadcast.hpp"
 #include "tx_cmd.h"
+#include "fec_swfec.hpp"
+
+// max input UDP payload in swfec mode: repair header + len prefix must fit
+// the fragment plaintext (MAX_FEC_PAYLOAD)
+#define SWFEC_MAX_INPUT (MAX_FEC_PAYLOAD - 12 - 2)
 
 
 // Tags item
@@ -72,12 +77,14 @@ typedef enum {
 class Transmitter
 {
 public:
-    Transmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags);
+    Transmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags, bool use_swfec_mode = false);
     virtual ~Transmitter();
     bool send_packet(const uint8_t *buf, size_t size, uint8_t flags);
     void send_session_key(void);
     void init_session(int k, int n);
     void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
+    bool is_swfec(void) const { return use_swfec; }
+    void swfec_set_params(int overhead_pct, int deadline_ms);
     virtual void select_output(int idx) = 0;
     virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
     virtual void update_radiotap_header(radiotap_header_t &radiotap_header) = 0;
@@ -91,10 +98,14 @@ private:
     Transmitter& operator=(const Transmitter&);
     void send_block_fragment(size_t packet_size);
     void deinit_session(void);
+    bool swfec_send(const uint8_t *buf, size_t size, uint8_t flags);
+    void send_swfec_wire(const uint8_t *data, size_t size);
+    void rebuild_session_packet(void);
 
+    // RS (Reed-Solomon) mode members
     fec_t* fec_p;
-    int fec_k;  // RS number of primary fragments in block
-    int fec_n;  // RS total number of fragments in block
+    int fec_k;  // RS number of primary fragments in block / swfec: overhead_pct
+    int fec_n;  // RS total number of fragments in block / swfec: deadline_ms
     uint64_t block_idx; // (block_idx << 8) + fragment_idx = nonce (64bit)
     uint8_t fragment_idx;
     uint8_t** block;
@@ -110,6 +121,12 @@ private:
     uint8_t session_packet[MAX_SESSION_PACKET_SIZE];
     uint16_t session_packet_size;
     std::vector<tags_item_t> tags;
+
+    // --- swfec mode (fec_type WFB_FEC_SWFEC): sliding-window codec ---
+    bool use_swfec;                    // selected at construction (-z)
+    swfec::SwfecEncoder *swfec_enc;    // NULL unless use_swfec
+    uint64_t swfec_nonce;              // monotone AEAD nonce counter
+    uint64_t swfec_oversize;           // dropped inputs > SWFEC_MAX_INPUT
 };
 
 
@@ -158,7 +175,8 @@ class RawSocketTransmitter : public Transmitter
 public:
     RawSocketTransmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags,
                          const std::vector<std::string> &wlans, radiotap_header_t &radiotap_header,
-                         uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay);
+                         uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay,
+                         bool use_swfec_mode = false);
     virtual ~RawSocketTransmitter();
 
     virtual void select_output(int idx)
@@ -205,8 +223,9 @@ class UdpTransmitter : public Transmitter
 {
 public:
     UdpTransmitter(int k, int n, const std::string &keypair, const std::string &client_addr, int base_port, uint64_t epoch, uint32_t channel_id,
-                   uint32_t fec_delay, std::vector<tags_item_t> &tags, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size): \
-        Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags), radiotap_header({}), base_port(base_port), use_qdisc(use_qdisc), fwmark_base(fwmark_base)
+                   uint32_t fec_delay, std::vector<tags_item_t> &tags, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size,
+                   bool use_swfec_mode = false): \
+        Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags, use_swfec_mode), radiotap_header({}), base_port(base_port), use_qdisc(use_qdisc), fwmark_base(fwmark_base)
     {
         sockfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (sockfd < 0) throw std::runtime_error(string_format("Error opening socket: %s", strerror(errno)));
@@ -311,7 +330,8 @@ class RemoteTransmitter : public Transmitter
 public:
     RemoteTransmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags,
                       const std::vector<std::pair<std::string, std::vector<uint16_t>>> &remote_hosts, radiotap_header_t &radiotap_header,
-                      uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size);
+                      uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size,
+                      bool use_swfec_mode = false);
     virtual ~RemoteTransmitter()
     {
         close(sockfd);

@@ -191,6 +191,7 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 
 // FEC types
 #define WFB_FEC_VDM_RS  0x1  //Reed-Solomon on Vandermonde matrix
+#define WFB_FEC_SWFEC   0x2  // sliding-window FEC (swfec); k=overhead_pct, n=deadline_ms
 
 // packet flags
 #define WFB_PACKET_FEC_ONLY 0x1
