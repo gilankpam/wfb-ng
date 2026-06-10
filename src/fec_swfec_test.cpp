@@ -127,6 +127,88 @@ static void test_encoder_vectors(const char* path)
     printf("encoder vectors %s: OK (%d ops, %d packets byte-exact)\n", path, ops, pkts_checked);
 }
 
+static void test_decoder_vectors(const char* path)
+{
+    VecReader r(path);
+    r.header(3);
+    swfec::SwfecDecoder dec(30000);
+    int pushes = 0, deliveries = 0;
+    for (;;) {
+        uint8_t op = r.u8();
+        if (op == 255) break;
+        assert(op == 0);
+        uint64_t now = r.u64();
+        uint32_t plen = r.u32();
+        std::vector<uint8_t> pkt(plen);
+        r.bytes(pkt.data(), plen);
+        std::vector<swfec::Delivered> got;
+        dec.push(pkt.data(), plen, now, got);
+        uint32_t expect_n = r.u32();
+        assert(got.size() == expect_n);
+        for (uint32_t i = 0; i < expect_n; i++) {
+            uint32_t seq = r.u32();
+            uint8_t late = r.u8();
+            uint32_t dlen = r.u32();
+            std::vector<uint8_t> dpay(dlen);
+            r.bytes(dpay.data(), dlen);
+            assert(got[i].seq == seq);
+            assert((uint8_t)got[i].late == late);
+            assert(got[i].payload.size() == dlen);
+            assert(memcmp(got[i].payload.data(), dpay.data(), dlen) == 0);
+            deliveries++;
+        }
+        pushes++;
+    }
+    const swfec::DecoderStats& s = dec.stats();
+    uint64_t expect_stats[6];
+    for (int i = 0; i < 6; i++) expect_stats[i] = r.u64();
+    assert(s.sources_received == expect_stats[0]);
+    assert(s.repairs_received == expect_stats[1]);
+    assert(s.repairs_redundant == expect_stats[2]);
+    assert(s.recovered == expect_stats[3]);
+    assert(s.abandoned == expect_stats[4]);
+    assert(s.malformed == expect_stats[5]);
+    printf("decoder vectors: OK (%d pushes, %d deliveries, stats exact)\n", pushes, deliveries);
+}
+
+// Self-contained roundtrip fuzz: encoder->lossy channel->decoder, seeded LCG.
+// Invariants: delivered payloads byte-identical, no duplicate seqs, pivot
+// state bounded by the window cap.
+static uint8_t fuzz_payload_byte(uint32_t seq, size_t j) {
+    return (uint8_t)(seq * 31u + (uint32_t)j * 7u + 3u);
+}
+static void test_fuzz_roundtrip(void)
+{
+    swfec::SwfecEncoder enc(0.5f, 30000);
+    swfec::SwfecDecoder dec(30000);
+    uint64_t lcg = 0xDEADBEEFCAFEF00DULL;
+    std::map<uint32_t, bool> seen;
+    for (uint32_t i = 0; i < 10000; i++) {
+        size_t len = 20 + (i * 13) % 1380;
+        std::vector<uint8_t> payload(len);
+        for (size_t j = 0; j < len; j++) payload[j] = fuzz_payload_byte(i, j);
+        std::vector<std::vector<uint8_t> > pkts;
+        uint64_t now = (uint64_t)i * 1000;
+        enc.push_source(payload.data(), len, now, pkts);
+        for (size_t p = 0; p < pkts.size(); p++) {
+            lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+            if ((lcg >> 33) % 100 < 20) continue;   // 20% loss
+            std::vector<swfec::Delivered> out;
+            dec.push(pkts[p].data(), pkts[p].size(), now + 100, out);
+            for (size_t d = 0; d < out.size(); d++) {
+                assert(!seen.count(out[d].seq));
+                seen[out[d].seq] = true;
+                size_t elen = 20 + (out[d].seq * 13) % 1380;
+                assert(out[d].payload.size() == elen);
+                for (size_t j = 0; j < elen; j++)
+                    assert(out[d].payload[j] == fuzz_payload_byte(out[d].seq, j));
+            }
+        }
+        assert(dec.pivot_count() <= 64);
+    }
+    printf("fuzz roundtrip: OK (%zu/10000 delivered, no dups, state bounded)\n", seen.size());
+}
+
 int main(void)
 {
     test_gf_anchors();
@@ -135,6 +217,8 @@ int main(void)
     test_encoder_vectors("test_vectors/encoder_oh50.bin");
     test_encoder_vectors("test_vectors/encoder_oh150.bin");
     test_encoder_vectors("test_vectors/encoder_flush_oh30.bin");
+    test_decoder_vectors("test_vectors/decoder_mixed.bin");
+    test_fuzz_roundtrip();
     printf("fec_swfec_test: ALL OK\n");
     return 0;
 }

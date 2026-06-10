@@ -125,4 +125,224 @@ bool SwfecEncoder::make_repair(std::vector<uint8_t>& pkt)
     return true;
 }
 
+SwfecDecoder::SwfecDecoder(uint64_t deadline_us)
+    : deadline_us_(deadline_us), highest_(0)
+{
+    memset(&stats_, 0, sizeof(stats_));
+    zfex_swfec_init();
+}
+
+uint64_t SwfecDecoder::unwrap_seq(uint32_t seq)
+{
+    const __int128 SPAN = (__int128)1 << 32;
+    __int128 base = (__int128)highest_ & ~(SPAN - 1);
+    __int128 best = base + seq;
+    __int128 cands[2] = { base - SPAN + (__int128)seq, base + SPAN + (__int128)seq };
+    for (int i = 0; i < 2; i++) {
+        __int128 c = cands[i];
+        if (c < 0) continue;
+        __int128 da = c - (__int128)highest_;          if (da < 0) da = -da;
+        __int128 db = best - (__int128)highest_;       if (db < 0) db = -db;
+        if (da < db) best = c;
+    }
+    uint64_t u = (uint64_t)best;
+    if (u > highest_) highest_ = u;
+    return u;
+}
+
+void SwfecDecoder::push(const uint8_t* pkt, size_t len, uint64_t now_us,
+                        std::vector<Delivered>& out)
+{
+    expire(now_us);
+    if (len < 1) { stats_.malformed++; return; }
+    if (pkt[0] == SWFEC_WIRE_SOURCE) {
+        if (len < SWFEC_SOURCE_HDR) { stats_.malformed++; return; }
+        stats_.sources_received++;
+        uint32_t seq = swfec_be32(pkt + 1);
+        uint64_t useq = unwrap_seq(seq);
+        if (known_.count(useq))
+            return;   // duplicate
+        size_t plen = len - SWFEC_SOURCE_HDR;
+        abuf_t symbol(2 + plen);
+        swfec_put_be16(&symbol[0], (uint16_t)plen);
+        if (plen)
+            memcpy(&symbol[2], pkt + SWFEC_SOURCE_HDR, plen);
+        Delivered d;
+        d.seq = seq;
+        d.late = false;
+        d.payload.assign(pkt + SWFEC_SOURCE_HDR, pkt + len);
+        out.push_back(Delivered());
+        out.back().seq = d.seq; out.back().late = d.late;
+        out.back().payload.swap(d.payload);
+        learn(useq, symbol, now_us, false, out);
+    } else if (pkt[0] == SWFEC_WIRE_REPAIR) {
+        if (len < SWFEC_REPAIR_HDR) { stats_.malformed++; return; }
+        uint16_t symbol_len = swfec_be16(pkt + 10);
+        if (len != SWFEC_REPAIR_HDR + (size_t)symbol_len) { stats_.malformed++; return; }
+        stats_.repairs_received++;
+        uint32_t repair_id = swfec_be32(pkt + 1);
+        uint32_t window_start = swfec_be32(pkt + 5);
+        size_t n = pkt[9];
+        uint64_t start = unwrap_seq(window_start);
+        std::vector<uint8_t> coeffs(n);
+        if (n) CoeffGen::coeffs(repair_id, n, coeffs.data());
+        Row row;
+        row.arrived_us = now_us;
+        row.symbol.assign(pkt + SWFEC_REPAIR_HDR, pkt + len);
+        for (size_t i = 0; i < n; i++) {
+            uint8_t c = coeffs[i];
+            if (!c) continue;
+            uint64_t s = start + i;
+            std::map<uint64_t, Known>::iterator it = known_.find(s);
+            if (it != known_.end()) {
+                const abuf_t& sym = it->second.symbol;
+                if (row.symbol.size() < sym.size())
+                    row.symbol.resize(sym.size(), 0);
+                zfex_swfec_addmul(row.symbol.data(), sym.data(), c, sym.size());
+            } else {
+                row.coeffs[s] = c;
+                if (!first_seen_.count(s))
+                    first_seen_[s] = now_us;
+            }
+        }
+        insert_row(row, now_us, out);
+    } else {
+        stats_.malformed++;
+    }
+}
+
+void SwfecDecoder::insert_row(Row& row, uint64_t now_us, std::vector<Delivered>& out)
+{
+    for (;;) {
+        if (row.coeffs.empty()) {
+            stats_.repairs_redundant++;
+            return;
+        }
+        uint64_t lead = row.coeffs.begin()->first;
+        uint8_t c = row.coeffs.begin()->second;
+        std::map<uint64_t, Row>::iterator pit = pivots_.find(lead);
+        if (pit != pivots_.end()) {
+            // row -= c * pivot (snapshot pivot data; the maps may not alias)
+            std::vector<std::pair<uint64_t, uint8_t> > pc(
+                pit->second.coeffs.begin(), pit->second.coeffs.end());
+            abuf_t psym = pit->second.symbol;   // copy, mirrors the Rust clone
+            for (size_t i = 0; i < pc.size(); i++) {
+                uint8_t prod = zfex_swfec_mul(c, pc[i].second);
+                uint8_t& e = row.coeffs[pc[i].first];
+                e = (uint8_t)(e ^ prod);
+                if (e == 0)
+                    row.coeffs.erase(pc[i].first);
+            }
+            if (row.symbol.size() < psym.size())
+                row.symbol.resize(psym.size(), 0);
+            zfex_swfec_addmul(row.symbol.data(), psym.data(), c, psym.size());
+        } else {
+            uint8_t inv = zfex_swfec_inv(c);
+            for (std::map<uint64_t, uint8_t>::iterator it = row.coeffs.begin();
+                 it != row.coeffs.end(); ++it)
+                it->second = zfex_swfec_mul(it->second, inv);
+            if (inv != 1)
+                for (size_t i = 0; i < row.symbol.size(); i++)
+                    row.symbol[i] = zfex_swfec_mul(inv, row.symbol[i]);
+            Row& slot = pivots_[lead];
+            slot.coeffs.swap(row.coeffs);
+            slot.symbol.swap(row.symbol);
+            slot.arrived_us = row.arrived_us;
+            try_solve(now_us, out);
+            return;
+        }
+    }
+}
+
+void SwfecDecoder::try_solve(uint64_t now_us, std::vector<Delivered>& out)
+{
+    for (;;) {
+        uint64_t k = 0;
+        bool found = false;
+        for (std::map<uint64_t, Row>::iterator it = pivots_.begin();
+             it != pivots_.end(); ++it)
+            if (it->second.coeffs.size() == 1) { k = it->first; found = true; break; }
+        if (!found)
+            return;
+        abuf_t symbol;
+        symbol.swap(pivots_[k].symbol);
+        pivots_.erase(k);
+        // normalized single coefficient == 1: symbol IS the packet symbol
+        learn(k, symbol, now_us, true, out);
+    }
+}
+
+void SwfecDecoder::learn(uint64_t useq, abuf_t& symbol, uint64_t now_us,
+                         bool deliver, std::vector<Delivered>& out)
+{
+    if (deliver && symbol.size() >= 2) {
+        size_t plen = ((size_t)symbol[0] << 8) | symbol[1];
+        if (symbol.size() >= 2 + plen) {
+            stats_.recovered++;
+            out.push_back(Delivered());
+            out.back().seq = (uint32_t)useq;
+            out.back().late = true;
+            out.back().payload.assign(symbol.begin() + 2, symbol.begin() + 2 + plen);
+        }
+    }
+    first_seen_.erase(useq);
+    Known& kn = known_[useq];
+    kn.symbol.swap(symbol);
+    kn.t_us = now_us;
+
+    std::vector<uint64_t> affected;
+    for (std::map<uint64_t, Row>::iterator it = pivots_.begin();
+         it != pivots_.end(); ++it)
+        if (it->second.coeffs.count(useq))
+            affected.push_back(it->first);
+    for (size_t i = 0; i < affected.size(); i++) {
+        std::map<uint64_t, Row>::iterator it = pivots_.find(affected[i]);
+        if (it == pivots_.end())
+            continue;   // already consumed by recursion
+        Row row;
+        row.coeffs.swap(it->second.coeffs);
+        row.symbol.swap(it->second.symbol);
+        row.arrived_us = it->second.arrived_us;
+        pivots_.erase(it);
+        uint8_t c = row.coeffs[useq];
+        row.coeffs.erase(useq);
+        const abuf_t& sym = known_[useq].symbol;
+        if (row.symbol.size() < sym.size())
+            row.symbol.resize(sym.size(), 0);
+        zfex_swfec_addmul(row.symbol.data(), sym.data(), c, sym.size());
+        insert_row(row, now_us, out);
+    }
+}
+
+void SwfecDecoder::expire(uint64_t now_us)
+{
+    uint64_t dl = deadline_us_;
+    std::vector<uint64_t> expired;
+    for (std::map<uint64_t, uint64_t>::iterator it = first_seen_.begin();
+         it != first_seen_.end(); ++it) {
+        uint64_t age = now_us >= it->second ? now_us - it->second : 0;
+        if (age > dl)
+            expired.push_back(it->first);
+    }
+    for (size_t i = 0; i < expired.size(); i++) {
+        first_seen_.erase(expired[i]);
+        stats_.abandoned++;
+        std::vector<uint64_t> dead;
+        for (std::map<uint64_t, Row>::iterator it = pivots_.begin();
+             it != pivots_.end(); ++it)
+            if (it->second.coeffs.count(expired[i]))
+                dead.push_back(it->first);
+        for (size_t j = 0; j < dead.size(); j++)
+            pivots_.erase(dead[j]);
+    }
+    for (std::map<uint64_t, Row>::iterator it = pivots_.begin(); it != pivots_.end();) {
+        uint64_t age = now_us >= it->second.arrived_us ? now_us - it->second.arrived_us : 0;
+        if (age > dl) pivots_.erase(it++); else ++it;
+    }
+    for (std::map<uint64_t, Known>::iterator it = known_.begin(); it != known_.end();) {
+        uint64_t age = now_us >= it->second.t_us ? now_us - it->second.t_us : 0;
+        if (age > 2 * dl) known_.erase(it++); else ++it;
+    }
+}
+
 } // namespace swfec
