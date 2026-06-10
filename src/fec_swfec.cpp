@@ -134,20 +134,30 @@ SwfecDecoder::SwfecDecoder(uint64_t deadline_us)
 
 uint64_t SwfecDecoder::unwrap_seq(uint32_t seq)
 {
-    const __int128 SPAN = (__int128)1 << 32;
-    __int128 base = (__int128)highest_ & ~(SPAN - 1);
-    __int128 best = base + seq;
-    __int128 cands[2] = { base - SPAN + (__int128)seq, base + SPAN + (__int128)seq };
+    // Map a 32-bit wire sequence number to a monotonically-increasing 64-bit
+    // counter by finding the u64 value closest to highest_ that has the same
+    // low 32 bits as seq.
+    //
+    // Originally used __int128 for intermediate arithmetic, but __int128 is
+    // not supported on 32-bit ARM (armv7l). Rewritten with uint64_t abs-diff;
+    // the "base - SPAN" candidate is only evaluated when base >= SPAN (i.e.
+    // it would not have underflowed in the signed formulation either).
+    const uint64_t SPAN = (uint64_t)1 << 32;
+    uint64_t base = highest_ & ~(SPAN - 1);           // align to 2^32 boundary
+    uint64_t best = base + (uint64_t)seq;
+    uint64_t cands[2] = {
+        base - SPAN + (uint64_t)seq,                  // cands[0]: epoch - 1
+        base + SPAN + (uint64_t)seq                   // cands[1]: epoch + 1
+    };
     for (int i = 0; i < 2; i++) {
-        __int128 c = cands[i];
-        if (c < 0) continue;
-        __int128 da = c - (__int128)highest_;          if (da < 0) da = -da;
-        __int128 db = best - (__int128)highest_;       if (db < 0) db = -db;
+        if (i == 0 && base < SPAN) continue;          // would have been negative
+        uint64_t c = cands[i];
+        uint64_t da = (c    >= highest_) ? (c    - highest_) : (highest_ - c);
+        uint64_t db = (best >= highest_) ? (best - highest_) : (highest_ - best);
         if (da < db) best = c;
     }
-    uint64_t u = (uint64_t)best;
-    if (u > highest_) highest_ = u;
-    return u;
+    if (best > highest_) highest_ = best;
+    return best;
 }
 
 void SwfecDecoder::push(const uint8_t* pkt, size_t len, uint64_t now_us,

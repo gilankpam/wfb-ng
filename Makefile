@@ -49,7 +49,7 @@ src/%.o: src/%.cpp src/*.hpp src/*.h
 	$(CXX) $(_CFLAGS) -std=gnu++11 -c -o $@ $<
 
 wfb_rx: src/rx.o src/radiotap.o src/zfex.o src/wifibroadcast.o src/fec_swfec.o
-	$(CXX) -o $@ $^ $(_LDFLAGS) -lpcap
+	$(CXX) -o $@ $^ $(_LDFLAGS) -lpcap $(PCAP_EXTRA_LDFLAGS)
 
 wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o src/fec_swfec.o
 	$(CXX) -o $@ $^ $(_LDFLAGS)
