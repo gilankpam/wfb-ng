@@ -3,9 +3,55 @@
 // (poly 0x11D): anchors mirror crates/swfec/src/gf256.rs tests.
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <vector>
 #include "zfex.h"
+#include "fec_swfec.hpp"
+
+// --- minimal vector-file reader (format: plan "Vector file format") ---
+struct VecReader {
+    FILE* f;
+    explicit VecReader(const char* path) {
+        f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(2); }
+    }
+    ~VecReader() { fclose(f); }
+    bool eof() {
+        int c = fgetc(f);
+        if (c == EOF) return true;
+        ungetc(c, f);
+        return false;
+    }
+    uint8_t u8() { uint8_t v; assert(fread(&v, 1, 1, f) == 1); return v; }
+    uint32_t u32() { uint32_t v; assert(fread(&v, 4, 1, f) == 1); return v; }  // LE host assumed (x86/ARM LE)
+    uint64_t u64() { uint64_t v; assert(fread(&v, 8, 1, f) == 1); return v; }
+    void bytes(uint8_t* p, size_t n) { if (n) assert(fread(p, 1, n, f) == n); }
+    void header(uint32_t expect_kind) {
+        assert(u32() == 0x53574643u);
+        assert(u32() == 1);
+        assert(u32() == expect_kind);
+        u32(); // param
+    }
+};
+
+static void test_coeff_vectors(const char* path)
+{
+    VecReader r(path);
+    r.header(1);
+    int checked = 0;
+    while (!r.eof()) {
+        uint32_t repair_id = r.u32();
+        uint32_t n = r.u32();
+        std::vector<uint8_t> expect(n), got(n);
+        r.bytes(expect.data(), n);
+        swfec::CoeffGen::coeffs(repair_id, n, got.data());
+        assert(memcmp(expect.data(), got.data(), n) == 0);
+        checked++;
+    }
+    printf("coeff vectors: OK (%d cases byte-exact)\n", checked);
+}
 
 static void test_gf_anchors(void)
 {
@@ -46,6 +92,7 @@ int main(void)
 {
     test_gf_anchors();
     test_addmul_matches_naive();
+    test_coeff_vectors("test_vectors/coeffs.bin");
     printf("fec_swfec_test: ALL OK\n");
     return 0;
 }

@@ -48,10 +48,10 @@ src/%.o: src/%.c src/*.h
 src/%.o: src/%.cpp src/*.hpp src/*.h
 	$(CXX) $(_CFLAGS) -std=gnu++11 -c -o $@ $<
 
-wfb_rx: src/rx.o src/radiotap.o src/zfex.o src/wifibroadcast.o
+wfb_rx: src/rx.o src/radiotap.o src/zfex.o src/wifibroadcast.o src/fec_swfec.o
 	$(CXX) -o $@ $^ $(_LDFLAGS) -lpcap
 
-wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o
+wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o src/fec_swfec.o
 	$(CXX) -o $@ $^ $(_LDFLAGS)
 
 fec_test: src/fec_test.cpp src/zfex.o
@@ -60,7 +60,7 @@ fec_test: src/fec_test.cpp src/zfex.o
 libsodium_test: src/libsodium_test.cpp
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) -lsodium $(shell pkg-config --libs catch2-with-main)
 
-fec_swfec_test: src/fec_swfec_test.o src/zfex.o
+fec_swfec_test: src/fec_swfec_test.o src/zfex.o src/fec_swfec.o
 	$(CXX) -o $@ $^ $(LDFLAGS)
 
 swfec_test_run: fec_swfec_test
