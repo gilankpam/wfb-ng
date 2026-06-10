@@ -27,13 +27,13 @@ static void test_addmul_matches_naive(void)
     static uint8_t dst[1203] __attribute__((aligned(16)));
     static uint8_t ref[1203] __attribute__((aligned(16)));
     static uint8_t src[1203] __attribute__((aligned(16)));
+    static uint8_t expect[1203] __attribute__((aligned(16)));
     for (int i = 0; i < 1203; i++) {
         src[i] = (uint8_t)(i * 31 + 7);
         dst[i] = ref[i] = (uint8_t)(i * 5);
     }
     for (int c = 0; c <= 255; c++) {
         memcpy(dst, ref, sizeof(dst));
-        uint8_t expect[1203];
         for (int i = 0; i < 1203; i++)
             expect[i] = ref[i] ^ zfex_swfec_mul((gf)c, src[i]);
         zfex_swfec_addmul(dst, src, (gf)c, sizeof(dst));
