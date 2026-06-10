@@ -26,7 +26,7 @@ struct aligned_alloc_t {
     template <class U> aligned_alloc_t(const aligned_alloc_t<U, Align>&) {}
     T* allocate(size_t n) {
         void* p = NULL;
-        if (posix_memalign(&p, Align, n * sizeof(T) ? n * sizeof(T) : Align) != 0)
+        if (posix_memalign(&p, Align, n != 0 ? n * sizeof(T) : Align) != 0)
             throw std::bad_alloc();
         return static_cast<T*>(p);
     }
