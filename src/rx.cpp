@@ -732,6 +732,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 }
 
                 delete swfec_dec;
+                swfec_dec = NULL;
                 swfec_dec = new swfec::SwfecDecoder((uint64_t)new_session_data->n * 1000);
                 session_is_swfec = true;
                 swfec_deadline_ms = new_session_data->n;
@@ -790,7 +791,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     // --- swfec fast path: feed raw wire packet to sliding-window decoder ---
     if (session_is_swfec)
     {
+        assert(swfec_dec != NULL);
         // Seq-gap tracker: observe wire header before decode
+        // Loss tracker uses raw u32 wire seqs by design: a session rekeys (new
+        // decoder + reset) long before the u32 seq could wrap (~2^32 packets), so
+        // no unwrap is needed here. The decoder handles its own u64 unwrap internally.
         if (decrypted_len >= 5 && decrypted[0] == swfec::SWFEC_WIRE_SOURCE)
         {
             uint32_t s = swfec::swfec_be32(decrypted + 1);
@@ -819,6 +824,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         swfec_dec->push(decrypted, decrypted_len, swfec::monotonic_us(), out);
         for (size_t i = 0; i < out.size(); i++)
         {
+            assert(out[i].payload.size() <= MAX_FEC_PAYLOAD);
             send_to_socket(out[i].payload.data(), (uint16_t)out[i].payload.size());
             swfec_delivered += 1;
             count_p_outgoing += 1;
