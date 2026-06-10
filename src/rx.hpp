@@ -33,6 +33,7 @@
 
 #include "wifibroadcast.hpp"
 #include "zfex.h"
+#include "fec_swfec.hpp"
 
 // Forward declaration for isolated packet loss notification
 class PacketLossListener
@@ -233,6 +234,16 @@ private:
     int fec_k;  // RS number of primary fragments in block
     int fec_n;  // RS total number of fragments in block
     uint8_t session_hash[crypto_generichash_BYTES];
+
+    // --- swfec session state ---
+    bool session_is_swfec;
+    swfec::SwfecDecoder *swfec_dec;   // NULL unless swfec session active
+    uint8_t swfec_deadline_ms;        // current deadline, for param-only updates
+    // seq-gap loss accounting (mirrors phase-2 ExpectedTracker):
+    uint64_t swfec_max_seq_end;       // max(source seq, repair window end) seen
+    bool     swfec_any_seen;
+    uint64_t swfec_delivered;         // total Delivered emitted
+    uint64_t swfec_lost_reported;     // already counted into count_p_lost
 
     uint32_t seq;
     rx_ring_item_t rx_ring[RX_RING_SIZE];

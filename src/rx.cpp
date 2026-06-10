@@ -270,7 +270,10 @@ void Receiver::loop_iter(void)
 Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-    fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
+    fec_p(NULL), fec_k(-1), fec_n(-1),
+    session_is_swfec(false), swfec_dec(NULL), swfec_deadline_ms(0),
+    swfec_max_seq_end(0), swfec_any_seen(false), swfec_delivered(0), swfec_lost_reported(0),
+    seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
     last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
 {
     memset(session_key, '\0', sizeof(session_key));
@@ -301,6 +304,8 @@ Aggregator::~Aggregator()
     {
         deinit_fec();
     }
+    delete swfec_dec;
+    swfec_dec = NULL;
 }
 
 void Aggregator::init_fec(int k, int n)
@@ -498,6 +503,18 @@ void Aggregator::dump_stats(void)
                 it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
     }
 
+    // Swfec loss accounting: compute seq-gap based loss before emitting PKT line
+    if (session_is_swfec && swfec_any_seen)
+    {
+        uint64_t expected = swfec_max_seq_end + 1;
+        uint64_t lost_total = expected > swfec_delivered ? expected - swfec_delivered : 0;
+        if (lost_total > swfec_lost_reported)
+        {
+            count_p_lost += (uint32_t)(lost_total - swfec_lost_reported);
+            swfec_lost_reported = lost_total;
+        }
+    }
+
     IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
             count_p_all, count_b_all,                    // incoming
             count_p_dec_err,                             // decryption
@@ -656,47 +673,88 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             return;
         }
 
-        if (new_session_data->fec_type != WFB_FEC_VDM_RS)
+        if (new_session_data->fec_type == WFB_FEC_VDM_RS)
+        {
+            if (new_session_data->n < 1)
+            {
+                WFB_ERR("Invalid FEC N: %d\n", new_session_data->n);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            if (new_session_data->k < 1 || new_session_data->k > new_session_data->n)
+            {
+                WFB_ERR("Invalid FEC K: %d\n", new_session_data->k);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            count_p_session += 1;
+
+            // Ignore RSSI (and per-card rx counters) for session packets to simplify calculation
+            // of lost packets because session packets doesn't have any serial number and it is
+            // too hard to calculate number of unique session packets
+
+            if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
+            {
+                epoch = be64toh(new_session_data->epoch);
+                memcpy(session_key, new_session_data->session_key, sizeof(session_key));
+
+                // Drop any active swfec decoder when switching to RS
+                delete swfec_dec;
+                swfec_dec = NULL;
+                session_is_swfec = false;
+
+                if (fec_p != NULL)
+                {
+                    deinit_fec();
+                }
+
+                init_fec(new_session_data->k, new_session_data->n);
+
+                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
+                IPC_MSG_SEND();
+            }
+        }
+        else if (new_session_data->fec_type == WFB_FEC_SWFEC)
+        {
+            count_p_session += 1;
+
+            if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
+            {
+                // New swfec session: (re)build decoder
+                epoch = be64toh(new_session_data->epoch);
+                memcpy(session_key, new_session_data->session_key, sizeof(session_key));
+
+                if (fec_p != NULL)
+                {
+                    deinit_fec();
+                }
+
+                delete swfec_dec;
+                swfec_dec = new swfec::SwfecDecoder((uint64_t)new_session_data->n * 1000);
+                session_is_swfec = true;
+                swfec_deadline_ms = new_session_data->n;
+                swfec_max_seq_end = 0;
+                swfec_any_seen = false;
+                swfec_delivered = 0;
+                swfec_lost_reported = 0;
+
+                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_SWFEC, (int)new_session_data->k, (int)new_session_data->n);
+                IPC_MSG_SEND();
+            }
+            else if (session_is_swfec && new_session_data->n != swfec_deadline_ms)
+            {
+                // Param-only update: deadline changed, same key — no reset (spec §6)
+                swfec_deadline_ms = new_session_data->n;
+                swfec_dec->set_deadline_us((uint64_t)new_session_data->n * 1000);
+            }
+        }
+        else
         {
             WFB_ERR("Unsupported FEC codec type: %d\n", new_session_data->fec_type);
             count_p_dec_err += 1;
             return;
-        }
-
-        if (new_session_data->n < 1)
-        {
-            WFB_ERR("Invalid FEC N: %d\n", new_session_data->n);
-            count_p_dec_err += 1;
-            return;
-        }
-
-        if (new_session_data->k < 1 || new_session_data->k > new_session_data->n)
-        {
-            WFB_ERR("Invalid FEC K: %d\n", new_session_data->k);
-            count_p_dec_err += 1;
-            return;
-        }
-
-        count_p_session += 1;
-
-        // Ignore RSSI (and per-card rx counters) for session packets to simplify calculation
-        // of lost packets because session packets doesn't have any serial number and it is
-        // too hard to calculate number of unique session packets
-
-        if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
-        {
-            epoch = be64toh(new_session_data->epoch);
-            memcpy(session_key, new_session_data->session_key, sizeof(session_key));
-
-            if (fec_p != NULL)
-            {
-                deinit_fec();
-            }
-
-            init_fec(new_session_data->k, new_session_data->n);
-
-            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
-            IPC_MSG_SEND();
         }
 
         // Cache already processed session
@@ -728,6 +786,49 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
     count_p_data += 1;
     log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, freq, mcs_index, bandwidth);
+
+    // --- swfec fast path: feed raw wire packet to sliding-window decoder ---
+    if (session_is_swfec)
+    {
+        // Seq-gap tracker: observe wire header before decode
+        if (decrypted_len >= 5 && decrypted[0] == swfec::SWFEC_WIRE_SOURCE)
+        {
+            uint32_t s = swfec::swfec_be32(decrypted + 1);
+            if (!swfec_any_seen || s > (uint32_t)swfec_max_seq_end)
+            {
+                swfec_max_seq_end = s;
+                swfec_any_seen = true;
+            }
+        }
+        else if (decrypted_len >= 12 && decrypted[0] == swfec::SWFEC_WIRE_REPAIR)
+        {
+            uint32_t window_start = swfec::swfec_be32(decrypted + 5);
+            uint8_t  window_len   = decrypted[9];
+            if (window_len > 0)
+            {
+                uint32_t end = window_start + window_len - 1;
+                if (!swfec_any_seen || end > (uint32_t)swfec_max_seq_end)
+                {
+                    swfec_max_seq_end = end;
+                    swfec_any_seen = true;
+                }
+            }
+        }
+
+        std::vector<swfec::Delivered> out;
+        swfec_dec->push(decrypted, decrypted_len, swfec::monotonic_us(), out);
+        for (size_t i = 0; i < out.size(); i++)
+        {
+            send_to_socket(out[i].payload.data(), (uint16_t)out[i].payload.size());
+            swfec_delivered += 1;
+            count_p_outgoing += 1;
+            count_b_outgoing += (uint32_t)out[i].payload.size();
+            if (out[i].late)
+                count_p_fec_recovered += 1;
+        }
+        return;   // RS ring logic is not applicable for swfec
+    }
+    // --- end swfec fast path ---
 
     assert(decrypted_len >= sizeof(wpacket_hdr_t));
     assert(decrypted_len <= MAX_FEC_PAYLOAD);
