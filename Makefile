@@ -60,6 +60,12 @@ fec_test: src/fec_test.cpp src/zfex.o
 libsodium_test: src/libsodium_test.cpp
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) -lsodium $(shell pkg-config --libs catch2-with-main)
 
+fec_swfec_test: src/fec_swfec_test.o src/zfex.o
+	$(CXX) -o $@ $^ $(LDFLAGS)
+
+swfec_test_run: fec_swfec_test
+	./fec_swfec_test
+
 wfb_keygen: src/keygen.o
 	$(CC) -o $@ $^ $(_LDFLAGS)
 
