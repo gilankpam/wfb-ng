@@ -88,11 +88,53 @@ static void test_addmul_matches_naive(void)
     printf("addmul vs naive: OK (all 256 coefficients)\n");
 }
 
+static void test_encoder_vectors(const char* path)
+{
+    VecReader r(path);
+    r.header(2);
+    // Config is encoded in the scenario: deadline 30ms always; overhead from
+    // the file's param field re-read here:
+    fseek(r.f, 12, SEEK_SET);
+    uint32_t overhead_pct;
+    assert(fread(&overhead_pct, 4, 1, r.f) == 1);
+    swfec::SwfecEncoder enc(overhead_pct / 100.0f, 30000);
+    int ops = 0, pkts_checked = 0;
+    while (!r.eof()) {
+        uint8_t op = r.u8();
+        uint64_t now = r.u64();
+        std::vector<std::vector<uint8_t> > got;
+        if (op == 0) {
+            uint32_t plen = r.u32();
+            std::vector<uint8_t> payload(plen);
+            r.bytes(payload.data(), plen);
+            enc.push_source(payload.data(), plen, now, got);
+        } else {
+            assert(op == 1);
+            enc.poll(now, got);
+        }
+        uint32_t expect_n = r.u32();
+        assert(got.size() == expect_n);
+        for (uint32_t i = 0; i < expect_n; i++) {
+            uint32_t elen = r.u32();
+            std::vector<uint8_t> expect(elen);
+            r.bytes(expect.data(), elen);
+            assert(got[i].size() == elen);
+            assert(memcmp(got[i].data(), expect.data(), elen) == 0);
+            pkts_checked++;
+        }
+        ops++;
+    }
+    printf("encoder vectors %s: OK (%d ops, %d packets byte-exact)\n", path, ops, pkts_checked);
+}
+
 int main(void)
 {
     test_gf_anchors();
     test_addmul_matches_naive();
     test_coeff_vectors("test_vectors/coeffs.bin");
+    test_encoder_vectors("test_vectors/encoder_oh50.bin");
+    test_encoder_vectors("test_vectors/encoder_oh150.bin");
+    test_encoder_vectors("test_vectors/encoder_flush_oh30.bin");
     printf("fec_swfec_test: ALL OK\n");
     return 0;
 }
