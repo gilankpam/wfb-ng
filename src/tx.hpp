@@ -38,9 +38,9 @@
 // the fragment plaintext (MAX_FEC_PAYLOAD)
 #define SWFEC_MAX_INPUT (MAX_FEC_PAYLOAD - 12 - 2)
 
-// fpvd's waybeam venc emits RTP datagrams of <= 1400 B payload + 12 B RTP
+// Typical video encoders emit RTP datagrams of <= 1400 B payload + 12 B RTP
 // header; oversize inputs are silently dropped in swfec mode, so pin the
-// headroom at compile time. See fpvd spec 2026-06-11-swfec-adoption-design.
+// headroom at compile time.
 static_assert(SWFEC_MAX_INPUT >= 1412, "swfec input headroom regression");
 
 

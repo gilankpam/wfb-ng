@@ -196,8 +196,8 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 // IPC stats contract version, emitted as SESSION trailing field #5
 // (epoch:fec_type:k:n:contract_version). v3: WFB_FEC_SWFEC (2) exists; for
 // swfec sessions the SESSION k/n slots carry overhead_pct/deadline_ms.
-// Bump on any stats-shape change — fpvdgs hard-fails on versions it
-// doesn't know, by design.
+// Bump on any stats-shape change — stats consumers are expected to
+// hard-fail on versions they don't know, by design.
 #define WFB_IPC_CONTRACT_VERSION 3
 
 // packet flags
