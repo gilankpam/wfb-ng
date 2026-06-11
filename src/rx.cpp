@@ -517,11 +517,11 @@ void Aggregator::dump_stats(void)
 
     // Contract v3: re-emit SESSION once per stats window so a late-attached
     // python parser learns the session without waiting for an on-change event.
-    // The python side dedups, so aggregators only see real changes.
+    // The python consumer dedups by last-seen values, so only genuine changes trigger downstream reactions.
     if (fec_p != NULL || swfec_dec != NULL)
     {
         IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n", ts, epoch,
-                session_is_swfec ? WFB_FEC_SWFEC : WFB_FEC_VDM_RS, fec_k, fec_n,
+                (unsigned)(session_is_swfec ? WFB_FEC_SWFEC : WFB_FEC_VDM_RS), fec_k, fec_n,
                 1u, (unsigned)WFB_IPC_CONTRACT_VERSION);
     }
 
@@ -724,7 +724,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
                 // Trailing fields #5 (interleave_depth, fixed 1 — no interleaver in this
                 // fork) and #6 (contract_version). 4-field-only parsers stay compatible.
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n,
+                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n", get_time_ms(), epoch, (unsigned)WFB_FEC_VDM_RS, fec_k, fec_n,
                         1u, (unsigned)WFB_IPC_CONTRACT_VERSION);
                 IPC_MSG_SEND();
             }
@@ -756,7 +756,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
                 fec_k = new_session_data->k;   // swfec: overhead_pct rides the k slot
                 fec_n = new_session_data->n;   // swfec: deadline_ms rides the n slot
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n", get_time_ms(), epoch, WFB_FEC_SWFEC, fec_k, fec_n,
+                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n", get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
                         1u, (unsigned)WFB_IPC_CONTRACT_VERSION);
                 IPC_MSG_SEND();
             }
@@ -765,6 +765,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 // Param-only update: deadline changed, same key — no reset (spec §6)
                 swfec_deadline_ms = new_session_data->n;
                 swfec_dec->set_deadline_us((uint64_t)new_session_data->n * 1000);
+                fec_n = new_session_data->n;  // keep the SESSION re-emit in sync
+                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n",
+                        get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
+                        1u, (unsigned)WFB_IPC_CONTRACT_VERSION);
+                IPC_MSG_SEND();
             }
         }
         else

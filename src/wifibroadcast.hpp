@@ -230,7 +230,7 @@ typedef struct {
 typedef struct {
     uint64_t epoch; // Drop session packets from old epoch
     uint32_t channel_id; // (link_id << 8) + port_number
-    uint8_t fec_type; // Now only supported type is WFB_FEC_VDM_RS
+    uint8_t fec_type; // WFB_FEC_VDM_RS or WFB_FEC_SWFEC
     uint8_t k;   // FEC k
     uint8_t n;   // FEC n
     uint8_t session_key[crypto_aead_chacha20poly1305_KEYBYTES];
