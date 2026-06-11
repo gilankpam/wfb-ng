@@ -193,6 +193,13 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 #define WFB_FEC_VDM_RS  0x1  //Reed-Solomon on Vandermonde matrix
 #define WFB_FEC_SWFEC   0x2  // sliding-window FEC (swfec); k=overhead_pct, n=deadline_ms
 
+// IPC stats contract version, emitted as SESSION trailing field #6.
+// v3: WFB_FEC_SWFEC (2) exists; for swfec sessions the SESSION k/n slots
+// carry overhead_pct/deadline_ms. Field #5 (interleave_depth) is always 1
+// in this fork (no block interleaver). Bump on any stats-shape change —
+// fpvdgs hard-fails on versions it doesn't know, by design.
+#define WFB_IPC_CONTRACT_VERSION 3
+
 // packet flags
 #define WFB_PACKET_FEC_ONLY 0x1
 

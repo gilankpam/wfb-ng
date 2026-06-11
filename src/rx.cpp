@@ -712,7 +712,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
                 init_fec(new_session_data->k, new_session_data->n);
 
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
+                // Trailing fields #5 (interleave_depth, fixed 1 — no interleaver in this
+                // fork) and #6 (contract_version). 4-field-only parsers stay compatible.
+                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n,
+                        1u, (unsigned)WFB_IPC_CONTRACT_VERSION);
                 IPC_MSG_SEND();
             }
         }
@@ -741,7 +744,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 swfec_delivered = 0;
                 swfec_lost_reported = 0;
 
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_SWFEC, (int)new_session_data->k, (int)new_session_data->n);
+                fec_k = new_session_data->k;   // swfec: overhead_pct rides the k slot
+                fec_n = new_session_data->n;   // swfec: deadline_ms rides the n slot
+                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n", get_time_ms(), epoch, WFB_FEC_SWFEC, fec_k, fec_n,
+                        1u, (unsigned)WFB_IPC_CONTRACT_VERSION);
                 IPC_MSG_SEND();
             }
             else if (session_is_swfec && new_session_data->n != swfec_deadline_ms)
