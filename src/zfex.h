@@ -128,6 +128,13 @@ zfex_status_code_t fec_decode_simd(
  */
 
 
+/* --- swfec support: GF(2^8) helpers sharing zfex's runtime tables --- */
+void zfex_swfec_init(void);                                  /* idempotent table init */
+gf   zfex_swfec_mul(gf a, gf b);
+gf   zfex_swfec_inv(gf a);                                   /* a != 0 */
+/* dst[i] ^= c * src[i]; dst and src must be 16-byte aligned (SIMD path) */
+void zfex_swfec_addmul(gf *dst, const gf *src, gf c, size_t sz);
+
 #ifdef __cplusplus
 }
 #endif

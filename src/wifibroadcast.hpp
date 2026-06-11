@@ -191,6 +191,14 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 
 // FEC types
 #define WFB_FEC_VDM_RS  0x1  //Reed-Solomon on Vandermonde matrix
+#define WFB_FEC_SWFEC   0x2  // sliding-window FEC (swfec); k=overhead_pct, n=deadline_ms
+
+// IPC stats contract version, emitted as SESSION trailing field #5
+// (epoch:fec_type:k:n:contract_version). v3: WFB_FEC_SWFEC (2) exists; for
+// swfec sessions the SESSION k/n slots carry overhead_pct/deadline_ms.
+// Bump on any stats-shape change — stats consumers are expected to
+// hard-fail on versions they don't know, by design.
+#define WFB_IPC_CONTRACT_VERSION 3
 
 // packet flags
 #define WFB_PACKET_FEC_ONLY 0x1
@@ -222,7 +230,7 @@ typedef struct {
 typedef struct {
     uint64_t epoch; // Drop session packets from old epoch
     uint32_t channel_id; // (link_id << 8) + port_number
-    uint8_t fec_type; // Now only supported type is WFB_FEC_VDM_RS
+    uint8_t fec_type; // WFB_FEC_VDM_RS or WFB_FEC_SWFEC
     uint8_t k;   // FEC k
     uint8_t n;   // FEC n
     uint8_t session_key[crypto_aead_chacha20poly1305_KEYBYTES];

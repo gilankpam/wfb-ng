@@ -11,6 +11,8 @@ wfb_rx
 wfb_tx
 wfb_tx_cmd
 wfb_tun
+fec_swfec_test
+test_vectors/
 gs.key
 drone.key
 wfb_keygen

@@ -987,3 +987,25 @@ fec_decode_simd(
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
  * OF SUCH DAMAGE.
  */
+
+/* --- swfec support (see zfex.h) --- */
+void zfex_swfec_init(void)
+{
+    if (!fec_initialized)
+        init_fec();
+}
+
+gf zfex_swfec_mul(gf a, gf b)
+{
+    return gf_mul_table[a][b];
+}
+
+gf zfex_swfec_inv(gf a)
+{
+    return inverse[a];
+}
+
+void zfex_swfec_addmul(gf *dst, const gf *src, gf c, size_t sz)
+{
+    addmul_simd(dst, src, c, sz);
+}
