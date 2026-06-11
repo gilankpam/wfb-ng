@@ -238,6 +238,7 @@ private:
     // --- swfec session state ---
     bool session_is_swfec;
     swfec::SwfecDecoder *swfec_dec;   // NULL unless swfec session active
+    swfec::SwfecReorder *swfec_ro;    // in-order release buffer; NULL unless swfec session active
     uint8_t swfec_deadline_ms;        // current deadline, for param-only updates
     // seq-gap loss accounting (mirrors phase-2 ExpectedTracker):
     uint64_t swfec_max_seq_end;       // max(source seq, repair window end) seen

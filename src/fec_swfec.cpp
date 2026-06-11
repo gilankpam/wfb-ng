@@ -355,4 +355,71 @@ void SwfecDecoder::expire(uint64_t now_us)
     }
 }
 
+// --- SwfecReorder: in-order release buffer ---
+SwfecReorder::SwfecReorder(uint64_t deadline_us)
+    : deadline_us_(deadline_us), started_(false), next_seq_(0) {}
+
+void SwfecReorder::reset()
+{
+    started_ = false;
+    next_seq_ = 0;
+    buf_.clear();
+}
+
+void SwfecReorder::push(uint32_t seq, bool late, const uint8_t* data, size_t len,
+                        uint64_t now_us, std::vector<Out>& out, uint32_t& skipped)
+{
+    if (!started_) {
+        started_ = true;
+        next_seq_ = seq;
+    }
+    // Already emitted (or its gap was skipped): too late to deliver in order.
+    // No-wrap within a session, so a plain comparison is safe.
+    if (seq < next_seq_)
+        return;
+    // First writer wins; ignore duplicate deliveries of the same seq.
+    if (buf_.find(seq) != buf_.end())
+        return;
+    Item& it = buf_[seq];
+    it.payload.assign(data, data + len);
+    it.late = late;
+    it.arrived_us = now_us;
+    drain(now_us, out, skipped);
+}
+
+void SwfecReorder::poll(uint64_t now_us, std::vector<Out>& out, uint32_t& skipped)
+{
+    drain(now_us, out, skipped);
+}
+
+void SwfecReorder::drain(uint64_t now_us, std::vector<Out>& out, uint32_t& skipped)
+{
+    for (;;) {
+        // Release the contiguous run starting at the cursor.
+        std::map<uint32_t, Item>::iterator it;
+        while ((it = buf_.find(next_seq_)) != buf_.end()) {
+            out.push_back(Out());
+            out.back().payload.swap(it->second.payload);
+            out.back().late = it->second.late;
+            buf_.erase(it);
+            next_seq_ += 1;
+        }
+        if (buf_.empty())
+            return;
+        // A gap blocks the cursor. The oldest pending packet (smallest buffered
+        // seq) is the one waiting behind the gap; if it has waited longer than
+        // the deadline, the missing packet will never come (the decoder abandons
+        // unrecoverable seqs within the same deadline), so skip the gap.
+        std::map<uint32_t, Item>::iterator head = buf_.begin();
+        uint64_t age = now_us >= head->second.arrived_us
+                           ? now_us - head->second.arrived_us : 0;
+        if (age > deadline_us_) {
+            skipped += head->first - next_seq_;
+            next_seq_ = head->first;
+            continue;   // release the now-contiguous run
+        }
+        return;         // still within deadline: keep holding
+    }
+}
+
 } // namespace swfec

@@ -150,6 +150,49 @@ private:
     DecoderStats stats_;
 };
 
+// In-order release buffer for the swfec decode path. SwfecDecoder delivers
+// source packets on arrival (any order) and recovered packets late; a
+// zero-jitter RTP consumer (e.g. pixelpilot --rtp-jitter-ms 0) treats every
+// reorder as a gap and forces an IDR, which glitches the video even though
+// nothing was actually lost. This buffer restores the in-order delivery
+// contract of the RS-block path (rx.cpp): packets are released strictly in
+// sequence order, a gap is held up to the deadline for the missing packet to
+// arrive/recover, then skipped as lost. Latency is added only on a gap, not on
+// the loss-free path. Kept separate from SwfecDecoder so the decoder stays
+// byte-exact with the Rust reference (differential tests untouched).
+//
+// Sequence numbers are the raw 32-bit wire seqs. Like the rx.cpp loss tracker,
+// this relies on a session rekeying long before the u32 seq could wrap, so no
+// unwrap is needed; reset() is called on every session change.
+class SwfecReorder {
+public:
+    struct Out {
+        std::vector<uint8_t> payload;
+        bool late;   // recovered by FEC (decoder marked it late)
+    };
+    explicit SwfecReorder(uint64_t deadline_us);
+    void set_deadline_us(uint64_t v) { deadline_us_ = v; }   // param-only session update
+    void reset();
+    // Feed one decoder-delivered packet; appends in-order releases to out and
+    // adds the count of gap packets abandoned past the deadline to skipped.
+    void push(uint32_t seq, bool late, const uint8_t* data, size_t len,
+              uint64_t now_us, std::vector<Out>& out, uint32_t& skipped);
+    // Time-based drain without a new packet (honors the deadline during a
+    // quiet gap). Appends releases to out and abandoned counts to skipped.
+    void poll(uint64_t now_us, std::vector<Out>& out, uint32_t& skipped);
+private:
+    struct Item {
+        std::vector<uint8_t> payload;
+        bool late;
+        uint64_t arrived_us;
+    };
+    void drain(uint64_t now_us, std::vector<Out>& out, uint32_t& skipped);
+    uint64_t deadline_us_;
+    bool started_;
+    uint32_t next_seq_;               // next seq to emit (in-order cursor)
+    std::map<uint32_t, Item> buf_;    // pending seqs awaiting their predecessor
+};
+
 // Big-endian helpers shared by encoder/decoder/tests.
 static inline uint32_t swfec_be32(const uint8_t* p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];

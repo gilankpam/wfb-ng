@@ -271,7 +271,7 @@ Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_i
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
     fec_p(NULL), fec_k(-1), fec_n(-1),
-    session_is_swfec(false), swfec_dec(NULL), swfec_deadline_ms(0),
+    session_is_swfec(false), swfec_dec(NULL), swfec_ro(NULL), swfec_deadline_ms(0),
     swfec_max_seq_end(0), swfec_any_seen(false), swfec_delivered(0), swfec_lost_reported(0),
     seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
     last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
@@ -306,6 +306,8 @@ Aggregator::~Aggregator()
     }
     delete swfec_dec;
     swfec_dec = NULL;
+    delete swfec_ro;
+    swfec_ro = NULL;
 }
 
 void Aggregator::init_fec(int k, int n)
@@ -713,6 +715,8 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 // Drop any active swfec decoder when switching to RS
                 delete swfec_dec;
                 swfec_dec = NULL;
+                delete swfec_ro;
+                swfec_ro = NULL;
                 session_is_swfec = false;
 
                 if (fec_p != NULL)
@@ -746,6 +750,8 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 delete swfec_dec;
                 swfec_dec = NULL;
                 swfec_dec = new swfec::SwfecDecoder((uint64_t)new_session_data->n * 1000);
+                delete swfec_ro;
+                swfec_ro = new swfec::SwfecReorder((uint64_t)new_session_data->n * 1000);
                 session_is_swfec = true;
                 swfec_deadline_ms = new_session_data->n;
                 swfec_max_seq_end = 0;
@@ -764,6 +770,8 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 // Param-only update: deadline changed, same key — no reset (spec §6)
                 swfec_deadline_ms = new_session_data->n;
                 swfec_dec->set_deadline_us((uint64_t)new_session_data->n * 1000);
+                if (swfec_ro != NULL)
+                    swfec_ro->set_deadline_us((uint64_t)new_session_data->n * 1000);
                 fec_n = new_session_data->n;  // keep the SESSION re-emit in sync
                 IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n",
                         get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
@@ -840,16 +848,34 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             }
         }
 
+        uint64_t now_us = swfec::monotonic_us();
         std::vector<swfec::Delivered> out;
-        swfec_dec->push(decrypted, decrypted_len, swfec::monotonic_us(), out);
+        swfec_dec->push(decrypted, decrypted_len, now_us, out);
+
+        // The decoder delivers sources on arrival and recovered packets late,
+        // i.e. out of order. Pass everything through the in-order reorder buffer
+        // so the consumer (e.g. pixelpilot --rtp-jitter-ms 0) sees a strictly
+        // ordered stream, matching the RS-block path. A gap is held up to the
+        // deadline; if unfilled it is skipped (never emitted). Skipped packets
+        // need no separate loss tally: they advance swfec_max_seq_end but never
+        // increment swfec_delivered, so the existing dump_stats accounting counts
+        // them as lost exactly once. ro_skipped is kept only for clarity here.
+        std::vector<swfec::SwfecReorder::Out> ro_out;
+        uint32_t ro_skipped = 0;
+        (void)ro_skipped;
         for (size_t i = 0; i < out.size(); i++)
         {
             assert(out[i].payload.size() <= MAX_FEC_PAYLOAD);
-            send_to_socket(out[i].payload.data(), (uint16_t)out[i].payload.size());
+            swfec_ro->push(out[i].seq, out[i].late, out[i].payload.data(),
+                           out[i].payload.size(), now_us, ro_out, ro_skipped);
+        }
+        for (size_t i = 0; i < ro_out.size(); i++)
+        {
+            send_to_socket(ro_out[i].payload.data(), (uint16_t)ro_out[i].payload.size());
             swfec_delivered += 1;
             count_p_outgoing += 1;
-            count_b_outgoing += (uint32_t)out[i].payload.size();
-            if (out[i].late)
+            count_b_outgoing += (uint32_t)ro_out[i].payload.size();
+            if (ro_out[i].late)
                 count_p_fec_recovered += 1;
         }
         return;   // RS ring logic is not applicable for swfec

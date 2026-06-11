@@ -209,6 +209,91 @@ static void test_fuzz_roundtrip(void)
     printf("fuzz roundtrip: OK (%zu/10000 delivered, no dups, state bounded)\n", seen.size());
 }
 
+static void reorder_feed(swfec::SwfecReorder& ro, uint32_t seq, bool late,
+                         uint64_t now, std::vector<uint32_t>& em,
+                         std::vector<uint8_t>& lf, uint32_t& skipped_total)
+{
+    uint8_t b = (uint8_t)seq;   // payload byte encodes seq so we can check identity+order
+    std::vector<swfec::SwfecReorder::Out> out;
+    uint32_t sk = 0;
+    ro.push(seq, late, &b, 1, now, out, sk);
+    skipped_total += sk;
+    for (size_t i = 0; i < out.size(); i++) {
+        assert(out[i].payload.size() == 1);
+        em.push_back(out[i].payload[0]);
+        lf.push_back(out[i].late ? 1 : 0);
+    }
+}
+
+static void test_reorder(void)
+{
+    // 1. in-order stream passes straight through, no skips
+    {
+        swfec::SwfecReorder ro(30000);
+        std::vector<uint32_t> em; std::vector<uint8_t> lf; uint32_t sk = 0;
+        for (uint32_t s = 0; s < 5; s++) reorder_feed(ro, s, false, s * 1000, em, lf, sk);
+        assert(em.size() == 5);
+        for (uint32_t s = 0; s < 5; s++) assert(em[s] == s);
+        assert(sk == 0);
+    }
+    // 2. a reordered packet is held, then released in order when the gap fills
+    {
+        swfec::SwfecReorder ro(30000);
+        std::vector<uint32_t> em; std::vector<uint8_t> lf; uint32_t sk = 0;
+        reorder_feed(ro, 0, false, 0,   em, lf, sk);   // emit 0
+        reorder_feed(ro, 2, false, 100, em, lf, sk);   // hold (gap @ 1)
+        assert(em.size() == 1);
+        reorder_feed(ro, 1, true, 200,  em, lf, sk);   // 1 recovered late -> emit 1,2
+        assert(em.size() == 3);
+        assert(em[0] == 0 && em[1] == 1 && em[2] == 2);
+        assert(lf[1] == 1 && lf[2] == 0);              // late flag preserved per packet
+        assert(sk == 0);
+    }
+    // 3. a gap that never fills is skipped once the deadline elapses
+    {
+        swfec::SwfecReorder ro(30000);
+        std::vector<uint32_t> em; std::vector<uint8_t> lf; uint32_t sk = 0;
+        reorder_feed(ro, 0, false, 0,           em, lf, sk);   // emit 0
+        reorder_feed(ro, 2, false, 1000,        em, lf, sk);   // hold (gap @ 1), arrived t=1000
+        reorder_feed(ro, 3, false, 1000 + 30001, em, lf, sk);  // deadline passed -> skip 1, emit 2,3
+        assert(em.size() == 3);
+        assert(em[0] == 0 && em[1] == 2 && em[2] == 3);
+        assert(sk == 1);
+    }
+    // 4. a packet that arrives after its slot was skipped is dropped, not emitted out of order
+    {
+        swfec::SwfecReorder ro(30000);
+        std::vector<uint32_t> em; std::vector<uint8_t> lf; uint32_t sk = 0;
+        reorder_feed(ro, 0, false, 0,            em, lf, sk);
+        reorder_feed(ro, 2, false, 1000,         em, lf, sk);
+        reorder_feed(ro, 3, false, 1000 + 30001, em, lf, sk);  // skip 1
+        size_t before = em.size();
+        reorder_feed(ro, 1, true, 1000 + 30002,  em, lf, sk);  // too late -> drop
+        assert(em.size() == before);
+    }
+    // 5. a duplicate seq is emitted only once
+    {
+        swfec::SwfecReorder ro(30000);
+        std::vector<uint32_t> em; std::vector<uint8_t> lf; uint32_t sk = 0;
+        reorder_feed(ro, 0, false, 0,  em, lf, sk);
+        reorder_feed(ro, 0, false, 10, em, lf, sk);   // dup
+        assert(em.size() == 1);
+    }
+    // 6. poll() drains a stale gap with no new packet arriving
+    {
+        swfec::SwfecReorder ro(30000);
+        std::vector<uint32_t> em; std::vector<uint8_t> lf; uint32_t sk = 0;
+        reorder_feed(ro, 0, false, 0,    em, lf, sk);
+        reorder_feed(ro, 2, false, 1000, em, lf, sk);   // hold (gap @ 1)
+        assert(em.size() == 1);
+        std::vector<swfec::SwfecReorder::Out> out; uint32_t pk = 0;
+        ro.poll(1000 + 30001, out, pk);                 // deadline passed -> skip 1, emit 2
+        assert(out.size() == 1 && out[0].payload[0] == 2);
+        assert(pk == 1);
+    }
+    printf("reorder: OK (in-order, gap-fill, deadline-skip, drop-too-late, dedup, poll)\n");
+}
+
 int main(void)
 {
     test_gf_anchors();
@@ -219,6 +304,7 @@ int main(void)
     test_encoder_vectors("test_vectors/encoder_flush_oh30.bin");
     test_decoder_vectors("test_vectors/decoder_mixed.bin");
     test_fuzz_roundtrip();
+    test_reorder();
     printf("fec_swfec_test: ALL OK\n");
     return 0;
 }
