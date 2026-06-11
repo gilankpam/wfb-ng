@@ -515,6 +515,16 @@ void Aggregator::dump_stats(void)
         }
     }
 
+    // Contract v3: re-emit SESSION once per stats window so a late-attached
+    // python parser learns the session without waiting for an on-change event.
+    // The python side dedups, so aggregators only see real changes.
+    if (fec_p != NULL || swfec_dec != NULL)
+    {
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u:%u\n", ts, epoch,
+                session_is_swfec ? WFB_FEC_SWFEC : WFB_FEC_VDM_RS, fec_k, fec_n,
+                1u, (unsigned)WFB_IPC_CONTRACT_VERSION);
+    }
+
     IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
             count_p_all, count_b_all,                    // incoming
             count_p_dec_err,                             // decryption
