@@ -32,6 +32,13 @@ class SessionContractTests(unittest.TestCase):
             fec_type='VDM_RS', fec_k=8, fec_n=12, epoch=7,
             interleave_depth=1, contract_version=1))
 
+    def test_five_field_session_parsed(self):
+        p, cb = make_proto()
+        p.lineReceived(b'100\tSESSION\t7:2:50:30:2')
+        cb.process_new_session.assert_called_once_with('video rx', dict(
+            fec_type='swfec', fec_k=50, fec_n=30, epoch=7,
+            interleave_depth=2, contract_version=1))
+
     def test_session_reemission_deduped(self):
         p, cb = make_proto()
         p.lineReceived(b'100\tSESSION\t7:2:50:30:1:3')

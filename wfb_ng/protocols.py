@@ -436,7 +436,7 @@ class RXAntennaProtocol(LineReceiver):
 
                 # Contract v3 emits 6 fields (epoch:fec_type:k:n:
                 # interleave_depth:contract_version); stock emitted 4.
-                # Accept either; missing trailing fields default.
+                # Accept 4..6+; missing trailing fields default.
                 # For fec_type 'swfec', k/n carry overhead_pct/deadline_ms.
                 parts = list(int(i) for i in cols[2].split(':'))
                 if len(parts) < 4:
