@@ -1,5 +1,5 @@
 # Contract-v3 parsing tests for RXAntennaProtocol: tolerant SESSION
-# (4..6 fields), swfec fec_type naming, on-change dedup, tolerant PKT.
+# (4 or 5 fields), swfec fec_type naming, on-change dedup, tolerant PKT.
 #
 # Note: RXAntennaProtocol.lineReceived catches BadTelemetry internally
 # (logs the bad line and continues), so rejection is asserted via
@@ -18,37 +18,30 @@ def make_proto():
 
 
 class SessionContractTests(unittest.TestCase):
-    def test_six_field_session_parsed(self):
+    def test_five_field_session_parsed(self):
         p, cb = make_proto()
-        p.lineReceived(b'100\tSESSION\t7:2:50:30:1:3')
+        p.lineReceived(b'100\tSESSION\t7:2:50:30:3')
         cb.process_new_session.assert_called_once_with('video rx', dict(
             fec_type='swfec', fec_k=50, fec_n=30, epoch=7,
-            interleave_depth=1, contract_version=3))
+            contract_version=3))
 
     def test_four_field_session_defaults(self):
         p, cb = make_proto()
         p.lineReceived(b'100\tSESSION\t7:1:8:12')
         cb.process_new_session.assert_called_once_with('video rx', dict(
             fec_type='VDM_RS', fec_k=8, fec_n=12, epoch=7,
-            interleave_depth=1, contract_version=1))
-
-    def test_five_field_session_parsed(self):
-        p, cb = make_proto()
-        p.lineReceived(b'100\tSESSION\t7:2:50:30:2')
-        cb.process_new_session.assert_called_once_with('video rx', dict(
-            fec_type='swfec', fec_k=50, fec_n=30, epoch=7,
-            interleave_depth=2, contract_version=1))
+            contract_version=1))
 
     def test_session_reemission_deduped(self):
         p, cb = make_proto()
-        p.lineReceived(b'100\tSESSION\t7:2:50:30:1:3')
-        p.lineReceived(b'200\tSESSION\t7:2:50:30:1:3')   # periodic re-emit
+        p.lineReceived(b'100\tSESSION\t7:2:50:30:3')
+        p.lineReceived(b'200\tSESSION\t7:2:50:30:3')   # periodic re-emit
         self.assertEqual(cb.process_new_session.call_count, 1)
 
     def test_session_change_notifies_again(self):
         p, cb = make_proto()
-        p.lineReceived(b'100\tSESSION\t7:2:50:30:1:3')
-        p.lineReceived(b'200\tSESSION\t7:2:80:30:1:3')   # overhead changed
+        p.lineReceived(b'100\tSESSION\t7:2:50:30:3')
+        p.lineReceived(b'200\tSESSION\t7:2:80:30:3')   # overhead changed
         self.assertEqual(cb.process_new_session.call_count, 2)
 
     def test_short_session_rejected(self):

@@ -434,20 +434,18 @@ class RXAntennaProtocol(LineReceiver):
                 if len(cols) != 3:
                     raise BadTelemetry()
 
-                # Contract v3 emits 6 fields (epoch:fec_type:k:n:
-                # interleave_depth:contract_version); stock emitted 4.
-                # Accept 4..6+; missing trailing fields default.
+                # Contract v3 emits 5 fields (epoch:fec_type:k:n:
+                # contract_version); stock emitted 4. Accept either;
+                # a missing trailing field defaults to v1.
                 # For fec_type 'swfec', k/n carry overhead_pct/deadline_ms.
                 parts = list(int(i) for i in cols[2].split(':'))
                 if len(parts) < 4:
                     raise BadTelemetry()
                 epoch, fec_type, fec_k, fec_n = parts[:4]
-                interleave_depth = parts[4] if len(parts) > 4 else 1
-                contract_version = parts[5] if len(parts) > 5 else 1
+                contract_version = parts[4] if len(parts) > 4 else 1
 
                 new_session = dict(fec_type=fec_types.get(fec_type, 'Unknown'),
                                    fec_k=fec_k, fec_n=fec_n, epoch=epoch,
-                                   interleave_depth=interleave_depth,
                                    contract_version=contract_version)
 
                 # SESSION arrives on-change AND once per stats window;
