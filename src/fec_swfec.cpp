@@ -1,4 +1,4 @@
-// Implementation of the swfec C++ port. See fec_swfec.hpp for provenance.
+// swfec implementation. See fec_swfec.hpp for the protocol contract.
 #include "fec_swfec.hpp"
 
 #include <cstring>
@@ -28,7 +28,7 @@ SwfecEncoder::SwfecEncoder(float overhead, uint64_t deadline_us)
 void SwfecEncoder::push_source(const uint8_t* payload, size_t len, uint64_t now_us,
                                std::vector<std::vector<uint8_t> >& out)
 {
-    uint32_t seq = next_seq_++;   // unsigned wrap == Rust wrapping_add
+    uint32_t seq = next_seq_++;   // wraps mod 2^32 by design
 
     Entry e;
     e.seq = seq;
@@ -235,7 +235,7 @@ void SwfecDecoder::insert_row(Row& row, uint64_t now_us, std::vector<Delivered>&
             // row -= c * pivot (snapshot pivot data; the maps may not alias)
             std::vector<std::pair<uint64_t, uint8_t> > pc(
                 pit->second.coeffs.begin(), pit->second.coeffs.end());
-            abuf_t psym = pit->second.symbol;   // copy, mirrors the Rust clone
+            abuf_t psym = pit->second.symbol;   // deliberate copy (snapshot)
             for (size_t i = 0; i < pc.size(); i++) {
                 uint8_t prod = zfex_swfec_mul(c, pc[i].second);
                 uint8_t& e = row.coeffs[pc[i].first];

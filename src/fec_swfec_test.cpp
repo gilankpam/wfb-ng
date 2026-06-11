@@ -1,6 +1,6 @@
-// Differential and unit tests for the swfec C++ port.
+// Differential and unit tests for swfec.
 // Stage 1: verify zfex's GF(2^8) field matches swfec's wire protocol
-// (poly 0x11D): anchors mirror crates/swfec/src/gf256.rs tests.
+// (poly 0x11D).
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -10,7 +10,7 @@
 #include "zfex.h"
 #include "fec_swfec.hpp"
 
-// --- minimal vector-file reader (format: plan "Vector file format") ---
+// --- minimal vector-file reader ---
 struct VecReader {
     FILE* f;
     explicit VecReader(const char* path) {
@@ -56,7 +56,7 @@ static void test_coeff_vectors(const char* path)
 static void test_gf_anchors(void)
 {
     zfex_swfec_init();
-    // poly 0x11D, same anchors as the Rust reference: 2*2=4, 0x80*2=0x1D
+    // poly 0x11D anchors: 2*2=4, 0x80*2=0x1D
     assert(zfex_swfec_mul(0, 5) == 0);
     assert(zfex_swfec_mul(1, 0xAB) == 0xAB);
     assert(zfex_swfec_mul(2, 2) == 4);
@@ -298,7 +298,7 @@ int main(void)
 {
     test_gf_anchors();
     test_addmul_matches_naive();
-    // Differential tests against the Rust reference implementation. The
+    // Differential tests against pre-generated protocol vectors. The
     // binary vectors are not committed (~3 MB); when test_vectors/ is
     // present locally these pin byte-exact wire compatibility, otherwise
     // they are skipped and the self-contained tests below still run.
