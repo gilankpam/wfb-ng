@@ -492,6 +492,59 @@ int Aggregator::get_block_ring_idx(uint64_t block_idx)
     return ring_idx;
 }
 
+// Emit in-order packets released by the swfec reorder buffer, updating the
+// delivery/recovery counters. Shared by the packet fast path and the
+// quiet-gap poll so both account for output identically.
+void Aggregator::swfec_flush_reorder_out(std::vector<swfec::SwfecReorder::Out> &ro_out)
+{
+    for (size_t i = 0; i < ro_out.size(); i++)
+    {
+        send_to_socket(ro_out[i].payload.data(), (uint16_t)ro_out[i].payload.size());
+        swfec_delivered += 1;
+        count_p_outgoing += 1;
+        count_b_outgoing += (uint32_t)ro_out[i].payload.size();
+        if (ro_out[i].late)
+            count_p_fec_recovered += 1;
+    }
+}
+
+// Time-based drain with no new packet. The decoder delivers source packets on
+// arrival and recovered packets late, so the reorder buffer may hold packets
+// behind a gap waiting for the missing seq. On the loss-free path a new packet
+// always arrives to drive the drain, but if the stream goes quiet right after a
+// gap (e.g. end of a GOP) the held packets would otherwise stall until the next
+// packet. Calling this from the rx loop's idle tick releases them at the
+// deadline, matching the bounded latency of the RS-block path.
+void Aggregator::swfec_poll(void)
+{
+    if (!session_is_swfec || swfec_ro == NULL)
+        return;
+    uint64_t now_us = swfec::monotonic_us();
+    swfec_dec->tick(now_us);   // age out unrecoverable decoder state
+    std::vector<swfec::SwfecReorder::Out> ro_out;
+    uint32_t ro_skipped = 0;
+    (void)ro_skipped;
+    swfec_ro->poll(now_us, ro_out, ro_skipped);
+    swfec_flush_reorder_out(ro_out);
+}
+
+// Milliseconds until the next required quiet-gap drain, clamped to [0, max_ms],
+// or max_ms if nothing is pending. Used to bound the rx poll() timeout so the
+// drain fires near the deadline instead of at the next stats window.
+int Aggregator::swfec_poll_timeout_ms(int max_ms)
+{
+    if (!session_is_swfec || swfec_ro == NULL)
+        return max_ms;
+    uint64_t due_us = swfec_ro->next_drain_us();
+    if (due_us == 0)
+        return max_ms;
+    uint64_t now_us = swfec::monotonic_us();
+    if (due_us <= now_us)
+        return 0;
+    uint64_t wait_ms = (due_us - now_us + 999) / 1000;   // round up to not wake early
+    return wait_ms < (uint64_t)max_ms ? (int)wait_ms : max_ms;
+}
+
 void Aggregator::dump_stats(void)
 {
     //timestamp in ms
@@ -869,15 +922,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             swfec_ro->push(out[i].seq, out[i].late, out[i].payload.data(),
                            out[i].payload.size(), now_us, ro_out, ro_skipped);
         }
-        for (size_t i = 0; i < ro_out.size(); i++)
-        {
-            send_to_socket(ro_out[i].payload.data(), (uint16_t)ro_out[i].payload.size());
-            swfec_delivered += 1;
-            count_p_outgoing += 1;
-            count_b_outgoing += (uint32_t)ro_out[i].payload.size();
-            if (ro_out[i].late)
-                count_p_fec_recovered += 1;
-        }
+        swfec_flush_reorder_out(ro_out);
         return;   // RS ring logic is not applicable for swfec
     }
     // --- end swfec fast path ---
@@ -1174,7 +1219,10 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
     for(;;)
     {
         uint64_t cur_ts = get_time_ms();
-        int rc = poll(fds, nfds, log_send_ts > cur_ts ? log_send_ts - cur_ts : 0);
+        int poll_timeout = log_send_ts > cur_ts ? log_send_ts - cur_ts : 0;
+        // Wake early enough to drain a held swfec gap at its deadline.
+        poll_timeout = agg->swfec_poll_timeout_ms(poll_timeout);
+        int rc = poll(fds, nfds, poll_timeout);
 
         if (rc < 0){
             if (errno == EINTR || errno == EAGAIN) continue;
@@ -1187,6 +1235,9 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
             agg->dump_stats();
             log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
         }
+
+        // Release swfec packets held behind a gap whose deadline has passed.
+        agg->swfec_poll();
 
         if (rc == 0) continue; // timeout expired
 
@@ -1221,7 +1272,10 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
     for(;;)
     {
         uint64_t cur_ts = get_time_ms();
-        int rc = poll(fds, 1, log_send_ts > cur_ts ? log_send_ts - cur_ts : 0);
+        int poll_timeout = log_send_ts > cur_ts ? log_send_ts - cur_ts : 0;
+        // Wake early enough to drain a held swfec gap at its deadline.
+        poll_timeout = agg->swfec_poll_timeout_ms(poll_timeout);
+        int rc = poll(fds, 1, poll_timeout);
 
         if (rc < 0){
             if (errno == EINTR || errno == EAGAIN) continue;
@@ -1234,6 +1288,9 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
             agg->dump_stats();
             log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
         }
+
+        // Release swfec packets held behind a gap whose deadline has passed.
+        agg->swfec_poll();
 
         if (rc == 0) continue; // timeout expired
 

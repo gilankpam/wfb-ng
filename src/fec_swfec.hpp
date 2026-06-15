@@ -124,6 +124,9 @@ public:
     void push(const uint8_t* pkt, size_t len, uint64_t now_us,
               std::vector<Delivered>& out);
     void set_deadline_us(uint64_t v) { deadline_us_ = v; }   // param-only session update
+    // Age out unrecoverable state without a new packet (quiet-gap upkeep). push()
+    // expires internally, so this only matters while no packets are arriving.
+    void tick(uint64_t now_us) { expire(now_us); }
     const DecoderStats& stats() const { return stats_; }
     size_t pivot_count() const { return pivots_.size(); }
 private:
@@ -180,6 +183,16 @@ public:
     // Time-based drain without a new packet (honors the deadline during a
     // quiet gap). Appends releases to out and abandoned counts to skipped.
     void poll(uint64_t now_us, std::vector<Out>& out, uint32_t& skipped);
+    // Absolute time (us) at which the current head-of-line gap must be skipped,
+    // or 0 if nothing is pending. Lets a caller bound its wakeup so the
+    // quiet-gap drain fires near the deadline instead of waiting for the next
+    // packet to arrive. After drain() returns, a non-empty buffer always has a
+    // gap at the cursor, so the oldest buffered packet is the one behind it.
+    uint64_t next_drain_us() const {
+        if (buf_.empty())
+            return 0;
+        return buf_.begin()->second.arrived_us + deadline_us_;
+    }
 private:
     struct Item {
         std::vector<uint8_t> payload;

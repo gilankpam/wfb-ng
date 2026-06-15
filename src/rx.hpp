@@ -58,6 +58,14 @@ public:
                                 uint8_t bandwidth, sockaddr_in *sockaddr) = 0;
 
     virtual void dump_stats(void) = 0;
+
+    // swfec quiet-gap upkeep. Default no-op; only Aggregator drives a decoder.
+    // swfec_poll() releases reorder-buffer packets held behind a gap once their
+    // deadline passes (the loss-free path is driven by packet arrival instead).
+    // swfec_poll_timeout_ms() bounds the caller's poll() wait so the drain fires
+    // near the deadline rather than at the next stats window.
+    virtual void swfec_poll(void) {}
+    virtual int swfec_poll_timeout_ms(int max_ms) { return max_ms; }
 };
 
 
@@ -176,6 +184,8 @@ public:
                                 const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth, sockaddr_in *sockaddr);
     virtual void dump_stats(void);
+    virtual void swfec_poll(void);
+    virtual int swfec_poll_timeout_ms(int max_ms);
 
     // Packet loss listener for immediate notifications
     void set_packet_loss_listener(PacketLossListener* listener) { packet_loss_listener_ = listener; }
@@ -221,6 +231,7 @@ private:
 
     void init_fec(int k, int n);
     void deinit_fec(void);
+    void swfec_flush_reorder_out(std::vector<swfec::SwfecReorder::Out> &ro_out);
     void send_packet(int ring_idx, int fragment_idx);
     void apply_fec(int ring_idx);
     void log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi,
