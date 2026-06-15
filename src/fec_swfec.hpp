@@ -27,7 +27,14 @@ struct aligned_alloc_t {
     template <class U> aligned_alloc_t(const aligned_alloc_t<U, Align>&) {}
     T* allocate(size_t n) {
         void* p = NULL;
-        if (posix_memalign(&p, Align, n != 0 ? n * sizeof(T) : Align) != 0)
+        // zfex's SIMD addmul reads (SSSE3) and reads+writes (NEON) a full SIMD
+        // vector in its tail, so the allocation must be padded up to the stride
+        // (Align == ZFEX_SIMD_ALIGNMENT), not merely base-aligned. An exact-sized
+        // buffer is over-read by up to Align-1 bytes — and over-WRITTEN on NEON.
+        // deallocate() calls free(), so the rounded-up size is transparent.
+        size_t bytes = (n != 0 ? n * sizeof(T) : Align);
+        bytes = (bytes + Align - 1) & ~(size_t)(Align - 1);
+        if (posix_memalign(&p, Align, bytes) != 0)
             throw std::bad_alloc();
         return static_cast<T*>(p);
     }

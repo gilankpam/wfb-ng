@@ -69,23 +69,70 @@ static void test_gf_anchors(void)
 static void test_addmul_matches_naive(void)
 {
     zfex_swfec_init();
-    // aligned buffers, odd length to exercise the scalar tail
-    static uint8_t dst[1203] __attribute__((aligned(16)));
-    static uint8_t ref[1203] __attribute__((aligned(16)));
-    static uint8_t src[1203] __attribute__((aligned(16)));
-    static uint8_t expect[1203] __attribute__((aligned(16)));
-    for (int i = 0; i < 1203; i++) {
+    // Odd length N exercises the SIMD/scalar partial tail. The SIMD tail loads a
+    // full 16-byte vector, so the buffers are padded up to the stride (NBUF), just
+    // as the abuf_t allocator pads a real symbol — while addmul runs over the odd
+    // logical length N and only N bytes are compared.
+    enum { N = 1203, NBUF = 1216 };   // NBUF == ZFEX_ROUND_UP_SIMD(N)
+    static uint8_t dst[NBUF] __attribute__((aligned(16)));
+    static uint8_t ref[NBUF] __attribute__((aligned(16)));
+    static uint8_t src[NBUF] __attribute__((aligned(16)));
+    static uint8_t expect[NBUF] __attribute__((aligned(16)));
+    for (int i = 0; i < N; i++) {
         src[i] = (uint8_t)(i * 31 + 7);
         dst[i] = ref[i] = (uint8_t)(i * 5);
     }
     for (int c = 0; c <= 255; c++) {
-        memcpy(dst, ref, sizeof(dst));
-        for (int i = 0; i < 1203; i++)
+        memcpy(dst, ref, N);
+        for (int i = 0; i < N; i++)
             expect[i] = ref[i] ^ zfex_swfec_mul((gf)c, src[i]);
-        zfex_swfec_addmul(dst, src, (gf)c, sizeof(dst));
-        assert(memcmp(dst, expect, sizeof(dst)) == 0);
+        zfex_swfec_addmul(dst, src, (gf)c, N);
+        assert(memcmp(dst, expect, N) == 0);
     }
     printf("addmul vs naive: OK (all 256 coefficients)\n");
+}
+
+// zfex's SIMD addmul kernels load (SSSE3) and load+store (NEON) a full 16-byte
+// vector in their tail, so a symbol buffer whose length is not a multiple of the
+// SIMD stride is read/written past its logical end. Production symbols are
+// abuf_t, whose allocator must therefore pad the allocation up to the stride.
+// Drive that exact allocator across sub-stride and odd lengths and check the
+// result byte-for-byte: under a SIMD build with ASan this faults on the
+// over-read until aligned_alloc_t pads, and the asserts catch any miscompute.
+static void test_addmul_abuf_lengths(void)
+{
+    zfex_swfec_init();
+    for (size_t sz = 1; sz <= 40; sz++) {
+        swfec::abuf_t dst(sz), src(sz), ref(sz);
+        for (size_t i = 0; i < sz; i++) {
+            src[i] = (uint8_t)(i * 31 + 7);
+            dst[i] = ref[i] = (uint8_t)(i * 5 + 1);
+        }
+        zfex_swfec_addmul(dst.data(), src.data(), 0xB7, sz);
+        for (size_t i = 0; i < sz; i++)
+            assert(dst[i] == (uint8_t)(ref[i] ^ zfex_swfec_mul(0xB7, src[i])));
+    }
+    printf("addmul abuf lengths: OK (sub-stride + odd, in bounds)\n");
+}
+
+// A repair's window_len (pkt[9]) is a peer-controlled wire byte in 0..255, but
+// the encoder never emits more than SWFEC_WINDOW_CAP entries. A repair claiming
+// more must be rejected as malformed before the combine loop, not processed
+// (which would size coeffs[] and scan up to 255 phantom seqs per repair).
+static void test_decoder_rejects_oversized_window(void)
+{
+    swfec::SwfecDecoder dec(30000);
+    uint8_t pkt[swfec::SWFEC_REPAIR_HDR];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = swfec::SWFEC_WIRE_REPAIR;
+    pkt[9] = swfec::SWFEC_WINDOW_CAP + 1;   // window_len just over the cap
+    // symbol_len (pkt[10..11]) == 0, so len == SWFEC_REPAIR_HDR: structurally valid
+    std::vector<swfec::Delivered> out;
+    dec.push(pkt, sizeof(pkt), 1000, out);
+    assert(dec.stats().malformed == 1);
+    assert(dec.stats().repairs_received == 0);
+    assert(dec.pivot_count() == 0);
+    printf("decoder oversized window: OK (rejected as malformed)\n");
 }
 
 static void test_encoder_vectors(const char* path)
@@ -298,6 +345,7 @@ int main(void)
 {
     test_gf_anchors();
     test_addmul_matches_naive();
+    test_addmul_abuf_lengths();
     // Differential tests against pre-generated protocol vectors. The
     // binary vectors are not committed (~3 MB); when test_vectors/ is
     // present locally these pin byte-exact wire compatibility, otherwise
@@ -314,6 +362,7 @@ int main(void)
         printf("reference vectors: SKIPPED (test_vectors/ not present)\n");
     }
     test_fuzz_roundtrip();
+    test_decoder_rejects_oversized_window();
     test_reorder();
     printf("fec_swfec_test: ALL OK\n");
     return 0;

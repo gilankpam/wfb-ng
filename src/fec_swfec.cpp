@@ -4,6 +4,12 @@
 #include <cstring>
 #include "zfex.h"   // zfex_swfec_{init,mul,inv,addmul}
 
+// abuf_t's allocator (fec_swfec.hpp) aligns and pads symbol buffers to 16 so the
+// SIMD addmul tail can load/store a full vector in bounds. That 16 must equal
+// zfex's SIMD stride; if zfex ever changes it, update aligned_alloc_t's Align.
+static_assert(ZFEX_SIMD_ALIGNMENT == 16,
+              "abuf_t alignment/padding must match zfex's SIMD stride");
+
 namespace swfec {
 
 void CoeffGen::coeffs(uint32_t repair_id, size_t n, uint8_t* out)
@@ -189,10 +195,14 @@ void SwfecDecoder::push(const uint8_t* pkt, size_t len, uint64_t now_us,
         if (len < SWFEC_REPAIR_HDR) { stats_.malformed++; return; }
         uint16_t symbol_len = swfec_be16(pkt + 10);
         if (len != SWFEC_REPAIR_HDR + (size_t)symbol_len) { stats_.malformed++; return; }
+        size_t n = pkt[9];
+        // window_len is a peer-controlled wire byte (0..255); the encoder never
+        // emits more than SWFEC_WINDOW_CAP. Reject an over-cap repair before the
+        // combine loop so a bad peer can't inflate coeffs[]/first_seen_ scans.
+        if (n > SWFEC_WINDOW_CAP) { stats_.malformed++; return; }
         stats_.repairs_received++;
         uint32_t repair_id = swfec_be32(pkt + 1);
         uint32_t window_start = swfec_be32(pkt + 5);
-        size_t n = pkt[9];
         uint64_t start = unwrap_seq(window_start);
         std::vector<uint8_t> coeffs(n);
         if (n) CoeffGen::coeffs(repair_id, n, coeffs.data());
