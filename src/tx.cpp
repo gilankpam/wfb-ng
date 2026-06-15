@@ -724,19 +724,37 @@ void Transmitter::send_swfec_wire(const uint8_t *data, size_t size)
     }
 }
 
+// On a live swfec param change, re-announce the session packet a few times so a
+// single lost announce doesn't strand the RX on the old value until the next
+// ~1 Hz periodic broadcast. Mirrors the RS reconfigure path's session-key flood.
+static const int SWFEC_REANNOUNCE_BURST = 5;
+
 void Transmitter::swfec_set_params(int overhead_pct, int deadline_ms)
 {
     assert(use_swfec && swfec_enc != NULL);
-    swfec_enc->set_overhead(overhead_pct / 100.0f);
-    fec_k = overhead_pct;
-    // overhead is TX-only: the RX decoder learns each repair's window from the
-    // wire packet itself and never reads session 'k', so an overhead change
-    // needs no re-announce. Only a deadline change (below) re-announces.
+    bool changed = false;
+    if (overhead_pct != fec_k)
+    {
+        swfec_enc->set_overhead(overhead_pct / 100.0f);
+        fec_k = overhead_pct;   // overhead_pct rides the session 'k' slot
+        changed = true;
+    }
     if (deadline_ms != fec_n)
     {
-        fec_n = deadline_ms;
         swfec_enc->set_deadline_us((uint64_t)deadline_ms * 1000);
+        fec_n = deadline_ms;    // deadline_ms rides the session 'n' slot
+        changed = true;
+    }
+    if (changed)
+    {
+        // Rebuild and re-announce immediately. A deadline change must reach the RX
+        // promptly (the encoder already encodes with the new deadline); an
+        // overhead change keeps the RX-/telemetry-reported overhead_pct current
+        // (the RX never reads session 'k' for delivery, so this is cosmetic but
+        // correct). The burst gives the announce the same redundancy as RS.
         rebuild_session_packet();
+        for (int i = 0; i < SWFEC_REANNOUNCE_BURST; i++)
+            send_session_key();
     }
 }
 
@@ -1830,12 +1848,30 @@ int main(int argc, char * const *argv)
         case 'K':
             keypair = optarg;
             break;
-        case 'k':
-            k = atoi(optarg);
+        case 'k': {
+            // k rides a uint8 wire byte (FEC k, or swfec overhead_pct). Validate
+            // the full value before it truncates into the uint8_t, so an
+            // out-of-range -k is rejected rather than silently wrapped.
+            int v = atoi(optarg);
+            if (v < 0 || v > 255) {
+                WFB_ERR("-k must be in 0..255 (FEC k / swfec overhead_pct)\n");
+                goto show_usage;
+            }
+            k = (uint8_t)v;
             break;
-        case 'n':
-            n = atoi(optarg);
+        }
+        case 'n': {
+            // n rides a uint8 wire byte (FEC n, or swfec deadline_ms). Validate the
+            // full value before it truncates into the uint8_t: otherwise e.g.
+            // -n 300 silently becomes 44 ms (300 & 0xff) instead of being rejected.
+            int v = atoi(optarg);
+            if (v < 0 || v > 255) {
+                WFB_ERR("-n must be in 0..255 (FEC n / swfec deadline_ms)\n");
+                goto show_usage;
+            }
+            n = (uint8_t)v;
             break;
+        }
         case 'u':
             udp_port = atoi(optarg);
             break;
