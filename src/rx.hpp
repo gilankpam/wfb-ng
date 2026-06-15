@@ -251,11 +251,8 @@ private:
     swfec::SwfecDecoder *swfec_dec;   // NULL unless swfec session active
     swfec::SwfecReorder *swfec_ro;    // in-order release buffer; NULL unless swfec session active
     uint8_t swfec_deadline_ms;        // current deadline, for param-only updates
-    // seq-gap loss accounting (mirrors phase-2 ExpectedTracker):
-    uint64_t swfec_max_seq_end;       // max(source seq, repair window end) seen
-    bool     swfec_any_seen;
-    uint64_t swfec_delivered;         // total Delivered emitted
-    uint64_t swfec_lost_reported;     // already counted into count_p_lost
+    // swfec loss is counted directly from the reorder buffer's abandoned-gap
+    // tally (count_p_lost += ro_skipped), so no seq-gap tracker state is needed.
 
     uint32_t seq;
     rx_ring_item_t rx_ring[RX_RING_SIZE];

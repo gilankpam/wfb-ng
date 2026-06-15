@@ -272,7 +272,6 @@ Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_i
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
     fec_p(NULL), fec_k(-1), fec_n(-1),
     session_is_swfec(false), swfec_dec(NULL), swfec_ro(NULL), swfec_deadline_ms(0),
-    swfec_max_seq_end(0), swfec_any_seen(false), swfec_delivered(0), swfec_lost_reported(0),
     seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
     last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
 {
@@ -500,7 +499,6 @@ void Aggregator::swfec_flush_reorder_out(std::vector<swfec::SwfecReorder::Out> &
     for (size_t i = 0; i < ro_out.size(); i++)
     {
         send_to_socket(ro_out[i].payload.data(), (uint16_t)ro_out[i].payload.size());
-        swfec_delivered += 1;
         count_p_outgoing += 1;
         count_b_outgoing += (uint32_t)ro_out[i].payload.size();
         if (ro_out[i].late)
@@ -523,8 +521,8 @@ void Aggregator::swfec_poll(void)
     swfec_dec->tick(now_us);   // age out unrecoverable decoder state
     std::vector<swfec::SwfecReorder::Out> ro_out;
     uint32_t ro_skipped = 0;
-    (void)ro_skipped;
     swfec_ro->poll(now_us, ro_out, ro_skipped);
+    count_p_lost += ro_skipped;
     swfec_flush_reorder_out(ro_out);
 }
 
@@ -558,17 +556,9 @@ void Aggregator::dump_stats(void)
                 it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
     }
 
-    // Swfec loss accounting: compute seq-gap based loss before emitting PKT line
-    if (session_is_swfec && swfec_any_seen)
-    {
-        uint64_t expected = swfec_max_seq_end + 1;
-        uint64_t lost_total = expected > swfec_delivered ? expected - swfec_delivered : 0;
-        if (lost_total > swfec_lost_reported)
-        {
-            count_p_lost += (uint32_t)(lost_total - swfec_lost_reported);
-            swfec_lost_reported = lost_total;
-        }
-    }
+    // swfec loss is accumulated into count_p_lost as the reorder buffer abandons
+    // gaps past the deadline (see swfec fast path / swfec_poll); nothing to
+    // compute here. count_p_lost is reset each window by clear_stats().
 
     // Contract v3: re-emit SESSION once per stats window so a late-attached
     // python parser learns the session without waiting for an on-change event.
@@ -787,6 +777,17 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         }
         else if (new_session_data->fec_type == WFB_FEC_SWFEC)
         {
+            // swfec carries deadline_ms in the n slot; reject n==0 (a deadline-0
+            // decoder expires every packet immediately and the reorder buffer
+            // drops everything), mirroring the RS branch's FEC-N guard. swfec k
+            // is overhead_pct, which RX ignores, so it needs no validation.
+            if (new_session_data->n < 1)
+            {
+                WFB_ERR("Invalid swfec deadline_ms (n): %d\n", new_session_data->n);
+                count_p_dec_err += 1;
+                return;
+            }
+
             count_p_session += 1;
 
             if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
@@ -807,10 +808,6 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 swfec_ro = new swfec::SwfecReorder((uint64_t)new_session_data->n * 1000);
                 session_is_swfec = true;
                 swfec_deadline_ms = new_session_data->n;
-                swfec_max_seq_end = 0;
-                swfec_any_seen = false;
-                swfec_delivered = 0;
-                swfec_lost_reported = 0;
 
                 fec_k = new_session_data->k;   // swfec: overhead_pct rides the k slot
                 fec_n = new_session_data->n;   // swfec: deadline_ms rides the n slot
@@ -873,33 +870,6 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     if (session_is_swfec)
     {
         assert(swfec_dec != NULL);
-        // Seq-gap tracker: observe wire header before decode
-        // Loss tracker uses raw u32 wire seqs by design: a session rekeys (new
-        // decoder + reset) long before the u32 seq could wrap (~2^32 packets), so
-        // no unwrap is needed here. The decoder handles its own u64 unwrap internally.
-        if (decrypted_len >= 5 && decrypted[0] == swfec::SWFEC_WIRE_SOURCE)
-        {
-            uint32_t s = swfec::swfec_be32(decrypted + 1);
-            if (!swfec_any_seen || s > (uint32_t)swfec_max_seq_end)
-            {
-                swfec_max_seq_end = s;
-                swfec_any_seen = true;
-            }
-        }
-        else if (decrypted_len >= 12 && decrypted[0] == swfec::SWFEC_WIRE_REPAIR)
-        {
-            uint32_t window_start = swfec::swfec_be32(decrypted + 5);
-            uint8_t  window_len   = decrypted[9];
-            if (window_len > 0)
-            {
-                uint32_t end = window_start + window_len - 1;
-                if (!swfec_any_seen || end > (uint32_t)swfec_max_seq_end)
-                {
-                    swfec_max_seq_end = end;
-                    swfec_any_seen = true;
-                }
-            }
-        }
 
         uint64_t now_us = swfec::monotonic_us();
         std::vector<swfec::Delivered> out;
@@ -909,19 +879,19 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         // i.e. out of order. Pass everything through the in-order reorder buffer
         // so the consumer (e.g. pixelpilot --rtp-jitter-ms 0) sees a strictly
         // ordered stream, matching the RS-block path. A gap is held up to the
-        // deadline; if unfilled it is skipped (never emitted). Skipped packets
-        // need no separate loss tally: they advance swfec_max_seq_end but never
-        // increment swfec_delivered, so the existing dump_stats accounting counts
-        // them as lost exactly once. ro_skipped is kept only for clarity here.
+        // deadline; if unfilled it is skipped (never emitted). The reorder buffer
+        // reports those abandoned-past-deadline gaps in ro_skipped — the
+        // authoritative loss count, anchored to the first seq this RX saw — which
+        // feeds count_p_lost (reset each stats window by clear_stats).
         std::vector<swfec::SwfecReorder::Out> ro_out;
         uint32_t ro_skipped = 0;
-        (void)ro_skipped;
         for (size_t i = 0; i < out.size(); i++)
         {
             assert(out[i].payload.size() <= MAX_FEC_PAYLOAD);
             swfec_ro->push(out[i].seq, out[i].late, out[i].payload.data(),
                            out[i].payload.size(), now_us, ro_out, ro_skipped);
         }
+        count_p_lost += ro_skipped;
         swfec_flush_reorder_out(ro_out);
         return;   // RS ring logic is not applicable for swfec
     }
