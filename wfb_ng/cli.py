@@ -212,7 +212,7 @@ class AntennaStat(Int32StringReceiver):
 
             addstr_markup(window, 2, 20, '{Freq MCS BW %s[ANT]%s pkt/s dloss}     {RSSI} [dBm]        {SNR} [dB]' % (lpad, rpad))
             for y, (((freq, mcs_index, bandwidth), ant_id), v) in enumerate(sorted(stats_d.items()), 3):
-                pkt_s, rssi_min, rssi_avg, rssi_max, snr_min, snr_avg, snr_max = v
+                pkt_s, rssi_min, rssi_avg, rssi_max, snr_min, snr_avg, snr_max = v[:7]
                 if y < ymax:
                     active_tx = ((ant_id >> 8) == tx_wlan)
                     diff_loss = max(p['uniq'][0] - pkt_s, 0)
