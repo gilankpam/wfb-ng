@@ -19,6 +19,7 @@
 #
 
 import sys
+import locale
 import curses
 import msgpack
 import tempfile
@@ -53,10 +54,22 @@ def ignore_curses_err(f):
     return _f
 
 
+def _addch(window, y, x, c, *attrs):
+    try:
+        window.addch(y, x, c, *attrs)
+    except OverflowError:
+        # addch() packs the char into a chtype, so it only accepts chars that
+        # encode to a single byte in the terminal encoding. Multibyte chars
+        # (e.g. UTF-8 '°') raise OverflowError. addstr() writes the encoded
+        # bytes directly and works on both narrow and wide curses builds
+        # (add_wch() is absent on narrow ncurses, e.g. the OpenIPC GS).
+        window.addstr(y, x, c, *attrs)
+
+
 @ignore_curses_err
 def addstr_noerr(window, y, x, s, *attrs):
     for i, c in enumerate(s, x):
-        window.addch(y, i, c, *attrs)
+        _addch(window, y, i, c, *attrs)
 
 
 def addstr_centered(window, s, attrs=0):
@@ -86,7 +99,7 @@ def addstr_markup(window, y, x, s, attrs=0):
             attrs &= ~curses.A_REVERSE
             continue
 
-        window.addch(y, x, c, attrs)
+        _addch(window, y, x, c, attrs)
         x += 1
 
 def rectangle(win, uly, ulx, lry, lrx):
@@ -440,6 +453,9 @@ def main():
 
     fd = tempfile.TemporaryFile(mode='w+', encoding='utf-8')
     log.startLogging(fd)
+
+    # Required for curses add_wch() to render non-ASCII (e.g. '°') correctly.
+    locale.setlocale(locale.LC_ALL, '')
 
     stdscr = curses.initscr()
     try:
