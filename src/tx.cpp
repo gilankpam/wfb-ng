@@ -2033,7 +2033,7 @@ int main(int argc, char * const *argv)
         goto show_usage;
     }
 
-    if (keypair.empty()) {
+    if (tx_mode != INJECTOR && keypair.empty()) {
         WFB_ERR("WARNING: no -K given — running UNENCRYPTED on radio_port %d\n", radio_port);
     }
 

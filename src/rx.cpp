@@ -921,6 +921,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             return;
         }
 
+        // Plaintext validation failures below are counted as count_p_bad (not the
+        // encrypted path's count_p_dec_err): there is no decrypt step, and an
+        // invalid plaintext session is unauthenticated / likely hostile, so the
+        // "bad packet" bucket fits better than "decode error". Deliberate.
         if (size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) || size > MAX_SESSION_PACKET_SIZE)
         {
             WFB_ERR("Invalid plain session packet\n");
@@ -944,12 +948,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
         const wsession_data_t* sd = (const wsession_data_t*)(buf + sizeof(wsession_hdr_t));
 
-        if (be64toh(sd->epoch) < epoch)
-        {
-            WFB_ERR("Session epoch doesn't match: %" PRIu64 " < %" PRIu64 "\n", be64toh(sd->epoch), epoch);
-            count_p_bad += 1;
-            return;
-        }
+        // No epoch gate in plaintext: the epoch field is unauthenticated here, so
+        // honoring "epoch < current -> reject" would let one forged session with a
+        // huge epoch permanently latch the RX into rejecting all legitimate
+        // (epoch == 0) sessions — a persistent freeze that defeats the session-ID
+        // restart recovery below. The session-ID memcmp is the sole authority for
+        // session changes in plaintext; an unauthenticated epoch buys no real
+        // replay protection. (setup_session still records the announced epoch for
+        // the IPC SESSION line; a forged value is overwritten by the next session.)
         if (be32toh(sd->channel_id) != channel_id)
         {
             WFB_ERR("Session channel_id doesn't match: %u != %u\n", be32toh(sd->channel_id), channel_id);

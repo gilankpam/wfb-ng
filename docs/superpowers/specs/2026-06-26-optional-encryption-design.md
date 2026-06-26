@@ -129,6 +129,15 @@ Each site branches `if (encrypted) { …today… } else { …plaintext… }`:
     (`count_p_data++`, swfec push / RS ring) is byte-identical.
   - `WFB_PACKET_SESSION_PLAIN`: same `generichash` dedup; parse the plaintext
     `wsession_data_t`; (re)build the RS/swfec decoder; emit the same IPC `SESSION` line.
+    **No epoch monotonic gate in this path**: the `epoch` field is unauthenticated in
+    plaintext, so honouring "incoming epoch < current → reject" would let one forged
+    session with `epoch=UINT64_MAX` permanently latch the RX, preventing any
+    subsequent legitimate session (with `epoch=0`) from being accepted.  The session-ID
+    `memcmp` is the sole authority for session changes in plaintext; an unauthenticated
+    epoch buys no replay protection here.  `setup_session` still records the announced
+    epoch for the IPC `SESSION` line; a forged value is overwritten by the next real
+    session.  (The encrypted `WFB_PACKET_SESSION` path retains its epoch gate because
+    the epoch there is authenticated by the `crypto_box`.)
 
 **"New session?" detection — unified session-ID mechanism.** Both the encrypted and
 plaintext paths use the *same* gate: `memcmp(session_key, new->session_key)`. In
@@ -216,11 +225,15 @@ unchanged params (e.g. `epoch=0` default, same `k/n`).
 
 **For the plaintext video stream** (operator-accepted): confidentiality is lost
 (anyone can watch); integrity/authenticity is lost (anyone on the channel can inject
-or forge video fragments, or forge a session with bogus `k/n` or a higher `epoch`).
-Worst case is **video denial-of-service or spoofing**. 802.11 FCS still drops
-in-flight-corrupted frames and the FEC/in-order reorder structure rejects much
-garbage, but a deliberate attacker can disrupt the plaintext video — this is inherent
-to "no encryption" and limited to the video stream.
+or forge video fragments, or forge a session with bogus `k/n`).  A forged
+`SESSION_PLAIN` with a large epoch causes **at most a transient decoder rebuild** (the
+RX picks up the announced `k/n` from the forged packet and rebuilds; the next
+legitimate `SESSION_PLAIN` with a different `session_key` or `k/n` triggers another
+rebuild) — it does **not** produce a persistent latch, because the plaintext path
+carries no epoch gate (see §4.4).  Worst case remains **video denial-of-service or
+spoofing**. 802.11 FCS still drops in-flight-corrupted frames and the FEC/in-order
+reorder structure rejects much garbage, but a deliberate attacker can disrupt the
+plaintext video — this is inherent to "no encryption" and limited to the video stream.
 
 **For mavlink/tunnel (unchanged):** confidentiality and integrity are preserved
 (AEAD + `crypto_box`). They run on different `channel_id`s (video `radio_port` `0x00`,
