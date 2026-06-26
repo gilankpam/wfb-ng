@@ -1,7 +1,7 @@
 # Optional Encryption for `wfb_tx` / `wfb_rx` — Design
 
 **Date:** 2026-06-26
-**Status:** Approved design; pending implementation plan
+**Status:** Implemented (branch `optional-encryption`)
 **Target:** Local fork (based on svpcom/wfb-ng)
 
 ## 1. Goal & motivation
