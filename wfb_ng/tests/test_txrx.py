@@ -475,6 +475,87 @@ class PlaintextTXOnlyTestCase(unittest.TestCase):
         self.assertEqual(len(self.txp.rxq), 25)
 
 
+class PlaintextTXRXTestCase(TXRXTestCase):
+    # Same end-to-end round-trip assertions as TXRXTestCase, but both
+    # wfb_tx and wfb_rx run with NO -K (plaintext). Inherits test_txrx,
+    # test_aggregation, test_fec_timeout, test_cmd_* unchanged.
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        yield self.setup_keys(bindir)  # keys generated but unused (no -K passed)
+
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.cmdp = TXCommandClient(('127.0.0.1', 7003))
+
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        self.cmd_ep = reactor.listenUDP(0, self.cmdp)
+
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        # NOTE: no -K on either side -> plaintext
+        cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-a', '10001', '-u', '10002',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000', '-C', '7003',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+
+        ap = FakeAntennaProtocol()
+        self.rx_pp = RXProtocol(ap, cmd_rx, 'debug rx')
+        self.tx_pp = TXProtocol(ap, cmd_tx, 'debug tx')
+
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        yield df_sleep(0.1)
+
+
+class PlaintextSafetyTestCase(unittest.TestCase):
+    # Core invariant: a plaintext TX (no -K) must NOT be decoded by an
+    # ENCRYPTED RX (-K). The encrypted RX rejects 0x3/0x4 -> no output.
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        yield call_and_check_rc(os.path.join(bindir, 'wfb_keygen'))
+
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-K', 'drone.key', '-a', '10001', '-u', '10002',  # ENCRYPTED rx
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000',  # PLAINTEXT tx
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+
+        ap = FakeAntennaProtocol()
+        self.rx_pp = RXProtocol(ap, cmd_rx, 'debug rx')
+        self.tx_pp = TXProtocol(ap, cmd_tx, 'debug tx')
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        self.rx_pp.transport.signalProcess('KILL')
+        self.tx_pp.transport.signalProcess('KILL')
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_encrypted_rx_rejects_plaintext(self):
+        for i in range(16):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+        yield df_sleep(0.1)
+        self.assertEqual(len(self.txp.rxq), 25)  # plaintext tx still emits
+        for pkt in self.txp.rxq:                  # forward every packet to the ENCRYPTED rx
+            self.rxp.send_msg(pkt)
+        yield df_sleep(1.1)
+        self.assertEqual(self.rxp.rxq, [])        # ...which decodes nothing
+
+
 class UNIXTXRXTestCase(TXRXTestCase):
     @defer.inlineCallbacks
     def setUp(self):

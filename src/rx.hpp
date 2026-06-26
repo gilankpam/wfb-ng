@@ -284,6 +284,7 @@ private:
     uint64_t last_known_block;  //id of last known block
     uint64_t epoch; // current epoch
     const uint32_t channel_id; // (link_id << 8) + port_number
+    const bool encrypted; // false when no keypair given (-K absent): plaintext mode
 
     // rx->tx keypair
     uint8_t rx_secretkey[crypto_box_SECRETKEYBYTES];
