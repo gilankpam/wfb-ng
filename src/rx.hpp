@@ -251,6 +251,8 @@ private:
     Aggregator& operator=(const Aggregator&);
 
     void init_fec(int k, int n);
+    void setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch);
+    void swfec_set_deadline(uint8_t n); // param-only swfec deadline update (shared encrypted + plaintext)
     void deinit_fec(void);
     void swfec_flush_reorder_out(std::vector<swfec::SwfecReorder::Out> &ro_out);
     void send_packet(int ring_idx, int fragment_idx);

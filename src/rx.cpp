@@ -353,6 +353,72 @@ void Aggregator::init_fec(int k, int n)
     }
 }
 
+// (Re)build the RX decoder from session FEC params and emit the IPC SESSION line.
+// Shared by the encrypted session path (on session-key change) and the plaintext
+// session path (on param change). Does not touch session_key.
+void Aggregator::setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch)
+{
+    epoch = new_epoch;
+
+    if (fec_type == WFB_FEC_VDM_RS)
+    {
+        // Drop any active swfec decoder when switching to RS
+        delete swfec_dec;
+        swfec_dec = NULL;
+        delete swfec_ro;
+        swfec_ro = NULL;
+        session_is_swfec = false;
+
+        if (fec_p != NULL)
+        {
+            deinit_fec();
+        }
+
+        init_fec(k, n);
+
+        // Trailing field #5 (contract_version). 4-field-only parsers stay compatible.
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch,
+                (unsigned)WFB_FEC_VDM_RS, fec_k, fec_n, (unsigned)WFB_IPC_CONTRACT_VERSION);
+        IPC_MSG_SEND();
+    }
+    else // WFB_FEC_SWFEC
+    {
+        if (fec_p != NULL)
+        {
+            deinit_fec();
+        }
+
+        delete swfec_dec;
+        swfec_dec = NULL;
+        swfec_dec = new swfec::SwfecDecoder((uint64_t)n * 1000);
+        delete swfec_ro;
+        swfec_ro = new swfec::SwfecReorder((uint64_t)n * 1000);
+        session_is_swfec = true;
+        swfec_deadline_ms = n;
+
+        fec_k = k;   // swfec: overhead_pct rides the k slot
+        fec_n = n;   // swfec: deadline_ms rides the n slot
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch,
+                (unsigned)WFB_FEC_SWFEC, fec_k, fec_n, (unsigned)WFB_IPC_CONTRACT_VERSION);
+        IPC_MSG_SEND();
+    }
+}
+
+// Param-only swfec deadline update (same session, deadline changed): no decoder
+// reset. Shared by the encrypted session path and the plaintext SESSION_PLAIN path.
+void Aggregator::swfec_set_deadline(uint8_t n)
+{
+    swfec_deadline_ms = n;
+    swfec_dec->set_deadline_us((uint64_t)n * 1000);
+    if (swfec_ro != NULL)
+        swfec_ro->set_deadline_us((uint64_t)n * 1000);
+    fec_n = n;
+    IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n",
+            get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
+            (unsigned)WFB_IPC_CONTRACT_VERSION);
+    IPC_MSG_SEND();
+}
+
 void Aggregator::deinit_fec(void)
 {
     assert(fec_p != NULL);
@@ -768,27 +834,9 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
             if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
             {
-                epoch = be64toh(new_session_data->epoch);
                 memcpy(session_key, new_session_data->session_key, sizeof(session_key));
-
-                // Drop any active swfec decoder when switching to RS
-                delete swfec_dec;
-                swfec_dec = NULL;
-                delete swfec_ro;
-                swfec_ro = NULL;
-                session_is_swfec = false;
-
-                if (fec_p != NULL)
-                {
-                    deinit_fec();
-                }
-
-                init_fec(new_session_data->k, new_session_data->n);
-
-                // Trailing field #5 (contract_version). 4-field-only parsers stay compatible.
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch, (unsigned)WFB_FEC_VDM_RS, fec_k, fec_n,
-                        (unsigned)WFB_IPC_CONTRACT_VERSION);
-                IPC_MSG_SEND();
+                setup_session(WFB_FEC_VDM_RS, new_session_data->k, new_session_data->n,
+                              be64toh(new_session_data->epoch));
             }
         }
         else if (new_session_data->fec_type == WFB_FEC_SWFEC)
@@ -809,40 +857,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
             {
                 // New swfec session: (re)build decoder
-                epoch = be64toh(new_session_data->epoch);
                 memcpy(session_key, new_session_data->session_key, sizeof(session_key));
-
-                if (fec_p != NULL)
-                {
-                    deinit_fec();
-                }
-
-                delete swfec_dec;
-                swfec_dec = NULL;
-                swfec_dec = new swfec::SwfecDecoder((uint64_t)new_session_data->n * 1000);
-                delete swfec_ro;
-                swfec_ro = new swfec::SwfecReorder((uint64_t)new_session_data->n * 1000);
-                session_is_swfec = true;
-                swfec_deadline_ms = new_session_data->n;
-
-                fec_k = new_session_data->k;   // swfec: overhead_pct rides the k slot
-                fec_n = new_session_data->n;   // swfec: deadline_ms rides the n slot
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
-                        (unsigned)WFB_IPC_CONTRACT_VERSION);
-                IPC_MSG_SEND();
+                setup_session(WFB_FEC_SWFEC, new_session_data->k, new_session_data->n,
+                              be64toh(new_session_data->epoch));
             }
             else if (session_is_swfec && new_session_data->n != swfec_deadline_ms)
             {
-                // Param-only update: deadline changed, same key — no reset (spec §6)
-                swfec_deadline_ms = new_session_data->n;
-                swfec_dec->set_deadline_us((uint64_t)new_session_data->n * 1000);
-                if (swfec_ro != NULL)
-                    swfec_ro->set_deadline_us((uint64_t)new_session_data->n * 1000);
-                fec_n = new_session_data->n;  // keep the SESSION re-emit in sync
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n",
-                        get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
-                        (unsigned)WFB_IPC_CONTRACT_VERSION);
-                IPC_MSG_SEND();
+                // Param-only update: deadline changed, same key — no reset
+                swfec_set_deadline(new_session_data->n);
             }
         }
         else
