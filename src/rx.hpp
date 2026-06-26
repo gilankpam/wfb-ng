@@ -54,7 +54,7 @@ class BaseAggregator
 public:
     virtual ~BaseAggregator(){}
     virtual void process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
-                                const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
+                                const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth, sockaddr_in *sockaddr) = 0;
 
     virtual void dump_stats(void) = 0;
@@ -75,7 +75,7 @@ public:
     Forwarder(const std::string &client_addr, int client_port, int snd_buf_size);
     virtual ~Forwarder();
     virtual void process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
-                                const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
+                                const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth,sockaddr_in *sockaddr);
     virtual void dump_stats(void) {}
 private:
@@ -105,9 +105,10 @@ class rxAntennaItem
 public:
     rxAntennaItem(void) : count_all(0),
                           rssi_sum(0), rssi_min(0), rssi_max(0),
-                          snr_sum(0), snr_min(0), snr_max(0) {}
+                          snr_sum(0), snr_min(0), snr_max(0),
+                          evm_sum(0), evm_min(0), evm_max(0), evm_count(0) {}
 
-    void log_rssi(int8_t rssi, int8_t noise){
+    void log_rssi(int8_t rssi, int8_t noise, uint8_t evm){
         int8_t snr = (noise != SCHAR_MAX) ? rssi - noise : 0;
 
         if(count_all == 0){
@@ -124,6 +125,22 @@ public:
         rssi_sum += rssi;
         snr_sum += snr;
         count_all += 1;
+
+        // EVM% carried in radiotap lock_quality (0..100, higher is better).
+        // evm == 0xff means the field was absent on this frame; evm == 0 means
+        // the hardware could not measure it (rxevm sentinel). Skip both so the
+        // average reflects only real samples (counted separately by evm_count).
+        if (evm > 0 && evm <= 100) {
+            if (evm_count == 0) {
+                evm_min = evm;
+                evm_max = evm;
+            } else {
+                evm_min = std::min(evm, evm_min);
+                evm_max = std::max(evm, evm_max);
+            }
+            evm_sum += evm;
+            evm_count += 1;
+        }
     }
 
     int32_t count_all;
@@ -133,6 +150,10 @@ public:
     int32_t snr_sum;
     int8_t snr_min;
     int8_t snr_max;
+    int32_t evm_sum;
+    uint8_t evm_min;
+    uint8_t evm_max;
+    int32_t evm_count;
 };
 
 struct rxAntennaKey
@@ -181,7 +202,7 @@ public:
     Aggregator(const std::string &keypair, uint64_t epoch, uint32_t channel_id);
     virtual ~Aggregator();
     virtual void process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
-                                const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
+                                const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth, sockaddr_in *sockaddr);
     virtual void dump_stats(void);
     virtual void swfec_poll(void);
@@ -235,7 +256,7 @@ private:
     void send_packet(int ring_idx, int fragment_idx);
     void apply_fec(int ring_idx);
     void log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi,
-                  const int8_t *noise, uint16_t freq, uint8_t mcs_index, uint8_t bandwidth);
+                  const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index, uint8_t bandwidth);
     int get_block_ring_idx(uint64_t block_idx);
     int rx_ring_push(void);
     // cppcheck-suppress unusedPrivateFunction

@@ -57,10 +57,13 @@ class FakeAntennaProtocol(object):
     def update_rx_stats(self, rx_id, packet_stats, ant_stats, session):
         log.msg('%s %r %r %r' % (rx_id, packet_stats, ant_stats, session))
 
-        for (((freq, mcs_index, bandwidth), ant_id),
-             (pkt_s,
-              rssi_min, rssi_avg, rssi_max,
-              snr_min, snr_avg, snr_max)) in ant_stats.items():
+        for (((freq, mcs_index, bandwidth), ant_id), v) in ant_stats.items():
+            (pkt_s,
+             rssi_min, rssi_avg, rssi_max,
+             snr_min, snr_avg, snr_max) = v[:7]
+            # wfb_rx appends EVM (evm_min/avg/max) after SNR. Synthetic test
+            # frames carry no radiotap lock_quality, so EVM is reported absent (-1).
+            evm_min, evm_avg, evm_max = v[7:10] if len(v) >= 10 else (-1, -1, -1)
 
             assert pkt_s >= 0
             assert freq == 4321
@@ -68,6 +71,7 @@ class FakeAntennaProtocol(object):
             assert bandwidth == 20
             assert rssi_min == rssi_avg == rssi_max == -42
             assert snr_min == snr_avg == snr_max == 28
+            assert evm_min == evm_avg == evm_max == -1
 
             host, port, wlan_idx, ant_id = struct.unpack('!IHBB', ant_id.to_bytes(8, byteorder='big'))
             assert host == 0x7f000001

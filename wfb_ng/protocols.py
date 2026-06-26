@@ -94,7 +94,8 @@ class StatisticsJSONProtocol(LineReceiver):
 
         if data['type'] == 'rx':
             ka = ('ant', 'freq', 'mcs', 'bw')
-            va = ('pkt_recv', 'rssi_min', 'rssi_avg', 'rssi_max', 'snr_min', 'snr_avg', 'snr_max')
+            va = ('pkt_recv', 'rssi_min', 'rssi_avg', 'rssi_max', 'snr_min', 'snr_avg', 'snr_max',
+                  'evm_min', 'evm_avg', 'evm_max')
             data['rx_ant_stats'] = list(dict(zip(ka + va, (ant_id,) + k + v))
                                         for (k, ant_id), v in data.pop('rx_ant_stats').items())
         elif data['type'] == 'tx':
@@ -216,10 +217,13 @@ class AntStatsAndSelector(object):
         stats_agg = {}
 
         for ant_stats in ant_stats_by_rx.values():
-            for (((freq, mcs_index, bandwidth), ant_id),
-                 (pkt_s,
-                  rssi_min, rssi_avg, rssi_max,
-                  snr_min, snr_avg, snr_max)) in ant_stats.items():
+            for (((freq, mcs_index, bandwidth), ant_id), v) in ant_stats.items():
+                # Newer wfb_rx appends EVM (evm_min/avg/max) to the RX_ANT tuple.
+                # This aggregation feeds TX-antenna selection + mavlink RSSI only,
+                # which don't use EVM, so take the stock 7-field prefix.
+                (pkt_s,
+                 rssi_min, rssi_avg, rssi_max,
+                 snr_min, snr_avg, snr_max) = v[:7]
 
                 if ant_id not in stats_agg:
                     stats_agg[ant_id] = (pkt_s,
