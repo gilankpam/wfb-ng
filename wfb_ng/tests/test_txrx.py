@@ -556,6 +556,55 @@ class PlaintextSafetyTestCase(unittest.TestCase):
         self.assertEqual(self.rxp.rxq, [])        # ...which decodes nothing
 
 
+class PlaintextSwfecTestCase(unittest.TestCase):
+    # Plaintext swfec (-z, no -K) no-loss round-trip: every source message,
+    # forwarded without loss, is delivered in order through the reorder buffer.
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        # swfec plaintext: -z, -k overhead_pct=20, -n deadline_ms=50, no -K
+        cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-a', '10001', '-u', '10002',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-z', '-k', '20', '-n', '50', '-u', '10003', '-D', '10004',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+
+        ap = FakeAntennaProtocol()
+        self.rx_pp = RXProtocol(ap, cmd_rx, 'debug rx')
+        self.tx_pp = TXProtocol(ap, cmd_tx, 'debug tx')
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        self.rx_pp.transport.signalProcess('KILL')
+        self.tx_pp.transport.signalProcess('KILL')
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_swfec_plaintext_roundtrip(self):
+        msgs = [b'swfec-%03d' % i for i in range(10)]
+        for m in msgs:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)  # let each source packet flush
+        yield df_sleep(0.1)
+        self.assertGreater(len(self.txp.rxq), len(msgs))  # session(s) + source + repair packets
+        for pkt in self.txp.rxq:       # forward everything, in order, no loss
+            self.rxp.send_msg(pkt)
+            yield df_sleep(0.002)
+        yield df_sleep(0.3)            # > deadline so the reorder buffer drains
+        self.assertEqual(self.rxp.rxq, msgs)
+
+
 class UNIXTXRXTestCase(TXRXTestCase):
     @defer.inlineCallbacks
     def setUp(self):
