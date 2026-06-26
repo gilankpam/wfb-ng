@@ -983,17 +983,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
         count_p_session += 1;
 
-        // Plaintext has no session_key, so detect a new/changed session from the
-        // FEC params + epoch instead of a key change. "first ever" = no decoder yet.
-        bool first = (fec_p == NULL && swfec_dec == NULL);
-        uint8_t cur_type = session_is_swfec ? WFB_FEC_SWFEC : WFB_FEC_VDM_RS;
-        bool rebuild = first
-                    || (be64toh(sd->epoch) != epoch)
-                    || (sd->fec_type != cur_type)
-                    || (sd->fec_type == WFB_FEC_VDM_RS && ((int)sd->k != fec_k || (int)sd->n != fec_n));
-
-        if (rebuild)
+        // Plaintext carries the TX's fresh-per-session random session_key as an
+        // opaque session ID (not used for any cipher). Detect a new session — a
+        // TX (re)start or an RS reconfigure, both of which call init_session()
+        // and mint a new ID — exactly as the encrypted path does: by a change in
+        // that field. A swfec live param tweak keeps the same ID (swfec_set_params
+        // does not call init_session), so it falls to the deadline-only update.
+        // This recovers a long-running RX from a TX restart with no clock/epoch
+        // dependency. The RX session_key member starts memset to 0, so the first
+        // real session (random ID) always differs and triggers the initial build.
+        if (memcmp(session_key, sd->session_key, sizeof(session_key)) != 0)
         {
+            memcpy(session_key, sd->session_key, sizeof(session_key));
             setup_session(sd->fec_type, sd->k, sd->n, be64toh(sd->epoch));
         }
         else if (sd->fec_type == WFB_FEC_SWFEC && session_is_swfec && sd->n != swfec_deadline_ms)

@@ -605,6 +605,90 @@ class PlaintextSwfecTestCase(unittest.TestCase):
         self.assertEqual(self.rxp.rxq, msgs)
 
 
+class PlaintextRestartTestCase(unittest.TestCase):
+    # A plaintext TX that restarts with UNCHANGED FEC params must recover at a
+    # long-running RX. The RX detects the new random session ID and rebuilds
+    # (resetting last_known_block / the swfec reorder cursor). Runs for both RS
+    # and swfec via the swfec flag on cmd_tx.
+    swfec = False
+
+    @defer.inlineCallbacks
+    def setUp(self):
+        self.bindir = os.path.join(os.path.dirname(__file__), '../..')
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        self.link_id = int.from_bytes(os.urandom(3), 'big')
+        cmd_rx = [os.path.join(self.bindir, 'wfb_rx'), '-a', '10001', '-u', '10002',
+                  '-i', str(self.link_id), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        self.rx_pp = RXProtocol(FakeAntennaProtocol(), cmd_rx, 'debug rx')
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp = None
+        self._start_tx()
+        yield df_sleep(0.2)
+
+    def _start_tx(self):
+        cmd_tx = [os.path.join(self.bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000',
+                  '-i', str(self.link_id), '-R', str(512 * 1024), '-s', str(512 * 1024)]
+        if self.swfec:
+            cmd_tx += ['-z', '-k', '20', '-n', '50']
+        cmd_tx.append('wlan0')
+        self.tx_pp = TXProtocol(FakeAntennaProtocol(), cmd_tx, 'debug tx')
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+
+    @defer.inlineCallbacks
+    def _drain_to_rx(self):
+        # forward everything the TX emitted (session first, in order) to the RX
+        for pkt in self.txp.rxq:
+            self.rxp.send_msg(pkt)
+            yield df_sleep(0.002)
+        self.txp.rxq[:] = []
+        yield df_sleep(0.3)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        if self.tx_pp is not None:
+            self.tx_pp.transport.signalProcess('KILL')
+        self.rx_pp.transport.signalProcess('KILL')
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_restart_recovers(self):
+        # Round 1: push enough blocks that the RX's last_known_block / swfec
+        # cursor is well above 0, so a restarted (reset-to-0) stream would be
+        # rejected as "already processed" unless the RX rebuilds.
+        round1 = [b'a%03d' % i for i in range(40)]
+        for m in round1:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)            # session announce + final block/window flush
+        yield self._drain_to_rx()
+        self.assertEqual(self.rxp.rxq, round1)
+
+        # Restart the TX: fresh process -> new random session ID, sequence resets to 0.
+        self.tx_pp.transport.signalProcess('KILL')
+        yield df_sleep(0.4)            # let it die and release udp:10003
+        self.txp.rxq[:] = []
+        self._start_tx()
+        yield df_sleep(0.2)
+
+        # Round 2: the long-running RX must accept the restarted low-sequence stream.
+        round2 = [b'b%03d' % i for i in range(40)]
+        for m in round2:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)
+        yield self._drain_to_rx()
+        self.assertEqual(self.rxp.rxq, round1 + round2)
+
+
+class PlaintextRestartSwfecTestCase(PlaintextRestartTestCase):
+    swfec = True
+
+
 class UNIXTXRXTestCase(TXRXTestCase):
     @defer.inlineCallbacks
     def setUp(self):

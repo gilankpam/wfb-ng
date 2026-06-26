@@ -143,10 +143,12 @@ void Transmitter::rebuild_session_packet(void)
         session_data->n = (uint8_t)fec_n;
 
         assert(sizeof(session_data->session_key) == sizeof(session_key));
-        if (encrypted)
-            memcpy(session_data->session_key, session_key, sizeof(session_key));
-        else
-            memset(session_data->session_key, 0, sizeof(session_data->session_key)); // unused in plaintext
+        // session_key is a fresh random value per init_session() (startup /
+        // restart / reconfigure), generated even in plaintext. Encrypted: it is
+        // the AEAD key. Plaintext: it rides the wire purely as an opaque session
+        // ID, so the RX detects a TX restart (new random ID) exactly as the
+        // encrypted path detects a session-key change. No secret is exposed.
+        memcpy(session_data->session_key, session_key, sizeof(session_key));
     }
 
     // Fill optional Tags

@@ -86,12 +86,14 @@ currently throws and exits. The default keypair is `"tx.key"` / `"rx.key"`
 existing:  WFB_PACKET_DATA          0x1   wblock_hdr  + AEAD(fragment) + 16B tag
            WFB_PACKET_SESSION       0x2   wsession_hdr + crypto_box(wsession_data)
 new:       WFB_PACKET_DATA_PLAIN    0x3   wblock_hdr  + raw fragment        (no tag)
-           WFB_PACKET_SESSION_PLAIN 0x4   wsession_hdr + raw wsession_data  (key field unused)
+           WFB_PACKET_SESSION_PLAIN 0x4   wsession_hdr + raw wsession_data  (key = opaque session ID)
 ```
 
 - The **plaintext session** reuses the *same* `wsession_data_t` struct (so RX
-  param-extraction is identical); it is simply not `crypto_box`-wrapped, and the
-  `session_key` field is zeroed/unused. It still carries `epoch/channel_id/fec_type/k/n`.
+  param-extraction is identical); it is simply not `crypto_box`-wrapped. The
+  `session_key` field carries a **fresh random session ID** (the same random value
+  that `init_session()` generates per TX start/restart/reconfigure), used as an opaque
+  identifier — no cipher use. It still carries `epoch/channel_id/fec_type/k/n`.
 - The **plaintext data** packet is `wblock_hdr_t` (type `0x3` + `data_nonce`)
   followed by the raw FEC fragment — no cipher, no tag.
 
@@ -109,7 +111,8 @@ Each site branches `if (encrypted) { …today… } else { …plaintext… }`:
 - **`rebuild_session_packet` (`:119`):** plaintext fills the same `wsession_data_t`,
   then `memcpy`s it after the header with type `WFB_PACKET_SESSION_PLAIN` instead of
   `crypto_box_easy`. Size omits `crypto_box_MACBYTES`. Keep the random per-rebuild
-  nonce (RX dedup still works); leave `session_key` zeroed.
+  nonce (RX dedup still works); `session_key` is copied unconditionally — in encrypted
+  mode it is the AEAD key; in plaintext mode it rides as an opaque session ID.
 - **`send_block_fragment` (`:651`)** and **`send_swfec_wire` (`:697`):** plaintext
   sets type `WFB_PACKET_DATA_PLAIN` and `memcpy`s the raw fragment after
   `wblock_hdr_t` — no AEAD, no tag. Inject length = `sizeof(wblock_hdr_t) + packet_size`.
@@ -127,17 +130,25 @@ Each site branches `if (encrypted) { …today… } else { …plaintext… }`:
   - `WFB_PACKET_SESSION_PLAIN`: same `generichash` dedup; parse the plaintext
     `wsession_data_t`; (re)build the RS/swfec decoder; emit the same IPC `SESSION` line.
 
-**Critical subtlety — plaintext "new session?" detection.** In plaintext, `session_key`
-is all-zero on both ends, so the existing gate `memcmp(session_key, new->session_key)`
-(`rx.cpp:769,809`) would **never fire** → the RX would never build its decoder. The
-plaintext session path must detect change on **`(fec_type, k, n, epoch)`** instead,
-with "first session ever" = `fec_p == NULL && swfec_dec == NULL` (initial state is
-`fec_k=-1, fec_n=-1, session_is_swfec=false, swfec_dec=NULL`, `rx.cpp:282-288`).
+**"New session?" detection — unified session-ID mechanism.** Both the encrypted and
+plaintext paths use the *same* gate: `memcmp(session_key, new->session_key)`. In
+encrypted mode, `session_key` is the AEAD symmetric key — a TX restart or RS
+reconfigure calls `init_session()`, which mints a fresh random value, the RX sees a
+change, and rebuilds. Plaintext gets the **same for free**: `init_session()` always
+generates a fresh random `session_key` (even with no encryption), the TX carries it on
+the wire as an opaque session ID, and the RX's existing `memcmp` trigger fires on a
+restart or reconfigure. Clock/epoch independence — no `-e` flag required on the
+launcher. The RX `session_key` member is `memset` to 0 at construction, so the first
+real session (random ID) always differs and triggers the initial decoder build.
+
+A swfec live param tweak (via `swfec_set_params`) does **not** call `init_session()`
+and does not mint a new session ID — so it falls through to the deadline-only update
+(`swfec_set_deadline`), which is exactly the desired behaviour for a hot deadline change.
 
 To avoid duplicating the RS/swfec setup, **extract a `setup_session(fec_type, k, n,
 epoch)` helper** holding today's decoder-build bodies (the contents of the two
 `if (memcmp(session_key, …))` blocks). Call it from both the encrypted branch (on
-key change) and the plaintext branch (on param change). This keeps the swfec
+key change) and the plaintext branch (on session-ID change). This keeps the swfec
 param-only deadline-update path (`rx.cpp:834-846`) intact for both modes.
 
 ### 4.5 Size accounting — no macro changes
@@ -192,6 +203,16 @@ knows or guesses `channel_id` (`link_id << 8 | radio_port`).
 > drops plaintext types into `count_p_bad`. A `wfb_rx` started **without** `-K`
 > processes **only** plaintext types (`0x3/0x4`) and drops encrypted types. Mode is a
 > per-process property of key presence — it cannot be flipped by any on-air packet.
+
+**Plaintext TX-restart recovery — clock-free, no launcher change required.** A
+long-running plaintext RX automatically recovers from a TX restart with unchanged FEC
+params, because the restarted TX calls `init_session()` which mints a new random
+session ID, which the RX's `memcmp(session_key, …)` trigger detects. The RX then
+calls `setup_session()`, which resets `last_known_block` (RS) or rebuilds the swfec
+decoder + reorder buffer, so the restarted stream's sequence-reset-to-0 packets are
+accepted. No `-e`/clock dependency, no launcher change needed. This is a strict
+improvement over the previous param-based detection, which missed a restart with
+unchanged params (e.g. `epoch=0` default, same `k/n`).
 
 **For the plaintext video stream** (operator-accepted): confidentiality is lost
 (anyone can watch); integrity/authenticity is lost (anyone on the channel can inject
