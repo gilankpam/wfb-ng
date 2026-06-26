@@ -304,12 +304,13 @@ This extracts the decoder-build logic so Task 3's plaintext path can reuse it. P
 - Modify: `src/rx.cpp` (add `setup_session` definition; route the RS branch `:769-792` and swfec branch `:809-833` through it)
 
 **Interfaces:**
-- Produces: `void Aggregator::setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch)` — sets `epoch`, tears down any existing decoder, builds the RS (`init_fec`) or swfec (`SwfecDecoder`/`SwfecReorder`) decoder, and emits the IPC `SESSION` line. Does **not** touch `session_key` (caller owns that).
+- Produces: `void Aggregator::setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch)` — sets `epoch`, tears down any existing decoder, builds the RS (`init_fec`) or swfec (`SwfecDecoder`/`SwfecReorder`) decoder, and emits the IPC `SESSION` line. Does **not** touch `session_key` (caller owns that). Also `void Aggregator::swfec_set_deadline(uint8_t n)` — param-only swfec deadline update (no decoder reset), used by both the encrypted and plaintext session paths.
 
-- [ ] **Step 1: Declare the helper** — in `src/rx.hpp`, in the `Aggregator` private section, immediately after `void init_fec(int k, int n);` (line 253):
+- [ ] **Step 1: Declare the helpers** — in `src/rx.hpp`, in the `Aggregator` private section, immediately after `void init_fec(int k, int n);` (line 253):
 
 ```cpp
     void setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch);
+    void swfec_set_deadline(uint8_t n); // param-only swfec deadline update (shared encrypted + plaintext)
 ```
 
 - [ ] **Step 2: Define the helper** — in `src/rx.cpp`, add this function immediately after the end of `Aggregator::init_fec` (after its closing brace near line 354):
@@ -365,6 +366,21 @@ void Aggregator::setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t 
         IPC_MSG_SEND();
     }
 }
+
+// Param-only swfec deadline update (same session, deadline changed): no decoder
+// reset. Shared by the encrypted session path and the plaintext SESSION_PLAIN path.
+void Aggregator::swfec_set_deadline(uint8_t n)
+{
+    swfec_deadline_ms = n;
+    swfec_dec->set_deadline_us((uint64_t)n * 1000);
+    if (swfec_ro != NULL)
+        swfec_ro->set_deadline_us((uint64_t)n * 1000);
+    fec_n = n;
+    IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n",
+            get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
+            (unsigned)WFB_IPC_CONTRACT_VERSION);
+    IPC_MSG_SEND();
+}
 ```
 
 - [ ] **Step 3: Route the encrypted RS branch through the helper** — in `src/rx.cpp` `process_packet`, replace the body of the RS `if (memcmp(session_key, ...) != 0)` block (lines 769-792) with:
@@ -378,7 +394,7 @@ void Aggregator::setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t 
             }
 ```
 
-- [ ] **Step 4: Route the encrypted swfec branch through the helper** — in `src/rx.cpp` `process_packet`, replace the body of the swfec `if (memcmp(session_key, ...) != 0)` block (lines 809-833, the "New swfec session" block only — leave the `else if (session_is_swfec && ...)` param-only block at 834-846 unchanged) with:
+- [ ] **Step 4: Route the encrypted swfec branches through the helpers** — in `src/rx.cpp` `process_packet`, replace the "New swfec session" block (lines 809-833) **and** the param-only `else if (session_is_swfec && ...)` block (lines 834-846) — i.e. lines 809-846 — with:
 
 ```cpp
             if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
@@ -387,6 +403,11 @@ void Aggregator::setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t 
                 memcpy(session_key, new_session_data->session_key, sizeof(session_key));
                 setup_session(WFB_FEC_SWFEC, new_session_data->k, new_session_data->n,
                               be64toh(new_session_data->epoch));
+            }
+            else if (session_is_swfec && new_session_data->n != swfec_deadline_ms)
+            {
+                // Param-only update: deadline changed, same key — no reset
+                swfec_set_deadline(new_session_data->n);
             }
 ```
 
@@ -412,7 +433,7 @@ git commit -m "noenc(rx): extract setup_session() helper (no behavior change)"
 - Test: `wfb_ng/tests/test_txrx.py` (`PlaintextTXRXTestCase`, `PlaintextSafetyTestCase`)
 
 **Interfaces:**
-- Consumes: `WFB_PACKET_DATA_PLAIN`/`WFB_PACKET_SESSION_PLAIN` (Task 1); `setup_session(...)` (Task 2); `wfb_tx` plaintext output (Task 1).
+- Consumes: `WFB_PACKET_DATA_PLAIN`/`WFB_PACKET_SESSION_PLAIN` (Task 1); `setup_session(...)` and `swfec_set_deadline(...)` (Task 2); `wfb_tx` plaintext output (Task 1).
 - Produces: a `wfb_rx` that with no `-K` decodes plaintext streams (RS + swfec) and with `-K` rejects plaintext packets into `count_p_bad`.
 
 - [ ] **Step 1: Write the failing tests** — append to `wfb_ng/tests/test_txrx.py`:
@@ -677,16 +698,7 @@ For `WFB_PACKET_SESSION`:
         }
         else if (sd->fec_type == WFB_FEC_SWFEC && session_is_swfec && sd->n != swfec_deadline_ms)
         {
-            // Param-only deadline update (same session, deadline changed) — no reset.
-            swfec_deadline_ms = sd->n;
-            swfec_dec->set_deadline_us((uint64_t)sd->n * 1000);
-            if (swfec_ro != NULL)
-                swfec_ro->set_deadline_us((uint64_t)sd->n * 1000);
-            fec_n = sd->n;
-            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n",
-                    get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
-                    (unsigned)WFB_IPC_CONTRACT_VERSION);
-            IPC_MSG_SEND();
+            swfec_set_deadline(sd->n);  // param-only deadline update, shared helper (Task 2)
         }
 
         memcpy(session_hash, new_session_hash, sizeof(session_hash));
@@ -967,6 +979,6 @@ git commit -m "noenc: documented [video] keypair=None opt-in; mark spec implemen
 
 **Placeholder scan:** every code step contains complete code; no TBD/TODO/"handle edge cases". ✓
 
-**Type/name consistency:** `encrypted` (both classes), `setup_session(uint8_t,uint8_t,uint8_t,uint64_t)` (declared Task 2 Step 1, defined Step 2, called Tasks 2-3), `WFB_PACKET_DATA_PLAIN`/`WFB_PACKET_SESSION_PLAIN` (defined Task 1, consumed Task 3), `key_arg(cfg)` (defined Task 5 Step 3, used Steps 4 + tested Step 1). The plaintext session reader uses a local `const wsession_data_t* sd` to avoid aliasing the non-const `new_session_data`. ✓
+**Type/name consistency:** `encrypted` (both classes), `setup_session(uint8_t,uint8_t,uint8_t,uint64_t)` and `swfec_set_deadline(uint8_t)` (declared Task 2 Step 1, defined Step 2, called Tasks 2-3), `WFB_PACKET_DATA_PLAIN`/`WFB_PACKET_SESSION_PLAIN` (defined Task 1, consumed Task 3), `key_arg(cfg)` (defined Task 5 Step 3, used Steps 4 + tested Step 1). The plaintext session reader uses a local `const wsession_data_t* sd` to avoid aliasing the non-const `new_session_data`. ✓
 
 **Note for the implementer:** member-initializer order must match declaration order (GCC `-Werror=reorder`): `encrypted` is declared and initialized last among each class's init-list members per the steps above. Build with `make wfb_rx wfb_tx` after each C++ task and watch for reorder/unused warnings.
