@@ -965,6 +965,175 @@ git commit -m "noenc: documented [video] keypair=None opt-in; mark spec implemen
 
 ---
 
+## Task 7: Plaintext session ID for restart detection
+
+Supersedes the `(fec_type,k,n,epoch)`-based "new session" detection from Task 3. The encrypted path recovers from a TX restart because `init_session()` mints a fresh random `session_key` on every (re)start, and the RX rebuilds when that field changes. Plaintext gets the same recovery for free by carrying that already-generated random `session_key` on the wire as an opaque **session ID** (no cipher use) and reusing the exact `memcmp(session_key, …)` rebuild trigger. Clock-independent — fixes the restart-recovery gap on RTC-less drones without touching the launcher.
+
+**Files:**
+- Modify: `src/tx.cpp` (`rebuild_session_packet` — stop zeroing the field in the plaintext branch)
+- Modify: `src/rx.cpp` (`process_packet` `WFB_PACKET_SESSION_PLAIN` case — replace param-based detection with session-ID detection)
+- Modify: `docs/superpowers/specs/2026-06-26-optional-encryption-design.md` (§4.2 / §4.4 / security note)
+- Test: `wfb_ng/tests/test_txrx.py` (new `PlaintextRestartTestCase`)
+
+**Interfaces:**
+- Consumes: `setup_session(...)` / `swfec_set_deadline(...)` (Task 2); the `wsession_data_t.session_key` field (already on the wire); the RX `session_key` member (already memset to 0 at construction, previously unused in plaintext).
+- Produces: a plaintext RX that rebuilds its decoder when the TX's per-session random ID changes (restart / RS reconfigure), and falls to the swfec deadline-only update when it doesn't (swfec live tweak) — behavior identical to the encrypted path.
+
+- [ ] **Step 1: Write the failing tests** — append to `wfb_ng/tests/test_txrx.py`:
+
+```python
+class PlaintextRestartTestCase(unittest.TestCase):
+    # A plaintext TX that restarts with UNCHANGED FEC params must recover at a
+    # long-running RX. The RX detects the new random session ID and rebuilds
+    # (resetting last_known_block / the swfec reorder cursor). Runs for both RS
+    # and swfec via the swfec flag on cmd_tx.
+    swfec = False
+
+    @defer.inlineCallbacks
+    def setUp(self):
+        self.bindir = os.path.join(os.path.dirname(__file__), '../..')
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        self.link_id = int.from_bytes(os.urandom(3), 'big')
+        cmd_rx = [os.path.join(self.bindir, 'wfb_rx'), '-a', '10001', '-u', '10002',
+                  '-i', str(self.link_id), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        self.rx_pp = RXProtocol(FakeAntennaProtocol(), cmd_rx, 'debug rx')
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp = None
+        self._start_tx()
+        yield df_sleep(0.2)
+
+    def _start_tx(self):
+        cmd_tx = [os.path.join(self.bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000',
+                  '-i', str(self.link_id), '-R', str(512 * 1024), '-s', str(512 * 1024)]
+        if self.swfec:
+            cmd_tx += ['-z', '-k', '20', '-n', '50']
+        cmd_tx.append('wlan0')
+        self.tx_pp = TXProtocol(FakeAntennaProtocol(), cmd_tx, 'debug tx')
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+
+    @defer.inlineCallbacks
+    def _drain_to_rx(self):
+        # forward everything the TX emitted (session first, in order) to the RX
+        for pkt in self.txp.rxq:
+            self.rxp.send_msg(pkt)
+            yield df_sleep(0.002)
+        self.txp.rxq[:] = []
+        yield df_sleep(0.3)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        if self.tx_pp is not None:
+            self.tx_pp.transport.signalProcess('KILL')
+        self.rx_pp.transport.signalProcess('KILL')
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_restart_recovers(self):
+        # Round 1: push enough blocks that the RX's last_known_block / swfec
+        # cursor is well above 0, so a restarted (reset-to-0) stream would be
+        # rejected as "already processed" unless the RX rebuilds.
+        round1 = [b'a%03d' % i for i in range(40)]
+        for m in round1:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)            # session announce + final block/window flush
+        yield self._drain_to_rx()
+        self.assertEqual(self.rxp.rxq, round1)
+
+        # Restart the TX: fresh process -> new random session ID, sequence resets to 0.
+        self.tx_pp.transport.signalProcess('KILL')
+        yield df_sleep(0.4)            # let it die and release udp:10003
+        self.txp.rxq[:] = []
+        self._start_tx()
+        yield df_sleep(0.2)
+
+        # Round 2: the long-running RX must accept the restarted low-sequence stream.
+        round2 = [b'b%03d' % i for i in range(40)]
+        for m in round2:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)
+        yield self._drain_to_rx()
+        self.assertEqual(self.rxp.rxq, round1 + round2)
+
+
+class PlaintextRestartSwfecTestCase(PlaintextRestartTestCase):
+    swfec = True
+```
+
+- [ ] **Step 2: Run the tests to verify they fail (current param-based detection can't see the restart)**
+
+Run: `make wfb_rx wfb_tx && PYTHONPATH=$(pwd) $(PYTHON) -m twisted.trial wfb_ng.tests.test_txrx.PlaintextRestartTestCase wfb_ng.tests.test_txrx.PlaintextRestartSwfecTestCase`
+Expected: FAIL — round 2's messages are missing from `rxp.rxq`. With the Task 3 detector, the restarted TX re-announces the identical `(fec_type,k,n,epoch=0)`, so `rebuild=false`, `last_known_block` / the swfec reorder cursor stay high, and every restarted packet is dropped as "already processed."
+
+- [ ] **Step 3: TX — carry the random `session_key` as a session ID** — in `src/tx.cpp` `rebuild_session_packet`, replace the `session_key`-field fill (the `if (encrypted) memcpy … else memset(…, 0, …)` block inside the "Fill fixed headers" scope) with an unconditional copy:
+
+```cpp
+        assert(sizeof(session_data->session_key) == sizeof(session_key));
+        // session_key is a fresh random value per init_session() (startup /
+        // restart / reconfigure), generated even in plaintext. Encrypted: it is
+        // the AEAD key. Plaintext: it rides the wire purely as an opaque session
+        // ID, so the RX detects a TX restart (new random ID) exactly as the
+        // encrypted path detects a session-key change. No secret is exposed.
+        memcpy(session_data->session_key, session_key, sizeof(session_key));
+```
+
+- [ ] **Step 4: RX — detect rebuild via the session ID** — in `src/rx.cpp` `process_packet`, in the `WFB_PACKET_SESSION_PLAIN` case, replace the param-based detection block (the `bool first = …; uint8_t cur_type = …; bool rebuild = …; if (rebuild) { setup_session(...); } else if (…) { swfec_set_deadline(...); }`) with the session-ID form that mirrors the encrypted path:
+
+```cpp
+        count_p_session += 1;
+
+        // Plaintext carries the TX's fresh-per-session random session_key as an
+        // opaque session ID (not used for any cipher). Detect a new session — a
+        // TX (re)start or an RS reconfigure, both of which call init_session()
+        // and mint a new ID — exactly as the encrypted path does: by a change in
+        // that field. A swfec live param tweak keeps the same ID (swfec_set_params
+        // does not call init_session), so it falls to the deadline-only update.
+        // This recovers a long-running RX from a TX restart with no clock/epoch
+        // dependency. The RX session_key member starts memset to 0, so the first
+        // real session (random ID) always differs and triggers the initial build.
+        if (memcmp(session_key, sd->session_key, sizeof(session_key)) != 0)
+        {
+            memcpy(session_key, sd->session_key, sizeof(session_key));
+            setup_session(sd->fec_type, sd->k, sd->n, be64toh(sd->epoch));
+        }
+        else if (sd->fec_type == WFB_FEC_SWFEC && session_is_swfec && sd->n != swfec_deadline_ms)
+        {
+            swfec_set_deadline(sd->n);  // param-only deadline update, shared helper (Task 2)
+        }
+
+        memcpy(session_hash, new_session_hash, sizeof(session_hash));
+        return;
+```
+
+Leave the preceding validation in this case unchanged (size, dedup hash, `epoch < epoch` reject, `channel_id` match, `fec_type`/`k`/`n` validation). `sd` remains the `const wsession_data_t*` declared earlier in the case.
+
+- [ ] **Step 5: Build and run the restart tests to verify they pass**
+
+Run: `make wfb_rx wfb_tx && PYTHONPATH=$(pwd) $(PYTHON) -m twisted.trial wfb_ng.tests.test_txrx.PlaintextRestartTestCase wfb_ng.tests.test_txrx.PlaintextRestartSwfecTestCase`
+Expected: PASS — `rxp.rxq == round1 + round2` for both RS and swfec. The restarted TX's new random ID triggers `setup_session`, which resets `last_known_block` (RS) / rebuilds the swfec decoder + reorder buffer, so the low-sequence restarted stream is accepted.
+
+- [ ] **Step 6: Verify the full suite (no regression; live RS reconfigure still works)**
+
+Run: `make test`
+Expected: baseline (2 `test_proxy` + 1 `test_tuntap`) plus all plaintext cases. In particular `PlaintextTXRXTestCase`'s inherited `test_cmd_fec` still passes: a live RS `set_fec` calls `init_session` → new session ID → the RX rebuilds with the new `k/n` (the new-ID path adopts the announced params), so reconfigure is covered by the same mechanism.
+
+- [ ] **Step 7: Update the design spec** — in `docs/superpowers/specs/2026-06-26-optional-encryption-design.md`: in §4.2 change "the `session_key` field is zeroed/unused" to note it carries a fresh random **session ID**; in §4.4 replace the "new session?" subtlety (param-based) with the session-ID detection; and in §5 add that plaintext recovers from a TX restart via the session-ID change (no `-e`/clock dependency).
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/tx.cpp src/rx.cpp wfb_ng/tests/test_txrx.py docs/superpowers/specs/2026-06-26-optional-encryption-design.md
+git commit -m "noenc: plaintext session ID for clock-free TX-restart recovery"
+```
+
+---
+
 ## Self-Review
 
 **Spec coverage:**
