@@ -55,6 +55,7 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     epoch(epoch),
     channel_id(channel_id),
     fec_delay(fec_delay),
+    encrypted(!keypair.empty()),
     tx_secretkey{},
     rx_publickey{},
     session_key{},
@@ -67,22 +68,25 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     swfec_oversize(0)
 {
 
-    FILE *fp;
-    if ((fp = fopen(keypair.c_str(), "r")) == NULL)
+    if (encrypted)
     {
-        throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
-    }
-    if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
-    {
+        FILE *fp;
+        if ((fp = fopen(keypair.c_str(), "r")) == NULL)
+        {
+            throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
+        }
+        if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
+        }
+        if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
+        }
         fclose(fp);
-        throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
     }
-    if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
-    {
-        fclose(fp);
-        throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
-    }
-    fclose(fp);
 
     init_session(k, n);
 }
@@ -120,12 +124,11 @@ void Transmitter::rebuild_session_packet(void)
 {
     // fill packet header (new random nonce each call)
     wsession_hdr_t *session_hdr = (wsession_hdr_t *)session_packet;
-    session_hdr->packet_type = WFB_PACKET_SESSION;
+    session_hdr->packet_type = encrypted ? WFB_PACKET_SESSION : WFB_PACKET_SESSION_PLAIN;
 
     randombytes_buf(session_hdr->session_nonce, sizeof(session_hdr->session_nonce));
 
     // fill packet contents
-
     uint8_t tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
 
     // Fill fixed headers
@@ -140,11 +143,13 @@ void Transmitter::rebuild_session_packet(void)
         session_data->n = (uint8_t)fec_n;
 
         assert(sizeof(session_data->session_key) == sizeof(session_key));
-        memcpy(session_data->session_key, session_key, sizeof(session_key));
+        if (encrypted)
+            memcpy(session_data->session_key, session_key, sizeof(session_key));
+        else
+            memset(session_data->session_key, 0, sizeof(session_data->session_key)); // unused in plaintext
     }
 
     // Fill optional Tags
-
     uint32_t session_data_size = sizeof(wsession_data_t);
     for(auto it = tags.begin(); it != tags.end(); it++)
     {
@@ -157,14 +162,22 @@ void Transmitter::rebuild_session_packet(void)
         memcpy(tlv->value, &it->value[0], it->value.size());
     }
 
-    if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
-                        (uint8_t*)tmp, session_data_size,
-                        session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
+    if (encrypted)
     {
-        throw runtime_error("Unable to make session key!");
+        if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
+                            (uint8_t*)tmp, session_data_size,
+                            session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
+        {
+            throw runtime_error("Unable to make session key!");
+        }
+        session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
+    }
+    else
+    {
+        memcpy(session_packet + sizeof(wsession_hdr_t), tmp, session_data_size);
+        session_packet_size = sizeof(wsession_hdr_t) + session_data_size;
     }
 
-    session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
     assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
 }
 
@@ -656,16 +669,23 @@ void Transmitter::send_block_fragment(size_t packet_size)
 
     assert(packet_size <= MAX_FEC_PAYLOAD);
 
-    block_hdr->packet_type = WFB_PACKET_DATA;
+    block_hdr->packet_type = encrypted ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
     block_hdr->data_nonce = htobe64(((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx);
 
-    // encrypted payload
-    if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
-                                             block[fragment_idx], packet_size,
-                                             (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
-                                             NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+    if (encrypted)
     {
-        throw runtime_error("Unable to encrypt packet!");
+        if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
+                                                 block[fragment_idx], packet_size,
+                                                 (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
+                                                 NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+        {
+            throw runtime_error("Unable to encrypt packet!");
+        }
+    }
+    else
+    {
+        memcpy(ciphertext + sizeof(wblock_hdr_t), block[fragment_idx], packet_size);
+        ciphertext_len = packet_size;
     }
 
     inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
@@ -701,18 +721,26 @@ void Transmitter::send_swfec_wire(const uint8_t *data, size_t size)
     long long unsigned int ciphertext_len = 0;
 
     assert(size <= MAX_FEC_PAYLOAD);
-    block_hdr->packet_type = WFB_PACKET_DATA;
+    block_hdr->packet_type = encrypted ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
     block_hdr->data_nonce = htobe64(swfec_nonce);
     swfec_nonce += 1;
 
-    // mirror send_block_fragment's exact AEAD call shape
-    if (crypto_aead_chacha20poly1305_encrypt(
-            ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
-            data, size,
-            (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
-            NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+    if (encrypted)
     {
-        throw runtime_error("Unable to encrypt swfec packet!");
+        // mirror send_block_fragment's exact AEAD call shape
+        if (crypto_aead_chacha20poly1305_encrypt(
+                ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
+                data, size,
+                (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
+                NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+        {
+            throw runtime_error("Unable to encrypt swfec packet!");
+        }
+    }
+    else
+    {
+        memcpy(ciphertext + sizeof(wblock_hdr_t), data, size);
+        ciphertext_len = size;
     }
 
     inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
@@ -1827,7 +1855,7 @@ int main(int argc, char * const *argv)
     bool mirror = false;
     bool vht_mode = false;
     bool use_swfec = false;
-    string keypair = "tx.key";
+    string keypair = "";
     uint8_t frame_type = FRAME_TYPE_DATA;
     bool use_qdisc = false;
     uint32_t fwmark = 0;
@@ -2001,6 +2029,10 @@ int main(int argc, char * const *argv)
 
     if (optind >= argc) {
         goto show_usage;
+    }
+
+    if (keypair.empty()) {
+        WFB_ERR("WARNING: no -K given — running UNENCRYPTED on radio_port %d\n", radio_port);
     }
 
     // swfec-mode validation and defaults

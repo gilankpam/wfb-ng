@@ -441,6 +441,40 @@ class KeyDerivationTestCase(TXRXTestCase):
         self.assertEqual(hashlib.sha1(keys[1]).hexdigest(), '7a6ffb44cebc53b4538d20bdcaba8d70c9cf4095')
 
 
+class PlaintextTXOnlyTestCase(unittest.TestCase):
+    # wfb_tx with no -K must run in plaintext and emit the same packet
+    # structure as encrypted mode (1 session + (8 data + 4 fec) per block).
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        # NOTE: no -K -> plaintext
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        ap = FakeAntennaProtocol()
+        self.tx_pp = TXProtocol(ap, cmd_tx, 'debug tx')
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        self.tx_pp.transport.signalProcess('KILL')
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_plaintext_tx_emits(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+        for i in range(16):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+        yield df_sleep(0.1)
+        # 1 session + (8 data + 4 fec) * 2 blocks, same as the encrypted test_txrx
+        self.assertEqual(len(self.txp.rxq), 25)
+
+
 class UNIXTXRXTestCase(TXRXTestCase):
     @defer.inlineCallbacks
     def setUp(self):

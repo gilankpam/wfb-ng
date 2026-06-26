@@ -118,6 +118,7 @@ private:
     const uint64_t epoch; // Packets from old epoch will be discarded
     const uint32_t channel_id; // (link_id << 8) + port_number
     const uint32_t fec_delay; // fec packet delay [us]
+    const bool encrypted; // false when no keypair given (-K absent): plaintext mode
 
     // tx->rx keypair
     uint8_t tx_secretkey[crypto_box_SECRETKEYBYTES];
