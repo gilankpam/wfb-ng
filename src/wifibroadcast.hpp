@@ -188,6 +188,8 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 // packet types
 #define WFB_PACKET_DATA    0x1
 #define WFB_PACKET_SESSION 0x2
+#define WFB_PACKET_DATA_PLAIN    0x3  // wblock_hdr  + raw fragment (no AEAD tag); -K absent
+#define WFB_PACKET_SESSION_PLAIN 0x4  // wsession_hdr + raw wsession_data (no crypto_box); -K absent
 
 // FEC types
 #define WFB_FEC_VDM_RS  0x1  //Reed-Solomon on Vandermonde matrix

@@ -251,6 +251,8 @@ private:
     Aggregator& operator=(const Aggregator&);
 
     void init_fec(int k, int n);
+    void setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch);
+    void swfec_set_deadline(uint8_t n); // param-only swfec deadline update (shared encrypted + plaintext)
     void deinit_fec(void);
     void swfec_flush_reorder_out(std::vector<swfec::SwfecReorder::Out> &ro_out);
     void send_packet(int ring_idx, int fragment_idx);
@@ -282,6 +284,7 @@ private:
     uint64_t last_known_block;  //id of last known block
     uint64_t epoch; // current epoch
     const uint32_t channel_id; // (link_id << 8) + port_number
+    const bool encrypted; // false when no keypair given (-K absent): plaintext mode
 
     // rx->tx keypair
     uint8_t rx_secretkey[crypto_box_SECRETKEYBYTES];

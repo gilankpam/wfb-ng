@@ -86,7 +86,7 @@ public:
     virtual ~Transmitter();
     bool send_packet(const uint8_t *buf, size_t size, uint8_t flags);
     void send_session_key(void);
-    void init_session(int k, int n);
+    void init_session(int k, int n, bool preserve_seq = false);
     void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
     bool is_swfec(void) const { return use_swfec; }
     void swfec_set_params(int overhead_pct, int deadline_ms);
@@ -118,6 +118,7 @@ private:
     const uint64_t epoch; // Packets from old epoch will be discarded
     const uint32_t channel_id; // (link_id << 8) + port_number
     const uint32_t fec_delay; // fec packet delay [us]
+    const bool encrypted; // false when no keypair given (-K absent): plaintext mode
 
     // tx->rx keypair
     uint8_t tx_secretkey[crypto_box_SECRETKEYBYTES];

@@ -282,27 +282,31 @@ Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_i
     fec_p(NULL), fec_k(-1), fec_n(-1),
     session_is_swfec(false), swfec_dec(NULL), swfec_ro(NULL), swfec_deadline_ms(0),
     seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
-    last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
+    last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id),
+    encrypted(!keypair.empty())
 {
     memset(session_key, '\0', sizeof(session_key));
     memset(session_hash, '\0', sizeof(session_hash));
 
-    FILE *fp;
-    if((fp = fopen(keypair.c_str(), "r")) == NULL)
+    if (encrypted)
     {
-        throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
-    }
-    if (fread(rx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
-    {
+        FILE *fp;
+        if((fp = fopen(keypair.c_str(), "r")) == NULL)
+        {
+            throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
+        }
+        if (fread(rx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read rx secret key: %s", strerror(errno)));
+        }
+        if (fread(tx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read tx public key: %s", strerror(errno)));
+        }
         fclose(fp);
-        throw runtime_error(string_format("Unable to read rx secret key: %s", strerror(errno)));
     }
-    if (fread(tx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
-    {
-        fclose(fp);
-        throw runtime_error(string_format("Unable to read tx public key: %s", strerror(errno)));
-    }
-    fclose(fp);
 }
 
 
@@ -351,6 +355,72 @@ void Aggregator::init_fec(int k, int n)
         rx_ring[ring_idx].fragment_map = new size_t[fec_n];
         memset(rx_ring[ring_idx].fragment_map, '\0', fec_n * sizeof(size_t));
     }
+}
+
+// (Re)build the RX decoder from session FEC params and emit the IPC SESSION line.
+// Shared by the encrypted session path (on session-key change) and the plaintext
+// session path (on param change). Does not touch session_key.
+void Aggregator::setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch)
+{
+    epoch = new_epoch;
+
+    if (fec_type == WFB_FEC_VDM_RS)
+    {
+        // Drop any active swfec decoder when switching to RS
+        delete swfec_dec;
+        swfec_dec = NULL;
+        delete swfec_ro;
+        swfec_ro = NULL;
+        session_is_swfec = false;
+
+        if (fec_p != NULL)
+        {
+            deinit_fec();
+        }
+
+        init_fec(k, n);
+
+        // Trailing field #5 (contract_version). 4-field-only parsers stay compatible.
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch,
+                (unsigned)WFB_FEC_VDM_RS, fec_k, fec_n, (unsigned)WFB_IPC_CONTRACT_VERSION);
+        IPC_MSG_SEND();
+    }
+    else // WFB_FEC_SWFEC
+    {
+        if (fec_p != NULL)
+        {
+            deinit_fec();
+        }
+
+        delete swfec_dec;
+        swfec_dec = NULL;
+        swfec_dec = new swfec::SwfecDecoder((uint64_t)n * 1000);
+        delete swfec_ro;
+        swfec_ro = new swfec::SwfecReorder((uint64_t)n * 1000);
+        session_is_swfec = true;
+        swfec_deadline_ms = n;
+
+        fec_k = k;   // swfec: overhead_pct rides the k slot
+        fec_n = n;   // swfec: deadline_ms rides the n slot
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch,
+                (unsigned)WFB_FEC_SWFEC, fec_k, fec_n, (unsigned)WFB_IPC_CONTRACT_VERSION);
+        IPC_MSG_SEND();
+    }
+}
+
+// Param-only swfec deadline update (same session, deadline changed): no decoder
+// reset. Shared by the encrypted session path and the plaintext SESSION_PLAIN path.
+void Aggregator::swfec_set_deadline(uint8_t n)
+{
+    swfec_deadline_ms = n;
+    swfec_dec->set_deadline_us((uint64_t)n * 1000);
+    if (swfec_ro != NULL)
+        swfec_ro->set_deadline_us((uint64_t)n * 1000);
+    fec_n = n;
+    IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n",
+            get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
+            (unsigned)WFB_IPC_CONTRACT_VERSION);
+    IPC_MSG_SEND();
 }
 
 void Aggregator::deinit_fec(void)
@@ -680,6 +750,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     switch(buf[0])
     {
     case WFB_PACKET_DATA:
+        if (!encrypted)   // plaintext RX must not accept encrypted data
+        {
+            count_p_bad += 1;
+            return;
+        }
         if(size < sizeof(wblock_hdr_t) + crypto_aead_chacha20poly1305_ABYTES + sizeof(wpacket_hdr_t))
         {
             WFB_ERR("Short packet (fec header)\n");
@@ -688,7 +763,32 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         }
         break;
 
+    case WFB_PACKET_DATA_PLAIN:
+        if (encrypted)   // encrypted RX must not accept plaintext data (downgrade guard)
+        {
+            count_p_bad += 1;
+            return;
+        }
+        if (size < sizeof(wblock_hdr_t) + sizeof(wpacket_hdr_t))
+        {
+            WFB_ERR("Short packet (plain fec header)\n");
+            count_p_bad += 1;
+            return;
+        }
+        if (size > sizeof(wblock_hdr_t) + MAX_FEC_PAYLOAD)  // no AEAD tag -> bound length explicitly
+        {
+            WFB_ERR("Long packet (plain fec payload)\n");
+            count_p_bad += 1;
+            return;
+        }
+        break;
+
     case WFB_PACKET_SESSION:
+        if (!encrypted)   // plaintext RX must not accept encrypted session
+        {
+            count_p_bad += 1;
+            return;
+        }
         new_session_data = (wsession_data_t*)session_tmp;
 
         if(size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES || \
@@ -768,27 +868,9 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
             if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
             {
-                epoch = be64toh(new_session_data->epoch);
                 memcpy(session_key, new_session_data->session_key, sizeof(session_key));
-
-                // Drop any active swfec decoder when switching to RS
-                delete swfec_dec;
-                swfec_dec = NULL;
-                delete swfec_ro;
-                swfec_ro = NULL;
-                session_is_swfec = false;
-
-                if (fec_p != NULL)
-                {
-                    deinit_fec();
-                }
-
-                init_fec(new_session_data->k, new_session_data->n);
-
-                // Trailing field #5 (contract_version). 4-field-only parsers stay compatible.
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch, (unsigned)WFB_FEC_VDM_RS, fec_k, fec_n,
-                        (unsigned)WFB_IPC_CONTRACT_VERSION);
-                IPC_MSG_SEND();
+                setup_session(WFB_FEC_VDM_RS, new_session_data->k, new_session_data->n,
+                              be64toh(new_session_data->epoch));
             }
         }
         else if (new_session_data->fec_type == WFB_FEC_SWFEC)
@@ -809,40 +891,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
             {
                 // New swfec session: (re)build decoder
-                epoch = be64toh(new_session_data->epoch);
                 memcpy(session_key, new_session_data->session_key, sizeof(session_key));
-
-                if (fec_p != NULL)
-                {
-                    deinit_fec();
-                }
-
-                delete swfec_dec;
-                swfec_dec = NULL;
-                swfec_dec = new swfec::SwfecDecoder((uint64_t)new_session_data->n * 1000);
-                delete swfec_ro;
-                swfec_ro = new swfec::SwfecReorder((uint64_t)new_session_data->n * 1000);
-                session_is_swfec = true;
-                swfec_deadline_ms = new_session_data->n;
-
-                fec_k = new_session_data->k;   // swfec: overhead_pct rides the k slot
-                fec_n = new_session_data->n;   // swfec: deadline_ms rides the n slot
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
-                        (unsigned)WFB_IPC_CONTRACT_VERSION);
-                IPC_MSG_SEND();
+                setup_session(WFB_FEC_SWFEC, new_session_data->k, new_session_data->n,
+                              be64toh(new_session_data->epoch));
             }
             else if (session_is_swfec && new_session_data->n != swfec_deadline_ms)
             {
-                // Param-only update: deadline changed, same key — no reset (spec §6)
-                swfec_deadline_ms = new_session_data->n;
-                swfec_dec->set_deadline_us((uint64_t)new_session_data->n * 1000);
-                if (swfec_ro != NULL)
-                    swfec_ro->set_deadline_us((uint64_t)new_session_data->n * 1000);
-                fec_n = new_session_data->n;  // keep the SESSION re-emit in sync
-                IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n",
-                        get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
-                        (unsigned)WFB_IPC_CONTRACT_VERSION);
-                IPC_MSG_SEND();
+                // Param-only update: deadline changed, same key — no reset
+                swfec_set_deadline(new_session_data->n);
             }
         }
         else
@@ -857,6 +913,105 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
 
         return;
 
+    case WFB_PACKET_SESSION_PLAIN:
+    {
+        if (encrypted)   // encrypted RX must not accept plaintext session (downgrade guard)
+        {
+            count_p_bad += 1;
+            return;
+        }
+
+        // Plaintext validation failures below are counted as count_p_bad (not the
+        // encrypted path's count_p_dec_err): there is no decrypt step, and an
+        // invalid plaintext session is unauthenticated / likely hostile, so the
+        // "bad packet" bucket fits better than "decode error". Deliberate.
+        if (size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) || size > MAX_SESSION_PACKET_SIZE)
+        {
+            WFB_ERR("Invalid plain session packet\n");
+            count_p_bad += 1;
+            return;
+        }
+
+        // Dedup identical re-announces (same generichash over body + nonce).
+        if (crypto_generichash(new_session_hash, sizeof(new_session_hash),
+                               buf + sizeof(wsession_hdr_t), size - sizeof(wsession_hdr_t),
+                               ((wsession_hdr_t*)buf)->session_nonce,
+                               sizeof(((wsession_hdr_t*)buf)->session_nonce)) != 0)
+        {
+            assert(0);
+        }
+        if (memcmp(session_hash, new_session_hash, sizeof(session_hash)) == 0)
+        {
+            count_p_session += 1;
+            return;
+        }
+
+        const wsession_data_t* sd = (const wsession_data_t*)(buf + sizeof(wsession_hdr_t));
+
+        // No epoch gate in plaintext: the epoch field is unauthenticated here, so
+        // honoring "epoch < current -> reject" would let one forged session with a
+        // huge epoch permanently latch the RX into rejecting all legitimate
+        // (epoch == 0) sessions — a persistent freeze that defeats the session-ID
+        // restart recovery below. The session-ID memcmp is the sole authority for
+        // session changes in plaintext; an unauthenticated epoch buys no real
+        // replay protection. (setup_session still records the announced epoch for
+        // the IPC SESSION line; a forged value is overwritten by the next session.)
+        if (be32toh(sd->channel_id) != channel_id)
+        {
+            WFB_ERR("Session channel_id doesn't match: %u != %u\n", be32toh(sd->channel_id), channel_id);
+            count_p_bad += 1;
+            return;
+        }
+        if (sd->fec_type == WFB_FEC_VDM_RS)
+        {
+            if (sd->n < 1 || sd->k < 1 || sd->k > sd->n)
+            {
+                WFB_ERR("Invalid FEC K/N: %d/%d\n", sd->k, sd->n);
+                count_p_bad += 1;
+                return;
+            }
+        }
+        else if (sd->fec_type == WFB_FEC_SWFEC)
+        {
+            if (sd->n < 1)
+            {
+                WFB_ERR("Invalid swfec deadline_ms (n): %d\n", sd->n);
+                count_p_bad += 1;
+                return;
+            }
+        }
+        else
+        {
+            WFB_ERR("Unsupported FEC codec type: %d\n", sd->fec_type);
+            count_p_bad += 1;
+            return;
+        }
+
+        count_p_session += 1;
+
+        // Plaintext carries the TX's fresh-per-session random session_key as an
+        // opaque session ID (not used for any cipher). Detect a new session — a
+        // TX (re)start or an RS reconfigure, both of which call init_session()
+        // and mint a new ID — exactly as the encrypted path does: by a change in
+        // that field. A swfec live param tweak keeps the same ID (swfec_set_params
+        // does not call init_session), so it falls to the deadline-only update.
+        // This recovers a long-running RX from a TX restart with no clock/epoch
+        // dependency. The RX session_key member starts memset to 0, so the first
+        // real session (random ID) always differs and triggers the initial build.
+        if (memcmp(session_key, sd->session_key, sizeof(session_key)) != 0)
+        {
+            memcpy(session_key, sd->session_key, sizeof(session_key));
+            setup_session(sd->fec_type, sd->k, sd->n, be64toh(sd->epoch));
+        }
+        else if (sd->fec_type == WFB_FEC_SWFEC && session_is_swfec && sd->n != swfec_deadline_ms)
+        {
+            swfec_set_deadline(sd->n);  // param-only deadline update, shared helper (Task 2)
+        }
+
+        memcpy(session_hash, new_session_hash, sizeof(session_hash));
+        return;
+    }
+
     default:
         WFB_ERR("Unknown packet type 0x%x\n", buf[0]);
         count_p_bad += 1;
@@ -867,7 +1022,13 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     unsigned long long decrypted_len;
     wblock_hdr_t *block_hdr = (wblock_hdr_t*)buf;
 
-    if (crypto_aead_chacha20poly1305_decrypt(decrypted, &decrypted_len,
+    if (buf[0] == WFB_PACKET_DATA_PLAIN)
+    {
+        // size was bounded to <= sizeof(wblock_hdr_t) + MAX_FEC_PAYLOAD in the switch
+        decrypted_len = size - sizeof(wblock_hdr_t);
+        memcpy(decrypted, buf + sizeof(wblock_hdr_t), decrypted_len);
+    }
+    else if (crypto_aead_chacha20poly1305_decrypt(decrypted, &decrypted_len,
                                              NULL,
                                              buf + sizeof(wblock_hdr_t), size - sizeof(wblock_hdr_t),
                                              buf,
@@ -1343,7 +1504,7 @@ int main(int argc, char* const *argv)
     int rcv_buf = 0;
     int snd_buf = 0;
 
-    string keypair = "rx.key";
+    string keypair = "";
     string unix_socket = "";
 
     while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:")) != -1) {
@@ -1424,6 +1585,10 @@ int main(int argc, char* const *argv)
     try
     {
         uint32_t channel_id = (link_id << 8) + radio_port;
+
+        if (rx_mode != FORWARDER && keypair.empty()) {
+            WFB_ERR("WARNING: no -K given — running UNENCRYPTED on radio_port %d\n", radio_port);
+        }
 
         // WiFi interface(s) are required for all modes except aggregator
         if(rx_mode == AGGREGATOR)

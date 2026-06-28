@@ -55,6 +55,7 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     epoch(epoch),
     channel_id(channel_id),
     fec_delay(fec_delay),
+    encrypted(!keypair.empty()),
     tx_secretkey{},
     rx_publickey{},
     session_key{},
@@ -67,22 +68,25 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     swfec_oversize(0)
 {
 
-    FILE *fp;
-    if ((fp = fopen(keypair.c_str(), "r")) == NULL)
+    if (encrypted)
     {
-        throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
-    }
-    if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
-    {
+        FILE *fp;
+        if ((fp = fopen(keypair.c_str(), "r")) == NULL)
+        {
+            throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
+        }
+        if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
+        }
+        if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
+        }
         fclose(fp);
-        throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
     }
-    if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
-    {
-        fclose(fp);
-        throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
-    }
-    fclose(fp);
 
     init_session(k, n);
 }
@@ -120,12 +124,11 @@ void Transmitter::rebuild_session_packet(void)
 {
     // fill packet header (new random nonce each call)
     wsession_hdr_t *session_hdr = (wsession_hdr_t *)session_packet;
-    session_hdr->packet_type = WFB_PACKET_SESSION;
+    session_hdr->packet_type = encrypted ? WFB_PACKET_SESSION : WFB_PACKET_SESSION_PLAIN;
 
     randombytes_buf(session_hdr->session_nonce, sizeof(session_hdr->session_nonce));
 
     // fill packet contents
-
     uint8_t tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
 
     // Fill fixed headers
@@ -140,11 +143,15 @@ void Transmitter::rebuild_session_packet(void)
         session_data->n = (uint8_t)fec_n;
 
         assert(sizeof(session_data->session_key) == sizeof(session_key));
+        // session_key is a fresh random value per init_session() (startup /
+        // restart / reconfigure), generated even in plaintext. Encrypted: it is
+        // the AEAD key. Plaintext: it rides the wire purely as an opaque session
+        // ID, so the RX detects a TX restart (new random ID) exactly as the
+        // encrypted path detects a session-key change. No secret is exposed.
         memcpy(session_data->session_key, session_key, sizeof(session_key));
     }
 
     // Fill optional Tags
-
     uint32_t session_data_size = sizeof(wsession_data_t);
     for(auto it = tags.begin(); it != tags.end(); it++)
     {
@@ -157,18 +164,38 @@ void Transmitter::rebuild_session_packet(void)
         memcpy(tlv->value, &it->value[0], it->value.size());
     }
 
-    if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
-                        (uint8_t*)tmp, session_data_size,
-                        session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
+    if (encrypted)
     {
-        throw runtime_error("Unable to make session key!");
+        if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
+                            (uint8_t*)tmp, session_data_size,
+                            session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
+        {
+            throw runtime_error("Unable to make session key!");
+        }
+        session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
+    }
+    else
+    {
+        memcpy(session_packet + sizeof(wsession_hdr_t), tmp, session_data_size);
+        session_packet_size = sizeof(wsession_hdr_t) + session_data_size;
     }
 
-    session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
     assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
 }
 
-void Transmitter::init_session(int k, int n)
+// preserve_seq: keep block_idx running monotonically across this (re)init instead
+// of restarting it at 0. Used by a live RS reconfigure (CMD_SET_FEC): the new
+// session mints a fresh session_key, but the data sequence must stay monotonic so
+// that a plaintext RX cannot mistake an in-flight old-session straggler (which is
+// unauthenticated and carries no session binding) for new data. If block_idx
+// restarted at 0, such a straggler — arriving after the RX reset its decoder
+// (last_known_block = -1) under WiFi reordering / multi-card diversity — would
+// poison last_known_block to a high value and stall every subsequent low-index
+// block as "already processed" until the next session change. Keeping block_idx
+// monotonic makes new data strictly greater than any straggler, so the RX's
+// existing ordering logic rejects the straggler and accepts the new stream. This
+// mirrors swfec, whose param change (swfec_set_params) never resets its nonce.
+void Transmitter::init_session(int k, int n, bool preserve_seq)
 {
     if (use_swfec)
     {
@@ -210,8 +237,9 @@ void Transmitter::init_session(int k, int n)
         assert(_rc == 0);
     }
 
-    block_idx = 0;
-    fragment_idx = 0;
+    if (!preserve_seq)
+        block_idx = 0;     // fresh stream (startup / restart / overflow rekey)
+    fragment_idx = 0;      // a (re)init always begins a fresh FEC block
 
     // init session key
     randombytes_buf(session_key, sizeof(session_key));
@@ -656,16 +684,23 @@ void Transmitter::send_block_fragment(size_t packet_size)
 
     assert(packet_size <= MAX_FEC_PAYLOAD);
 
-    block_hdr->packet_type = WFB_PACKET_DATA;
+    block_hdr->packet_type = encrypted ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
     block_hdr->data_nonce = htobe64(((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx);
 
-    // encrypted payload
-    if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
-                                             block[fragment_idx], packet_size,
-                                             (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
-                                             NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+    if (encrypted)
     {
-        throw runtime_error("Unable to encrypt packet!");
+        if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
+                                                 block[fragment_idx], packet_size,
+                                                 (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
+                                                 NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+        {
+            throw runtime_error("Unable to encrypt packet!");
+        }
+    }
+    else
+    {
+        memcpy(ciphertext + sizeof(wblock_hdr_t), block[fragment_idx], packet_size);
+        ciphertext_len = packet_size;
     }
 
     inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
@@ -701,18 +736,26 @@ void Transmitter::send_swfec_wire(const uint8_t *data, size_t size)
     long long unsigned int ciphertext_len = 0;
 
     assert(size <= MAX_FEC_PAYLOAD);
-    block_hdr->packet_type = WFB_PACKET_DATA;
+    block_hdr->packet_type = encrypted ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
     block_hdr->data_nonce = htobe64(swfec_nonce);
     swfec_nonce += 1;
 
-    // mirror send_block_fragment's exact AEAD call shape
-    if (crypto_aead_chacha20poly1305_encrypt(
-            ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
-            data, size,
-            (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
-            NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+    if (encrypted)
     {
-        throw runtime_error("Unable to encrypt swfec packet!");
+        // mirror send_block_fragment's exact AEAD call shape
+        if (crypto_aead_chacha20poly1305_encrypt(
+                ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
+                data, size,
+                (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
+                NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+        {
+            throw runtime_error("Unable to encrypt swfec packet!");
+        }
+    }
+    else
+    {
+        memcpy(ciphertext + sizeof(wblock_hdr_t), data, size);
+        ciphertext_len = size;
     }
 
     inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
@@ -1010,7 +1053,10 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         // Close open FEC block if any
                         while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
 
-                        t->init_session(req_k, req_n);
+                        // Live reconfigure: keep block_idx monotonic so a plaintext
+                        // RX cannot mistake an old-session straggler for new data
+                        // (see init_session comment re: last_known_block poisoning).
+                        t->init_session(req_k, req_n, true);
 
                         // Emulate FEC for initial session key distribution
                         for(int i = 0; i < req_n - req_k + 1; i++)
@@ -1827,7 +1873,7 @@ int main(int argc, char * const *argv)
     bool mirror = false;
     bool vht_mode = false;
     bool use_swfec = false;
-    string keypair = "tx.key";
+    string keypair = "";
     uint8_t frame_type = FRAME_TYPE_DATA;
     bool use_qdisc = false;
     uint32_t fwmark = 0;
@@ -2001,6 +2047,10 @@ int main(int argc, char * const *argv)
 
     if (optind >= argc) {
         goto show_usage;
+    }
+
+    if (tx_mode != INJECTOR && keypair.empty()) {
+        WFB_ERR("WARNING: no -K given — running UNENCRYPTED on radio_port %d\n", radio_port);
     }
 
     // swfec-mode validation and defaults
