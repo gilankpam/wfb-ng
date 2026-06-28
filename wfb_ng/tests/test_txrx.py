@@ -328,6 +328,84 @@ class TXRXTestCase(unittest.TestCase):
 
 
     @defer.inlineCallbacks
+    def test_reconfig_old_straggler_poison(self):
+        # Regression: after a FEC reconfigure (new session -> RX resets
+        # last_known_block to -1), an OLD-session straggler data packet with a
+        # high block_idx that arrives AFTER the reset (normal under WiFi
+        # reordering / multi-card diversity aggregation) must not poison
+        # last_known_block. If it does, all new-session data (block_idx 0,1,2..)
+        # is rejected as "already processed" and the video freezes.
+        #
+        # Encrypted mode is immune: the straggler was sealed with the OLD session
+        # key and fails AEAD against the new key, so it is dropped before it can
+        # touch last_known_block. Plaintext data carries no session binding, so
+        # without an explicit guard the straggler is accepted -> this test fails.
+        OFF = 17  # sizeof(wrxfwd_t) prefix on -D debug-mirrored packets
+        def ptype(p):     return p[OFF]
+        def is_data(p):   return ptype(p) in (0x1, 0x3)
+        def is_sess(p):   return ptype(p) in (0x2, 0x4)
+        def nonce(p):     return int.from_bytes(p[OFF + 1:OFF + 9], 'big')
+        def blk(p):       return nonce(p) >> 8
+        def frag(p):      return nonce(p) & 0xff
+
+        # ---- Round 1: establish session 1 (default k=8/n=12), 8 full blocks ----
+        for i in range(64):
+            self.txp.send_msg(b'a%03d' % i)
+            yield df_sleep(0.003)
+        yield df_sleep(0.1)
+
+        round1 = list(self.txp.rxq); self.txp.rxq[:] = []
+        data1 = [p for p in round1 if is_data(p)]
+        sess1 = [p for p in round1 if is_sess(p)]
+        self.assertTrue(data1 and sess1)
+
+        # Hold back a high-block SOURCE fragment (frag_idx 0 < any future n) to
+        # replay after the reset. Source fragments are never FEC-only parity, so
+        # they survive the post-reset fragment_idx < fec_n guard.
+        src1 = [p for p in data1 if frag(p) == 0]
+        straggler = max(src1, key=blk)
+
+        self.rxp.send_msg(sess1[0])
+        for p in data1:
+            if p is not straggler:
+                self.rxp.send_msg(p)
+            yield df_sleep(0.001)
+        yield df_sleep(0.2)
+        self.assertGreaterEqual(len(self.rxp.rxq), 48)  # round-1 mostly delivered
+
+        # ---- Reconfigure FEC -> brand new session, RX resets last_known_block ----
+        yield self.cmdp.set_fec(4, 8)
+        yield df_sleep(0.1)
+        after = list(self.txp.rxq); self.txp.rxq[:] = []
+        new_sess = [p for p in after if is_sess(p)]
+        self.assertTrue(new_sess, 'no new session packet emitted by set_fec')
+
+        # New session packet first -> RX rebuilds decoder, last_known_block = -1.
+        self.rxp.send_msg(new_sess[0])
+        yield df_sleep(0.02)
+        # OLD straggler (high block_idx) arrives AFTER the reset.
+        self.rxp.send_msg(straggler)
+        yield df_sleep(0.02)
+
+        # ---- Round 2: new low-block_idx data must still be delivered ----
+        for i in range(12):
+            self.txp.send_msg(b'b%03d' % i)
+            yield df_sleep(0.003)
+        yield df_sleep(0.1)
+        round2 = list(self.txp.rxq); self.txp.rxq[:] = []
+        for p in round2:
+            if is_data(p):
+                self.rxp.send_msg(p)
+            yield df_sleep(0.001)
+        yield df_sleep(0.2)
+
+        delivered_b = [m for m in self.rxp.rxq if m[:1] == b'b']
+        self.assertEqual(delivered_b, [b'b%03d' % i for i in range(12)],
+                         'new-session data dropped: last_known_block poisoned '
+                         'by old straggler (block_idx=%d)' % blk(straggler))
+
+
+    @defer.inlineCallbacks
     def test_cmd_fec_invalid_args(self):
         self.assertEqual(len(self.txp.rxq), 0)
         for i in range(6):

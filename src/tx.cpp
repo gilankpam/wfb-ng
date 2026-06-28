@@ -183,7 +183,19 @@ void Transmitter::rebuild_session_packet(void)
     assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
 }
 
-void Transmitter::init_session(int k, int n)
+// preserve_seq: keep block_idx running monotonically across this (re)init instead
+// of restarting it at 0. Used by a live RS reconfigure (CMD_SET_FEC): the new
+// session mints a fresh session_key, but the data sequence must stay monotonic so
+// that a plaintext RX cannot mistake an in-flight old-session straggler (which is
+// unauthenticated and carries no session binding) for new data. If block_idx
+// restarted at 0, such a straggler — arriving after the RX reset its decoder
+// (last_known_block = -1) under WiFi reordering / multi-card diversity — would
+// poison last_known_block to a high value and stall every subsequent low-index
+// block as "already processed" until the next session change. Keeping block_idx
+// monotonic makes new data strictly greater than any straggler, so the RX's
+// existing ordering logic rejects the straggler and accepts the new stream. This
+// mirrors swfec, whose param change (swfec_set_params) never resets its nonce.
+void Transmitter::init_session(int k, int n, bool preserve_seq)
 {
     if (use_swfec)
     {
@@ -225,8 +237,9 @@ void Transmitter::init_session(int k, int n)
         assert(_rc == 0);
     }
 
-    block_idx = 0;
-    fragment_idx = 0;
+    if (!preserve_seq)
+        block_idx = 0;     // fresh stream (startup / restart / overflow rekey)
+    fragment_idx = 0;      // a (re)init always begins a fresh FEC block
 
     // init session key
     randombytes_buf(session_key, sizeof(session_key));
@@ -1040,7 +1053,10 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         // Close open FEC block if any
                         while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
 
-                        t->init_session(req_k, req_n);
+                        // Live reconfigure: keep block_idx monotonic so a plaintext
+                        // RX cannot mistake an old-session straggler for new data
+                        // (see init_session comment re: last_known_block poisoning).
+                        t->init_session(req_k, req_n, true);
 
                         // Emulate FEC for initial session key distribution
                         for(int i = 0; i < req_n - req_k + 1; i++)
