@@ -223,8 +223,8 @@ class AntennaStat(Int32StringReceiver):
                 lpad = ''
                 rpad = ''
 
-            addstr_markup(window, 2, 20, '{Freq MCS BW %s[ANT]%s pkt/s dloss}     {RSSI} [dBm]        {SNR} [dB]        {EVM} [%%]' % (lpad, rpad))
-            # EVM (radiotap LOCK_QUALITY), 0-100% higher=better, per stream-0.
+            addstr_markup(window, 2, 20, '{Freq MCS BW %s[ANT]%s pkt/s dloss}     {RSSI} [dBm]        {SNR} [dB]        {EVM} [dB]' % (lpad, rpad))
+            # EVM (radiotap LOCK_QUALITY): |EVM| in dB, higher=better, per stream-0.
             # The aggregator sends -1 for an antenna that carried no measurable EVM.
             fmt_evm = lambda x: '--' if x is None or x < 0 else '%d' % x
             for y, (((freq, mcs_index, bandwidth), ant_id), v) in enumerate(sorted(stats_d.items()), 3):
