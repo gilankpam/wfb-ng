@@ -57,6 +57,9 @@ wfb_tx: src/tx.o src/zfex.o src/wifibroadcast.o src/fec_swfec.o
 fec_test: src/fec_test.cpp src/zfex.o
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) $(shell pkg-config --libs catch2-with-main)
 
+wrxfwd_test: src/wrxfwd_test.cpp src/wifibroadcast.hpp
+	$(CXX) $(_CFLAGS) -Isrc -o $@ src/wrxfwd_test.cpp $(LDFLAGS) $(shell pkg-config --libs catch2-with-main)
+
 libsodium_test: src/libsodium_test.cpp
 	$(CXX) $(_CFLAGS) -o $@ $^ $(LDFLAGS) -lsodium $(shell pkg-config --libs catch2-with-main)
 
@@ -78,10 +81,11 @@ wfb_tun: src/wfb_tun.o
 wfb_rtsp: src/rtsp_server.c
 	$(CC) $(_CFLAGS) $(shell pkg-config --cflags gstreamer-rtsp-server-1.0) -o $@ $^ $(LDFLAGS) $(shell pkg-config --libs gstreamer-rtsp-server-1.0)
 
-test: all_bin fec_test libsodium_test fec_swfec_test
+test: all_bin fec_test libsodium_test fec_swfec_test wrxfwd_test
 	./fec_test
 	./libsodium_test
 	./fec_swfec_test
+	./wrxfwd_test
 	PYTHONPATH=`pwd` $(PYTHON) -m twisted.trial wfb_ng.tests
 
 rpm:  all_bin wfb_rtsp $(ENV)

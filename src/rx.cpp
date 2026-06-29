@@ -472,11 +472,8 @@ void Forwarder::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx
                                const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                uint8_t bandwidth, sockaddr_in *sockaddr)
 {
-    // EVM is not forwarded over the cluster wire protocol (wrxfwd_t); only the
-    // local aggregator path carries it, so cluster mode reports no EVM.
-    (void)evm;
-
-    wrxfwd_t fwd_hdr = { .wlan_idx = wlan_idx,
+    wrxfwd_t fwd_hdr = { .version = WFB_FWD_VERSION,
+                         .wlan_idx = wlan_idx,
                          .freq = htons(freq),
                          .mcs_index = mcs_index,
                          .bandwidth = bandwidth };
@@ -484,6 +481,7 @@ void Forwarder::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx
     memcpy(fwd_hdr.antenna, antenna, RX_ANT_MAX * sizeof(uint8_t));
     memcpy(fwd_hdr.rssi, rssi, RX_ANT_MAX * sizeof(int8_t));
     memcpy(fwd_hdr.noise, noise, RX_ANT_MAX * sizeof(int8_t));
+    memcpy(fwd_hdr.evm, evm, RX_ANT_MAX * sizeof(uint8_t));
 
     struct iovec iov[2] = {{ .iov_base = (void*)&fwd_hdr,
                              .iov_len = sizeof(fwd_hdr)},
@@ -683,6 +681,16 @@ void Aggregator::dump_stats(void)
 void Aggregator::log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi, const int8_t *noise,
                           const uint8_t *evm, uint16_t freq, uint8_t mcs_index, uint8_t bandwidth)
 {
+    // EVM is a per-frame (per-stream) value, not per-antenna: ath9k measures it
+    // after the chains are combined and emits it once (aggregate radiotap
+    // LOCK_QUALITY -> evm[0]), leaving the other antenna slots absent (0xff).
+    // The frame was received on every listed antenna, so show its EVM on each
+    // row. Only ABSENT slots are filled, so a driver that reports genuine
+    // per-antenna EVM (e.g. Realtek) keeps its own values.
+    uint8_t frame_evm = 0xff;
+    for (int i = 0; i < RX_ANT_MAX && ant[i] != 0xff; i++)
+        if (evm[i] != 0xff) { frame_evm = evm[i]; break; }
+
     for(int i = 0; i < RX_ANT_MAX && ant[i] != 0xff; i++)
     {
         // antenna_id: addr + port + wlan_idx + ant
@@ -699,7 +707,7 @@ void Aggregator::log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const u
 
         key.antenna_id |= ((uint64_t)wlan_idx << 8 | (uint64_t)ant[i]);
 
-        antenna_stat[key].log_rssi(rssi[i], noise[i], evm[i]);
+        antenna_stat[key].log_rssi(rssi[i], noise[i], (evm[i] != 0xff) ? evm[i] : frame_evm);
     }
 }
 
@@ -1404,9 +1412,8 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
 
 void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interval, int rcv_buf_size)
 {
-    wrxfwd_t fwd_hdr;
     struct sockaddr_in sockaddr;
-    uint8_t buf[MAX_FORWARDER_PACKET_SIZE];
+    uint8_t buf[sizeof(wrxfwd_t) + MAX_FORWARDER_PACKET_SIZE];
 
     uint64_t log_send_ts = get_time_ms();
     struct pollfd fds[1];
@@ -1453,15 +1460,12 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
             {
                 memset((void*)&sockaddr, '\0', sizeof(sockaddr));
 
-                struct iovec iov[2] = {{ .iov_base = (void*)&fwd_hdr,
-                                         .iov_len = sizeof(fwd_hdr)},
-                                       { .iov_base = (void*)buf,
-                                         .iov_len = sizeof(buf) }};
-
+                struct iovec iov = { .iov_base = (void*)buf,
+                                     .iov_len  = sizeof(buf) };
                 struct msghdr msghdr = { .msg_name = (void*)&sockaddr,
                                          .msg_namelen = sizeof(sockaddr),
-                                         .msg_iov = iov,
-                                         .msg_iovlen = 2,
+                                         .msg_iov = &iov,
+                                         .msg_iovlen = 1,
                                          .msg_control = NULL,
                                          .msg_controllen = 0,
                                          .msg_flags = 0};
@@ -1472,16 +1476,17 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
                     break;
                 }
 
-                if (rsize < (ssize_t)sizeof(wrxfwd_t))
+                const wrxfwd_t *h;
+                const uint8_t *payload;
+                size_t payload_len;
+                if (!wrxfwd_parse(buf, rsize, &h, &payload, &payload_len))
                 {
-                    continue;
+                    continue;   // short packet or stale/unknown version -> drop
                 }
-                uint8_t evm_none[RX_ANT_MAX];
-                memset(evm_none, 0xff, sizeof(evm_none));
-                agg->process_packet(buf, rsize - sizeof(wrxfwd_t),
-                                    fwd_hdr.wlan_idx, fwd_hdr.antenna,
-                                    fwd_hdr.rssi, fwd_hdr.noise, evm_none, ntohs(fwd_hdr.freq),
-                                    fwd_hdr.mcs_index, fwd_hdr.bandwidth, &sockaddr);
+                agg->process_packet((uint8_t*)payload, payload_len,
+                                    h->wlan_idx, h->antenna,
+                                    h->rssi, h->noise, h->evm, ntohs(h->freq),
+                                    h->mcs_index, h->bandwidth, &sockaddr);
             }
             if(errno != EWOULDBLOCK) throw runtime_error(string_format("Error receiving packet: %s", strerror(errno)));
         }

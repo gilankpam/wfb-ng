@@ -208,16 +208,39 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 #define SESSION_KEY_ANNOUNCE_MSEC 1000
 #define RX_ANT_MAX  4
 
+// Cluster forward proto v2: adds evm[]. Magic 0xA2 sits outside the realistic
+// wlan_idx range so a v1 packet (offset-0 byte = wlan_idx 0/1) can't match.
+#define WFB_FWD_VERSION 0xA2
+
 // Header for forwarding raw packets from RX host to Aggregator in UDP packets
 typedef struct {
-    uint8_t wlan_idx;
-    uint8_t antenna[RX_ANT_MAX]; //RADIOTAP_ANTENNA, list of antenna idx, 0xff for unused slot
-    int8_t rssi[RX_ANT_MAX]; //RADIOTAP_DBM_ANTSIGNAL, list of rssi for corresponding antenna idx
-    int8_t noise[RX_ANT_MAX]; //RADIOTAP_DBM_ANTNOISE, list of (rssi - snr) for corresponding antenna idx
-    uint16_t freq; //IEEE80211_RADIOTAP_CHANNEL -- channel frequency in MHz
-    uint8_t mcs_index;
-    uint8_t bandwidth;
+    uint8_t  version;                // == WFB_FWD_VERSION; absent in v1
+    uint8_t  wlan_idx;
+    uint8_t  antenna[RX_ANT_MAX];    // RADIOTAP_ANTENNA, 0xff for unused slot
+    int8_t   rssi[RX_ANT_MAX];       // RADIOTAP_DBM_ANTSIGNAL
+    int8_t   noise[RX_ANT_MAX];      // RADIOTAP_DBM_ANTNOISE (rssi - snr)
+    uint8_t  evm[RX_ANT_MAX];        // LOCK_QUALITY EVM%, 0xff = unused
+    uint16_t freq;                   // RADIOTAP_CHANNEL MHz
+    uint8_t  mcs_index;
+    uint8_t  bandwidth;
 } __attribute__ ((packed)) wrxfwd_t;
+
+// Validate a received cluster-forward datagram. Returns true for a well-formed
+// v2 packet and fills the header + payload slice; false (drop) on a short
+// packet or version/magic mismatch (stale node).
+static inline bool wrxfwd_parse(const uint8_t *buf, ssize_t rsize,
+                                const wrxfwd_t **hdr_out,
+                                const uint8_t **payload_out,
+                                size_t *payload_len_out)
+{
+    if (rsize < (ssize_t)sizeof(wrxfwd_t)) return false;
+    const wrxfwd_t *h = (const wrxfwd_t *)buf;
+    if (h->version != WFB_FWD_VERSION) return false;
+    *hdr_out = h;
+    *payload_out = buf + sizeof(wrxfwd_t);
+    *payload_len_out = (size_t)(rsize - sizeof(wrxfwd_t));
+    return true;
+}
 
 // Network packet headers. All numbers are in network (big endian) format
 // Encrypted packets can be either session key or data packet.
