@@ -169,7 +169,11 @@ def init_udp_direct_rx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
     else:
         raise Exception('%s: unsupported peer address: %s' % (service_name, cfg.peer))
 
-    cmd = ('%(cmd)s%(cluster)s -p %(stream)d %(conn_str)s %(key_arg)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+    # dynlink tap (fpvd): optional per-stream attr; 0/absent = no tap.
+    # getattr keeps vanilla configs (no such key) working unchanged.
+    tap_port = int(getattr(cfg, 'dynlink_tap_port', 0) or 0)
+
+    cmd = ('%(cmd)s%(cluster)s -p %(stream)d %(conn_str)s %(key_arg)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d%(tap)s' % \
            dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                 cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                 stream=cfg.stream_rx,
@@ -178,7 +182,8 @@ def init_udp_direct_rx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
                 rcv_buf_size=settings.common.tx_rcv_buf_size,
                 snd_buf_size=settings.common.rx_snd_buf_size,
                 log_interval=settings.common.log_interval,
-                link_id=link_id)).split() + (wlans if not is_cluster else [])
+                link_id=link_id,
+                tap=' -D %d' % tap_port if tap_port else '')).split() + (wlans if not is_cluster else [])
 
     df = RXProtocol(ant_sel_f, cmd, '%s rx' % (service_name,)).start()
 
