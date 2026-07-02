@@ -83,3 +83,85 @@ static inline size_t tap_encode_loss(uint8_t *buf, size_t cap, uint16_t seq, uin
     tap_put_u32(p, new_seq); p += 4;
     return TAP_LOSS_SIZE;
 }
+
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+// Owns the tap UDP socket + the LOSS coalescer. Fire-and-forget: send
+// failures increment drop_count and are otherwise ignored — the radio
+// loop must never block or throw on tap I/O.
+class TapEmitter
+{
+public:
+    static const int LOSS_HOLDOFF_MS = 2;
+
+    ~TapEmitter() { if (fd_ >= 0) close(fd_); }
+    bool enabled(void) const { return fd_ >= 0; }
+    uint16_t take_seq(void) { return seq_++; }
+    uint32_t drop_count(void) const { return drop_count_; }
+
+    void init(int port)
+    {
+        fd_ = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        if (fd_ < 0) return; // tap stays disabled; video path unaffected
+        memset(&dst_, 0, sizeof(dst_));
+        dst_.sin_family = AF_INET;
+        dst_.sin_port = htons((uint16_t)port);
+        dst_.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
+
+    void send_buf(const uint8_t *buf, size_t len)
+    {
+        if (fd_ < 0) return;
+        if (sendto(fd_, buf, len, 0, (struct sockaddr *)&dst_, sizeof(dst_)) < 0)
+            drop_count_ += 1;
+    }
+
+    // First loss in a quiet period is sent immediately; losses inside the
+    // 2 ms holdoff accumulate and flush from flush_loss() (called every
+    // poll-loop iteration) — a burst can never become a datagram storm.
+    void note_loss(uint32_t lost, uint32_t last_seq, uint32_t new_seq, uint64_t ts_ms)
+    {
+        if (fd_ < 0 || lost == 0) return;
+        if (pend_lost_ == 0 && ts_ms >= hold_until_ms_) {
+            uint8_t buf[TAP_LOSS_SIZE];
+            size_t n = tap_encode_loss(buf, sizeof(buf), take_seq(), ts_ms, lost, last_seq, new_seq);
+            send_buf(buf, n);
+            hold_until_ms_ = ts_ms + LOSS_HOLDOFF_MS;
+        } else {
+            if (pend_lost_ == 0) { pend_last_ = last_seq; }
+            pend_lost_ += lost;
+            pend_new_ = new_seq;
+        }
+    }
+
+    void flush_loss(uint64_t ts_ms)
+    {
+        if (fd_ < 0 || pend_lost_ == 0 || ts_ms < hold_until_ms_) return;
+        uint8_t buf[TAP_LOSS_SIZE];
+        size_t n = tap_encode_loss(buf, sizeof(buf), take_seq(), ts_ms, pend_lost_, pend_last_, pend_new_);
+        send_buf(buf, n);
+        pend_lost_ = 0;
+        hold_until_ms_ = ts_ms + LOSS_HOLDOFF_MS;
+    }
+
+    // ms until the held loss may flush; -1 = nothing held
+    int loss_deadline_ms(uint64_t ts_ms) const
+    {
+        if (fd_ < 0 || pend_lost_ == 0) return -1;
+        return hold_until_ms_ > ts_ms ? (int)(hold_until_ms_ - ts_ms) : 0;
+    }
+
+private:
+    int fd_ = -1;
+    struct sockaddr_in dst_;
+    uint16_t seq_ = 0;
+    uint32_t drop_count_ = 0;
+    uint64_t hold_until_ms_ = 0;
+    uint32_t pend_lost_ = 0;
+    uint32_t pend_last_ = 0;
+    uint32_t pend_new_ = 0;
+};

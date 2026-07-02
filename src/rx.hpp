@@ -34,6 +34,7 @@
 #include "wifibroadcast.hpp"
 #include "zfex.h"
 #include "fec_swfec.hpp"
+#include "dynlink_tap.hpp"
 
 // Forward declaration for isolated packet loss notification
 class PacketLossListener
@@ -66,6 +67,11 @@ public:
     // near the deadline rather than at the next stats window.
     virtual void swfec_poll(void) {}
     virtual int swfec_poll_timeout_ms(int max_ms) { return max_ms; }
+
+    // dynlink tap (-D). Default no-op; only Aggregator emits.
+    virtual void tap_init(int port) { (void)port; }
+    virtual void tap_poll(uint64_t cur_ts) { (void)cur_ts; }
+    virtual int tap_poll_timeout_ms(uint64_t cur_ts, int max_ms) { (void)cur_ts; return max_ms; }
 };
 
 
@@ -211,6 +217,10 @@ public:
     // Packet loss listener for immediate notifications
     void set_packet_loss_listener(PacketLossListener* listener) { packet_loss_listener_ = listener; }
 
+    virtual void tap_init(int port);
+    virtual void tap_poll(uint64_t cur_ts);
+    virtual int tap_poll_timeout_ms(uint64_t cur_ts, int max_ms);
+
     // Make stats public for android userspace receiver
     void clear_stats(void)
     {
@@ -293,6 +303,14 @@ private:
 
     // Packet loss listener for immediate notifications
     PacketLossListener* packet_loss_listener_ = nullptr;
+
+    // dynlink tap: parallel 10 ms accumulation, cleared on each tap flush.
+    // antenna_stat and the :8103 path stay byte-identical.
+    static const int TAP_INTERVAL_MS = 10;
+    TapEmitter tap_;
+    rx_antenna_stat_t tap_stat;
+    tap_counters_t tap_counters;
+    uint64_t tap_next_flush_ms = 0;
 };
 
 

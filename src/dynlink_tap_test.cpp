@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <string>
 #include <vector>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
 #include "dynlink_tap.hpp"
 
 static std::string hex(const uint8_t *b, size_t n)
@@ -44,6 +48,42 @@ int main(void)
     len = tap_encode_loss(buf, sizeof(buf), 259, 1719900000131ULL, 4, 118272, 118277);
     assert(len == TAP_LOSS_SIZE);
     assert(hex(buf, len) == "02010301834f0772900100000400000000ce010005ce0100");
+
+    // --- LOSS coalescing: N gaps inside the 2 ms holdoff -> 1 datagram ---
+    {
+        int rxfd = socket(AF_INET, SOCK_DGRAM, 0);
+        assert(rxfd >= 0);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = 0;
+        assert(bind(rxfd, (struct sockaddr *)&a, sizeof(a)) == 0);
+        socklen_t alen = sizeof(a);
+        assert(getsockname(rxfd, (struct sockaddr *)&a, &alen) == 0);
+
+        TapEmitter e;
+        e.init(ntohs(a.sin_port));
+        assert(e.enabled());
+        e.note_loss(1, 10, 12, 1000);   // immediate
+        e.note_loss(2, 13, 16, 1001);   // inside holdoff -> held
+        e.note_loss(3, 17, 21, 1001);   // accumulates
+        e.flush_loss(1001);             // holdoff not expired -> nothing
+        e.flush_loss(1002);             // expired -> one coalesced datagram
+
+        uint8_t pkt[64];
+        ssize_t n = recv(rxfd, pkt, sizeof(pkt), 0);
+        assert(n == (ssize_t)TAP_LOSS_SIZE && pkt[0] == TAP_TYPE_LOSS);
+        uint32_t lost1 = pkt[12] | pkt[13] << 8 | pkt[14] << 16 | (uint32_t)pkt[15] << 24;
+        assert(lost1 == 1);
+        n = recv(rxfd, pkt, sizeof(pkt), 0);
+        assert(n == (ssize_t)TAP_LOSS_SIZE);
+        uint32_t lost2 = pkt[12] | pkt[13] << 8 | pkt[14] << 16 | (uint32_t)pkt[15] << 24;
+        assert(lost2 == 5); // 2 + 3 coalesced
+        n = recv(rxfd, pkt, sizeof(pkt), MSG_DONTWAIT);
+        assert(n < 0); // exactly two datagrams, no storm
+        close(rxfd);
+    }
 
     printf("dynlink_tap_test OK\n");
     return 0;
