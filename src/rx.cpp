@@ -46,6 +46,7 @@ extern "C"
 
 #include <string>
 #include <memory>
+#include <algorithm>
 
 #include "wifibroadcast.hpp"
 #include "rx.hpp"
@@ -581,9 +582,13 @@ void Aggregator::swfec_flush_reorder_out(std::vector<swfec::SwfecReorder::Out> &
     {
         send_to_socket(ro_out[i].payload.data(), (uint16_t)ro_out[i].payload.size());
         count_p_outgoing += 1;
+        tap_counters.out += 1;
         count_b_outgoing += (uint32_t)ro_out[i].payload.size();
         if (ro_out[i].late)
+        {
             count_p_fec_recovered += 1;
+            tap_counters.fec_rec += 1;
+        }
     }
 }
 
@@ -604,6 +609,8 @@ void Aggregator::swfec_poll(void)
     uint32_t ro_skipped = 0;
     swfec_ro->poll(now_us, ro_out, ro_skipped);
     count_p_lost += ro_skipped;
+    tap_counters.lost += ro_skipped;
+    if (ro_skipped) tap_.note_loss(ro_skipped, 0, 0, get_time_ms()); // swfec: no seq context
     swfec_flush_reorder_out(ro_out);
 }
 
@@ -622,6 +629,71 @@ int Aggregator::swfec_poll_timeout_ms(int max_ms)
         return 0;
     uint64_t wait_ms = (due_us - now_us + 999) / 1000;   // round up to not wake early
     return wait_ms < (uint64_t)max_ms ? (int)wait_ms : max_ms;
+}
+
+void Aggregator::tap_init(int port)
+{
+    tap_.init(port);
+    tap_next_flush_ms = get_time_ms() + TAP_INTERVAL_MS;
+}
+
+void Aggregator::tap_poll(uint64_t cur_ts)
+{
+    if (!tap_.enabled()) return;
+    tap_.flush_loss(cur_ts);
+    if (cur_ts < tap_next_flush_ms) return;
+
+    std::vector<tap_bucket_t> buckets;
+    buckets.reserve(tap_stat.size());
+    for (auto it = tap_stat.begin(); it != tap_stat.end(); it++) {
+        const rxAntennaKey &k = it->first;
+        const rxAntennaItem &v = it->second;
+        if (v.count_all <= 0) continue;
+        tap_bucket_t b;
+        b.freq = k.freq;
+        b.mcs = k.mcs_index;
+        b.bw = k.bandwidth;
+        b.ant_id = k.antenna_id;
+        b.pkt_recv = (uint32_t)v.count_all;
+        b.rssi_min = v.rssi_min;
+        b.rssi_avg = (int8_t)(v.rssi_sum / v.count_all);
+        b.rssi_max = v.rssi_max;
+        b.snr_min = v.snr_min;
+        b.snr_avg = (int8_t)(v.snr_sum / v.count_all);
+        b.snr_max = v.snr_max;
+        if (v.evm_count > 0) {
+            b.evm_min = v.evm_min;
+            b.evm_avg = (int16_t)(v.evm_sum / v.evm_count);
+            b.evm_max = v.evm_max;
+        } else {
+            b.evm_min = b.evm_avg = b.evm_max = -1;
+        }
+        buckets.push_back(b);
+    }
+    // unordered_map order is nondeterministic — sort for a stable wire
+    std::sort(buckets.begin(), buckets.end(),
+              [](const tap_bucket_t &a, const tap_bucket_t &b) {
+                  if (a.freq != b.freq) return a.freq < b.freq;
+                  if (a.mcs != b.mcs) return a.mcs < b.mcs;
+                  if (a.bw != b.bw) return a.bw < b.bw;
+                  return a.ant_id < b.ant_id;
+              });
+
+    uint8_t buf[TAP_MICRO_HDR_SIZE + TAP_MAX_BUCKETS * TAP_MICRO_BUCKET_SIZE];
+    size_t len = tap_encode_micro(buf, sizeof(buf), tap_.take_seq(), cur_ts, tap_counters, buckets);
+    if (len) tap_.send_buf(buf, len); // emitted even when empty: heartbeat
+    tap_stat.clear();
+    tap_counters.clear();
+    tap_next_flush_ms = cur_ts + TAP_INTERVAL_MS - ((cur_ts - tap_next_flush_ms) % TAP_INTERVAL_MS);
+}
+
+int Aggregator::tap_poll_timeout_ms(uint64_t cur_ts, int max_ms)
+{
+    if (!tap_.enabled()) return max_ms;
+    int t = tap_next_flush_ms > cur_ts ? (int)(tap_next_flush_ms - cur_ts) : 0;
+    int ld = tap_.loss_deadline_ms(cur_ts);
+    if (ld >= 0 && ld < t) t = ld;
+    return t < max_ms ? t : max_ms;
 }
 
 void Aggregator::dump_stats(void)
@@ -708,6 +780,8 @@ void Aggregator::log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const u
         key.antenna_id |= ((uint64_t)wlan_idx << 8 | (uint64_t)ant[i]);
 
         antenna_stat[key].log_rssi(rssi[i], noise[i], (evm[i] != 0xff) ? evm[i] : frame_evm);
+        if (tap_.enabled())
+            tap_stat[key].log_rssi(rssi[i], noise[i], (evm[i] != 0xff) ? evm[i] : frame_evm);
     }
 }
 
@@ -744,6 +818,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     //size_t new_session_tags_size = 0;
 
     count_p_all += 1;
+    tap_counters.all += 1;
     count_b_all += size;
 
     if(size == 0) return;
@@ -1049,6 +1124,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     }
 
     count_p_data += 1;
+    tap_counters.data += 1;
     log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, evm, freq, mcs_index, bandwidth);
 
     // --- swfec fast path: feed raw wire packet to sliding-window decoder ---
@@ -1077,6 +1153,8 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                            out[i].payload.size(), now_us, ro_out, ro_skipped);
         }
         count_p_lost += ro_skipped;
+        tap_counters.lost += ro_skipped;
+        if (ro_skipped) tap_.note_loss(ro_skipped, 0, 0, get_time_ms()); // swfec: no seq context
         swfec_flush_reorder_out(ro_out);
         return;   // RS ring logic is not applicable for swfec
     }
@@ -1190,6 +1268,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 if(fec_count)
                 {
                     count_p_fec_recovered += fec_count;
+                    tap_counters.fec_rec += fec_count;
                     WFB_DBG("FEC recovered %u packets\n", fec_count);
                 }
                 break;
@@ -1222,6 +1301,8 @@ void Aggregator::send_packet(int ring_idx, int fragment_idx)
         uint32_t lost_count = packet_seq - seq - 1;
         ANDROID_IPC_MSG("PKT_LOST\t%d", lost_count);
         count_p_lost += lost_count;
+        tap_counters.lost += lost_count;
+        tap_.note_loss(lost_count, seq, packet_seq, get_time_ms());
 
         // Immediate packet loss notification
         if (packet_loss_listener_ != NULL)
@@ -1241,6 +1322,7 @@ void Aggregator::send_packet(int ring_idx, int fragment_idx)
     {
         send_to_socket(payload, packet_size);
         count_p_outgoing += 1;
+        tap_counters.out += 1;
         count_b_outgoing += packet_size;
     }
 }
@@ -1377,6 +1459,7 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
         int poll_timeout = log_send_ts > cur_ts ? log_send_ts - cur_ts : 0;
         // Wake early enough to drain a held swfec gap at its deadline.
         poll_timeout = agg->swfec_poll_timeout_ms(poll_timeout);
+        poll_timeout = agg->tap_poll_timeout_ms(cur_ts, poll_timeout);
         int rc = poll(fds, nfds, poll_timeout);
 
         if (rc < 0){
@@ -1393,6 +1476,7 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
 
         // Release swfec packets held behind a gap whose deadline has passed.
         agg->swfec_poll();
+        agg->tap_poll(get_time_ms());
 
         if (rc == 0) continue; // timeout expired
 
@@ -1429,6 +1513,7 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
         int poll_timeout = log_send_ts > cur_ts ? log_send_ts - cur_ts : 0;
         // Wake early enough to drain a held swfec gap at its deadline.
         poll_timeout = agg->swfec_poll_timeout_ms(poll_timeout);
+        poll_timeout = agg->tap_poll_timeout_ms(cur_ts, poll_timeout);
         int rc = poll(fds, 1, poll_timeout);
 
         if (rc < 0){
@@ -1445,6 +1530,7 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
 
         // Release swfec packets held behind a gap whose deadline has passed.
         agg->swfec_poll();
+        agg->tap_poll(get_time_ms());
 
         if (rc == 0) continue; // timeout expired
 
@@ -1502,6 +1588,7 @@ int main(int argc, char* const *argv)
     uint32_t link_id = 0;
     uint64_t epoch = 0;
     int log_interval = 1000;
+    int dynlink_tap_port = 0;
     int client_port = 5600;
     int srv_port = 0;
     string client_addr = "127.0.0.1";
@@ -1512,7 +1599,7 @@ int main(int argc, char* const *argv)
     string keypair = "";
     string unix_socket = "";
 
-    while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:")) != -1) {
+    while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:D:")) != -1) {
         switch (opt) {
         case 'K':
             keypair = optarg;
@@ -1551,10 +1638,13 @@ int main(int argc, char* const *argv)
         case 'e':
             epoch = atoll(optarg);
             break;
+        case 'D':
+            dynlink_tap_port = atoi(optarg);
+            break;
         default: /* '?' */
         show_usage:
             WFB_INFO("Local RX: %s [-K rx_key] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-p radio_port]\n"
-                     "             [-R rcv_buf] [-s snd_buf] [-l log_interval] [-e epoch] [-i link_id] interface1 [interface2] ...\n", argv[0]);
+                     "             [-R rcv_buf] [-s snd_buf] [-l log_interval] [-e epoch] [-i link_id] [-D dynlink_tap_port] interface1 [interface2] ...\n", argv[0]);
             WFB_INFO("RX forwarder: %s -f [-c client_addr] [-u client_port] [-p radio_port]  [-R rcv_buf] [-s snd_buf]\n"
                      "                    [-i link_id] interface1 [interface2] ...\n", argv[0]);
             WFB_INFO("RX aggregator: %s -a server_port [-K rx_key] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-R rcv_buf]\n"
@@ -1627,6 +1717,11 @@ int main(int argc, char* const *argv)
 
         default:
             throw runtime_error(string_format("Unknown rx_mode=%d", rx_mode));
+        }
+
+        if (dynlink_tap_port > 0)
+        {
+            agg->tap_init(dynlink_tap_port);
         }
 
         if(rx_mode == AGGREGATOR)
