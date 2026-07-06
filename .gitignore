@@ -11,9 +11,12 @@ wfb_rx
 wfb_tx
 wfb_tx_cmd
 wfb_tun
+fec_swfec_test
+test_vectors/
 gs.key
 drone.key
 wfb_keygen
 wfb_ng/conf/site.cfg
 wfb_ng/conf/local.cfg
 .vscode/
+docs/superpowers/

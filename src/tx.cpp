@@ -48,37 +48,45 @@ using namespace std;
 #include "wifibroadcast.hpp"
 #include "tx.hpp"
 
-Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
+Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags, bool use_swfec_mode) : \
     fec_p(NULL), fec_k(-1), fec_n(-1),
     block_idx(0), fragment_idx(0),
     max_packet_size(0),
     epoch(epoch),
     channel_id(channel_id),
     fec_delay(fec_delay),
+    encrypted(!keypair.empty()),
     tx_secretkey{},
     rx_publickey{},
     session_key{},
     session_packet{},
     session_packet_size(0),
-    tags(tags)
+    tags(tags),
+    use_swfec(use_swfec_mode),
+    swfec_enc(NULL),
+    swfec_nonce(0),
+    swfec_oversize(0)
 {
 
-    FILE *fp;
-    if ((fp = fopen(keypair.c_str(), "r")) == NULL)
+    if (encrypted)
     {
-        throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
-    }
-    if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
-    {
+        FILE *fp;
+        if ((fp = fopen(keypair.c_str(), "r")) == NULL)
+        {
+            throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
+        }
+        if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
+        }
+        if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
+        }
         fclose(fp);
-        throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
     }
-    if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
-    {
-        fclose(fp);
-        throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
-    }
-    fclose(fp);
 
     init_session(k, n);
 }
@@ -89,6 +97,8 @@ Transmitter::~Transmitter()
     {
         deinit_session();
     }
+    delete swfec_enc;
+    swfec_enc = NULL;
 }
 
 
@@ -110,8 +120,99 @@ void Transmitter::deinit_session(void)
     fec_n = -1;
 }
 
-void Transmitter::init_session(int k, int n)
+void Transmitter::rebuild_session_packet(void)
 {
+    // fill packet header (new random nonce each call)
+    wsession_hdr_t *session_hdr = (wsession_hdr_t *)session_packet;
+    session_hdr->packet_type = encrypted ? WFB_PACKET_SESSION : WFB_PACKET_SESSION_PLAIN;
+
+    randombytes_buf(session_hdr->session_nonce, sizeof(session_hdr->session_nonce));
+
+    // fill packet contents
+    uint8_t tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
+
+    // Fill fixed headers
+    {
+        wsession_data_t* session_data = (wsession_data_t*)tmp;
+        assert(sizeof(*session_data) <= sizeof(tmp));
+
+        session_data->epoch = htobe64(epoch);
+        session_data->channel_id = htobe32(channel_id);
+        session_data->fec_type = use_swfec ? WFB_FEC_SWFEC : WFB_FEC_VDM_RS;
+        session_data->k = (uint8_t)fec_k;
+        session_data->n = (uint8_t)fec_n;
+
+        assert(sizeof(session_data->session_key) == sizeof(session_key));
+        // session_key is a fresh random value per init_session() (startup /
+        // restart / reconfigure), generated even in plaintext. Encrypted: it is
+        // the AEAD key. Plaintext: it rides the wire purely as an opaque session
+        // ID, so the RX detects a TX restart (new random ID) exactly as the
+        // encrypted path detects a session-key change. No secret is exposed.
+        memcpy(session_data->session_key, session_key, sizeof(session_key));
+    }
+
+    // Fill optional Tags
+    uint32_t session_data_size = sizeof(wsession_data_t);
+    for(auto it = tags.begin(); it != tags.end(); it++)
+    {
+        tlv_hdr_t* tlv = (tlv_hdr_t*)((uint8_t*)tmp + session_data_size);
+        session_data_size += sizeof(tlv_hdr_t) + it->value.size();
+        assert(session_data_size <= sizeof(tmp));
+
+        tlv->id = it->id;
+        tlv->len = it->value.size();
+        memcpy(tlv->value, &it->value[0], it->value.size());
+    }
+
+    if (encrypted)
+    {
+        if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
+                            (uint8_t*)tmp, session_data_size,
+                            session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
+        {
+            throw runtime_error("Unable to make session key!");
+        }
+        session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
+    }
+    else
+    {
+        memcpy(session_packet + sizeof(wsession_hdr_t), tmp, session_data_size);
+        session_packet_size = sizeof(wsession_hdr_t) + session_data_size;
+    }
+
+    assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
+}
+
+// preserve_seq: keep block_idx running monotonically across this (re)init instead
+// of restarting it at 0. Used by a live RS reconfigure (CMD_SET_FEC): the new
+// session mints a fresh session_key, but the data sequence must stay monotonic so
+// that a plaintext RX cannot mistake an in-flight old-session straggler (which is
+// unauthenticated and carries no session binding) for new data. If block_idx
+// restarted at 0, such a straggler — arriving after the RX reset its decoder
+// (last_known_block = -1) under WiFi reordering / multi-card diversity — would
+// poison last_known_block to a high value and stall every subsequent low-index
+// block as "already processed" until the next session change. Keeping block_idx
+// monotonic makes new data strictly greater than any straggler, so the RX's
+// existing ordering logic rejects the straggler and accepts the new stream. This
+// mirrors swfec, whose param change (swfec_set_params) never resets its nonce.
+void Transmitter::init_session(int k, int n, bool preserve_seq)
+{
+    if (use_swfec)
+    {
+        // k = overhead_pct (0..255), n = deadline_ms (1..255)
+        delete swfec_enc;
+        swfec_enc = new swfec::SwfecEncoder(k / 100.0f, (uint64_t)n * 1000);
+        swfec_nonce = 0;
+        fec_k = k;   // kept for session announce + CMD_GET_FEC
+        fec_n = n;
+
+        // init session key
+        randombytes_buf(session_key, sizeof(session_key));
+
+        rebuild_session_packet();
+        return;
+    }
+
     if (fec_p != NULL)
     {
         deinit_session();
@@ -136,67 +237,22 @@ void Transmitter::init_session(int k, int n)
         assert(_rc == 0);
     }
 
-    block_idx = 0;
-    fragment_idx = 0;
+    if (!preserve_seq)
+        block_idx = 0;     // fresh stream (startup / restart / overflow rekey)
+    fragment_idx = 0;      // a (re)init always begins a fresh FEC block
 
     // init session key
     randombytes_buf(session_key, sizeof(session_key));
 
-    // fill packet header
-    wsession_hdr_t *session_hdr = (wsession_hdr_t *)session_packet;
-    session_hdr->packet_type = WFB_PACKET_SESSION;
-
-    randombytes_buf(session_hdr->session_nonce, sizeof(session_hdr->session_nonce));
-
-    // fill packet contents
-
-    uint8_t tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
-
-    // Fill fixed headers
-    {
-        wsession_data_t* session_data = (wsession_data_t*)tmp;
-        assert(sizeof(*session_data) <= sizeof(tmp));
-
-        session_data->epoch = htobe64(epoch);
-        session_data->channel_id = htobe32(channel_id);
-        session_data->fec_type = WFB_FEC_VDM_RS;
-        session_data->k = (uint8_t)fec_k;
-        session_data->n = (uint8_t)fec_n;
-
-        assert(sizeof(session_data->session_key) == sizeof(session_key));
-        memcpy(session_data->session_key, session_key, sizeof(session_key));
-    }
-
-    // Fill optional Tags
-
-    uint32_t session_data_size = sizeof(wsession_data_t);
-    for(auto it = tags.begin(); it != tags.end(); it++)
-    {
-        tlv_hdr_t* tlv = (tlv_hdr_t*)((uint8_t*)tmp + session_data_size);
-        session_data_size += sizeof(tlv_hdr_t) + it->value.size();
-        assert(session_data_size <= sizeof(tmp));
-
-        tlv->id = it->id;
-        tlv->len = it->value.size();
-        memcpy(tlv->value, &it->value[0], it->value.size());
-    }
-
-    if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
-                        (uint8_t*)tmp, session_data_size,
-                        session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
-    {
-        throw runtime_error("Unable to make session key!");
-    }
-
-    session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
-    assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
+    rebuild_session_packet();
 }
 
 
 RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay,
                                            vector<tags_item_t> &tags, const vector<string> &wlans, radiotap_header_t &radiotap_header,
-                                           uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay) : \
-    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags),
+                                           uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay,
+                                           bool use_swfec_mode) : \
+    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags, use_swfec_mode),
     channel_id(channel_id),
     current_output(0),
     ieee80211_seq(0),
@@ -457,8 +513,9 @@ RawSocketTransmitter::~RawSocketTransmitter()
 
 RemoteTransmitter::RemoteTransmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay,
                                      vector<tags_item_t> &tags, const vector<pair<string, vector<uint16_t>>> &remote_hosts, radiotap_header_t &radiotap_header,
-                                     uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size) : \
-    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags),
+                                     uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size,
+                                     bool use_swfec_mode) : \
+    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags, use_swfec_mode),
     channel_id(channel_id),
     current_output(0),
     ieee80211_seq(0),
@@ -627,19 +684,121 @@ void Transmitter::send_block_fragment(size_t packet_size)
 
     assert(packet_size <= MAX_FEC_PAYLOAD);
 
-    block_hdr->packet_type = WFB_PACKET_DATA;
+    block_hdr->packet_type = encrypted ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
     block_hdr->data_nonce = htobe64(((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx);
 
-    // encrypted payload
-    if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
-                                             block[fragment_idx], packet_size,
-                                             (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
-                                             NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+    if (encrypted)
     {
-        throw runtime_error("Unable to encrypt packet!");
+        if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
+                                                 block[fragment_idx], packet_size,
+                                                 (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
+                                                 NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+        {
+            throw runtime_error("Unable to encrypt packet!");
+        }
+    }
+    else
+    {
+        memcpy(ciphertext + sizeof(wblock_hdr_t), block[fragment_idx], packet_size);
+        ciphertext_len = packet_size;
     }
 
     inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
+}
+
+bool Transmitter::swfec_send(const uint8_t *buf, size_t size, uint8_t flags)
+{
+    std::vector<std::vector<uint8_t> > pkts;
+    if (flags & WFB_PACKET_FEC_ONLY)
+    {
+        swfec_enc->poll(swfec::monotonic_us(), pkts);
+    }
+    else
+    {
+        if (size > SWFEC_MAX_INPUT)
+        {
+            swfec_oversize += 1;
+            if (swfec_oversize == 1)
+                WFB_ERR("swfec: packet too large (%zu > %zu), dropping\n", size, (size_t)SWFEC_MAX_INPUT);
+            return false;
+        }
+        swfec_enc->push_source(buf, size, swfec::monotonic_us(), pkts);
+    }
+    for (size_t i = 0; i < pkts.size(); i++)
+        send_swfec_wire(pkts[i].data(), pkts[i].size());
+    return !pkts.empty();
+}
+
+void Transmitter::send_swfec_wire(const uint8_t *data, size_t size)
+{
+    uint8_t ciphertext[MAX_FORWARDER_PACKET_SIZE];
+    wblock_hdr_t *block_hdr = (wblock_hdr_t*)ciphertext;
+    long long unsigned int ciphertext_len = 0;
+
+    assert(size <= MAX_FEC_PAYLOAD);
+    block_hdr->packet_type = encrypted ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
+    block_hdr->data_nonce = htobe64(swfec_nonce);
+    swfec_nonce += 1;
+
+    if (encrypted)
+    {
+        // mirror send_block_fragment's exact AEAD call shape
+        if (crypto_aead_chacha20poly1305_encrypt(
+                ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
+                data, size,
+                (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
+                NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+        {
+            throw runtime_error("Unable to encrypt swfec packet!");
+        }
+    }
+    else
+    {
+        memcpy(ciphertext + sizeof(wblock_hdr_t), data, size);
+        ciphertext_len = size;
+    }
+
+    inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
+
+    if (swfec_nonce > MAX_BLOCK_IDX)   // never in practice; keeps rekey hygiene
+    {
+        init_session(fec_k, fec_n);
+        send_session_key();
+    }
+}
+
+// On a live swfec param change, re-announce the session packet a few times so a
+// single lost announce doesn't strand the RX on the old value until the next
+// ~1 Hz periodic broadcast. Mirrors the RS reconfigure path's session-key flood.
+static const int SWFEC_REANNOUNCE_BURST = 5;
+
+void Transmitter::swfec_set_params(int overhead_pct, int deadline_ms)
+{
+    assert(use_swfec && swfec_enc != NULL);
+    bool changed = false;
+    if (overhead_pct != fec_k)
+    {
+        swfec_enc->set_overhead(overhead_pct / 100.0f);
+        fec_k = overhead_pct;   // overhead_pct rides the session 'k' slot
+        changed = true;
+    }
+    if (deadline_ms != fec_n)
+    {
+        swfec_enc->set_deadline_us((uint64_t)deadline_ms * 1000);
+        fec_n = deadline_ms;    // deadline_ms rides the session 'n' slot
+        changed = true;
+    }
+    if (changed)
+    {
+        // Rebuild and re-announce immediately. A deadline change must reach the RX
+        // promptly (the encoder already encodes with the new deadline); an
+        // overhead change keeps the RX-/telemetry-reported overhead_pct current
+        // (the RX never reads session 'k' for delivery, so this is cosmetic but
+        // correct). The burst gives the announce the same redundancy as RS.
+        rebuild_session_packet();
+        for (int i = 0; i < SWFEC_REANNOUNCE_BURST; i++)
+            send_session_key();
+    }
 }
 
 void Transmitter::send_session_key(void)
@@ -650,6 +809,9 @@ void Transmitter::send_session_key(void)
 
 bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
 {
+    if (use_swfec)
+        return swfec_send(buf, size, flags);
+
     assert(size <= MAX_PAYLOAD_SIZE);
 
     // FEC-only packets are only for closing already opened blocks
@@ -859,30 +1021,52 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         continue;
                     }
 
-                    int fec_k = req.u.cmd_set_fec.k;
-                    int fec_n = req.u.cmd_set_fec.n;
+                    int req_k = req.u.cmd_set_fec.k;
+                    int req_n = req.u.cmd_set_fec.n;
 
-                    if(!(fec_k <= fec_n && fec_k >=1 && fec_n >= 1 && fec_n < 256))
+                    if (t->is_swfec())
                     {
-                        resp.rc = htonl(EINVAL);
+                        // swfec: k=overhead_pct (0..255), n=deadline_ms (1..255)
+                        if (req_n < 1)
+                        {
+                            resp.rc = htonl(EINVAL);
+                            sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                            WFB_ERR("Rejecting new swfec settings: deadline_ms must be >= 1\n");
+                            continue;
+                        }
+
+                        t->swfec_set_params(req_k, req_n);
                         sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                        WFB_ERR("Rejecting new FEC settings");
-                        continue;
+                        WFB_INFO("swfec params updated: overhead_pct=%d deadline_ms=%d\n", req_k, req_n);
                     }
-
-                    // Close open FEC block if any
-                    while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
-
-                    t->init_session(fec_k, fec_n);
-
-                    // Emulate FEC for initial session key distribution
-                    for(int i = 0; i < fec_n - fec_k + 1; i++)
+                    else
                     {
-                        t->send_session_key();
-                    }
+                        // RS mode: validate k<=n constraints
+                        if(!(req_k <= req_n && req_k >=1 && req_n >= 1 && req_n < 256))
+                        {
+                            resp.rc = htonl(EINVAL);
+                            sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                            WFB_ERR("Rejecting new FEC settings");
+                            continue;
+                        }
 
-                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    WFB_INFO("Session restarted with FEC %d/%d\n", fec_k, fec_n);
+                        // Close open FEC block if any
+                        while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
+
+                        // Live reconfigure: keep block_idx monotonic so a plaintext
+                        // RX cannot mistake an old-session straggler for new data
+                        // (see init_session comment re: last_known_block poisoning).
+                        t->init_session(req_k, req_n, true);
+
+                        // Emulate FEC for initial session key distribution
+                        for(int i = 0; i < req_n - req_k + 1; i++)
+                        {
+                            t->send_session_key();
+                        }
+
+                        sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
+                        WFB_INFO("Session restarted with FEC %d/%d\n", req_k, req_n);
+                    }
                 }
                 break;
 
@@ -1428,7 +1612,7 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                     int udp_port, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                     uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                     radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                    int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
+                    int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay, bool use_swfec)
 {
     vector<int> rx_fd;
     vector<string> wlans;
@@ -1468,13 +1652,13 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
     {
         WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
         t = unique_ptr<UdpTransmitter>(new UdpTransmitter(k, n, keypair, "127.0.0.1", debug_port, epoch, channel_id,
-                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size));
+                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size, use_swfec));
     }
     else
     {
         t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
                                                                       wlans, radiotap_header, frame_type, use_qdisc, fwmark,
-                                                                      inject_retries, inject_retry_delay));
+                                                                      inject_retries, inject_retry_delay, use_swfec));
     }
 
     int control_fd = open_control_fd(control_port);
@@ -1485,7 +1669,7 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
                      const char *unix_socket, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                      uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                      radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
+                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay, bool use_swfec)
 {
     vector<int> rx_fd;
     vector<string> wlans;
@@ -1512,13 +1696,13 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
     {
         WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
         t = unique_ptr<UdpTransmitter>(new UdpTransmitter(k, n, keypair, "127.0.0.1", debug_port, epoch, channel_id,
-                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size));
+                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size, use_swfec));
     }
     else
     {
         t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
                                                                       wlans, radiotap_header, frame_type, use_qdisc, fwmark,
-                                                                      inject_retries, inject_retry_delay));
+                                                                      inject_retries, inject_retry_delay, use_swfec));
     }
 
     int control_fd = open_control_fd(control_port);
@@ -1530,7 +1714,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
                       int udp_port, int k, int n, const string &keypair, int fec_timeout,
                       uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                       radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                      int snd_buf_size)
+                      int snd_buf_size, bool use_swfec)
 {
     vector<int> rx_fd;
     vector<pair<string, vector<uint16_t>>> remote_hosts;
@@ -1595,7 +1779,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
     vector<tags_item_t> tags;
     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
-                                                                                    fwmark, snd_buf_size));
+                                                                                    fwmark, snd_buf_size, use_swfec));
 
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
@@ -1606,7 +1790,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
                            const char* unix_socket, int k, int n, const string &keypair, int fec_timeout,
                            uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                            radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
-                           int snd_buf_size)
+                           int snd_buf_size, bool use_swfec)
 {
     vector<int> rx_fd;
     vector<pair<string, vector<uint16_t>>> remote_hosts;
@@ -1657,7 +1841,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
     vector<tags_item_t> tags;
     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
-                                                                                    fwmark, snd_buf_size));
+                                                                                    fwmark, snd_buf_size, use_swfec));
 
     int control_fd = open_control_fd(control_port);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
@@ -1688,7 +1872,8 @@ int main(int argc, char * const *argv)
     int snd_buf = 0;
     bool mirror = false;
     bool vht_mode = false;
-    string keypair = "tx.key";
+    bool use_swfec = false;
+    string keypair = "";
     uint8_t frame_type = FRAME_TYPE_DATA;
     bool use_qdisc = false;
     uint32_t fwmark = 0;
@@ -1697,7 +1882,7 @@ int main(int argc, char * const *argv)
     uint32_t inject_retries = 0;
     uint32_t inject_retry_delay = 5000; // 5ms
 
-    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
+    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:z")) != -1) {
         switch (opt) {
         case 'I':
             tx_mode = INJECTOR;
@@ -1709,12 +1894,30 @@ int main(int argc, char * const *argv)
         case 'K':
             keypair = optarg;
             break;
-        case 'k':
-            k = atoi(optarg);
+        case 'k': {
+            // k rides a uint8 wire byte (FEC k, or swfec overhead_pct). Validate
+            // the full value before it truncates into the uint8_t, so an
+            // out-of-range -k is rejected rather than silently wrapped.
+            int v = atoi(optarg);
+            if (v < 0 || v > 255) {
+                WFB_ERR("-k must be in 0..255 (FEC k / swfec overhead_pct)\n");
+                goto show_usage;
+            }
+            k = (uint8_t)v;
             break;
-        case 'n':
-            n = atoi(optarg);
+        }
+        case 'n': {
+            // n rides a uint8 wire byte (FEC n, or swfec deadline_ms). Validate the
+            // full value before it truncates into the uint8_t: otherwise e.g.
+            // -n 300 silently becomes 44 ms (300 & 0xff) instead of being rejected.
+            int v = atoi(optarg);
+            if (v < 0 || v > 255) {
+                WFB_ERR("-n must be in 0..255 (FEC n / swfec deadline_ms)\n");
+                goto show_usage;
+            }
+            n = (uint8_t)v;
             break;
+        }
         case 'u':
             udp_port = atoi(optarg);
             break;
@@ -1814,21 +2017,26 @@ int main(int argc, char * const *argv)
             inject_retry_delay = atoi(optarg);
             break;
 
+        case 'z':
+            use_swfec = true;
+            break;
+
         default: /* '?' */
         show_usage:
-            WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
+            WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] [-z] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
                      "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                      "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
-                     "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n",
+                     "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n"
+                     "             -z: use swfec (sliding-window FEC); -k=overhead_pct (0..255), -n=deadline_ms (1..255)\n",
                     argv[0]);
-            WFB_INFO("TX distributor: %s -d [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-s snd_buf] [-p radio_port]\n"
+            WFB_INFO("TX distributor: %s -d [-K tx_key] [-k RS_K] [-n RS_N] [-z] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-s snd_buf] [-p radio_port]\n"
                      "                      [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                      "                      [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
                      "                      [-P fwmark] [-C control_port] host1:port1,port2,... [host2:port1,port2,...] ...\n",
                     argv[0]);
             WFB_INFO("TX injector: %s -I port [-Q] [-R rcv_buf] [-l log_interval] interface1 [interface2] ...\n",
                     argv[0]);
-            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u\n",
+            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u, use_swfec=false\n",
                      keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay);
             WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
             WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
@@ -1839,6 +2047,27 @@ int main(int argc, char * const *argv)
 
     if (optind >= argc) {
         goto show_usage;
+    }
+
+    if (tx_mode != INJECTOR && keypair.empty()) {
+        WFB_ERR("WARNING: no -K given — running UNENCRYPTED on radio_port %d\n", radio_port);
+    }
+
+    // swfec-mode validation and defaults
+    if (use_swfec)
+    {
+        // k=overhead_pct: 0..255 (any uint8 value is valid)
+        // n=deadline_ms: must be >= 1
+        if (n < 1)
+        {
+            WFB_ERR("swfec: deadline_ms (-n) must be >= 1\n");
+            goto show_usage;
+        }
+        // Ensure flush timer is active (swfec needs the 2ms tick; RS default 0 stays)
+        if (fec_timeout == 0)
+        {
+            fec_timeout = 2;
+        }
     }
 
     {
@@ -1880,7 +2109,7 @@ int main(int argc, char * const *argv)
                                 unix_socket, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
-                                snd_buf, inject_retries, inject_retry_delay);
+                                snd_buf, inject_retries, inject_retry_delay, use_swfec);
             }
             else
             {
@@ -1888,7 +2117,7 @@ int main(int argc, char * const *argv)
                                udp_port, debug_port, k, n, keypair, fec_timeout,
                                epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                radiotap_header, frame_type, control_port, mirror,
-                               snd_buf, inject_retries, inject_retry_delay);
+                               snd_buf, inject_retries, inject_retry_delay, use_swfec);
             }
             break;
 
@@ -1899,7 +2128,7 @@ int main(int argc, char * const *argv)
                                       unix_socket, k, n, keypair, fec_timeout,
                                       epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                       radiotap_header, frame_type, control_port, mirror,
-                                      snd_buf);
+                                      snd_buf, use_swfec);
             }
             else
             {
@@ -1907,7 +2136,7 @@ int main(int argc, char * const *argv)
                                  udp_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
-                                 snd_buf);
+                                 snd_buf, use_swfec);
             }
             break;
 

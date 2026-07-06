@@ -33,6 +33,8 @@
 
 #include "wifibroadcast.hpp"
 #include "zfex.h"
+#include "fec_swfec.hpp"
+#include "dynlink_tap.hpp"
 
 // Forward declaration for isolated packet loss notification
 class PacketLossListener
@@ -53,10 +55,23 @@ class BaseAggregator
 public:
     virtual ~BaseAggregator(){}
     virtual void process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
-                                const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
+                                const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth, sockaddr_in *sockaddr) = 0;
 
     virtual void dump_stats(void) = 0;
+
+    // swfec quiet-gap upkeep. Default no-op; only Aggregator drives a decoder.
+    // swfec_poll() releases reorder-buffer packets held behind a gap once their
+    // deadline passes (the loss-free path is driven by packet arrival instead).
+    // swfec_poll_timeout_ms() bounds the caller's poll() wait so the drain fires
+    // near the deadline rather than at the next stats window.
+    virtual void swfec_poll(void) {}
+    virtual int swfec_poll_timeout_ms(int max_ms) { return max_ms; }
+
+    // dynlink tap (-D). Default no-op; only Aggregator emits.
+    virtual void tap_init(int port) { (void)port; }
+    virtual void tap_poll(uint64_t cur_ts) { (void)cur_ts; }
+    virtual int tap_poll_timeout_ms(uint64_t cur_ts, int max_ms) { (void)cur_ts; return max_ms; }
 };
 
 
@@ -66,7 +81,7 @@ public:
     Forwarder(const std::string &client_addr, int client_port, int snd_buf_size);
     virtual ~Forwarder();
     virtual void process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
-                                const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
+                                const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth,sockaddr_in *sockaddr);
     virtual void dump_stats(void) {}
 private:
@@ -96,9 +111,10 @@ class rxAntennaItem
 public:
     rxAntennaItem(void) : count_all(0),
                           rssi_sum(0), rssi_min(0), rssi_max(0),
-                          snr_sum(0), snr_min(0), snr_max(0) {}
+                          snr_sum(0), snr_min(0), snr_max(0),
+                          evm_sum(0), evm_min(0), evm_max(0), evm_count(0) {}
 
-    void log_rssi(int8_t rssi, int8_t noise){
+    void log_rssi(int8_t rssi, int8_t noise, uint8_t evm){
         int8_t snr = (noise != SCHAR_MAX) ? rssi - noise : 0;
 
         if(count_all == 0){
@@ -115,6 +131,22 @@ public:
         rssi_sum += rssi;
         snr_sum += snr;
         count_all += 1;
+
+        // EVM% carried in radiotap lock_quality (0..100, higher is better).
+        // evm == 0xff means the field was absent on this frame; evm == 0 means
+        // the hardware could not measure it (rxevm sentinel). Skip both so the
+        // average reflects only real samples (counted separately by evm_count).
+        if (evm > 0 && evm <= 100) {
+            if (evm_count == 0) {
+                evm_min = evm;
+                evm_max = evm;
+            } else {
+                evm_min = std::min(evm, evm_min);
+                evm_max = std::max(evm, evm_max);
+            }
+            evm_sum += evm;
+            evm_count += 1;
+        }
     }
 
     int32_t count_all;
@@ -124,6 +156,10 @@ public:
     int32_t snr_sum;
     int8_t snr_min;
     int8_t snr_max;
+    int32_t evm_sum;
+    uint8_t evm_min;
+    uint8_t evm_max;
+    int32_t evm_count;
 };
 
 struct rxAntennaKey
@@ -172,12 +208,18 @@ public:
     Aggregator(const std::string &keypair, uint64_t epoch, uint32_t channel_id);
     virtual ~Aggregator();
     virtual void process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
-                                const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
+                                const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth, sockaddr_in *sockaddr);
     virtual void dump_stats(void);
+    virtual void swfec_poll(void);
+    virtual int swfec_poll_timeout_ms(int max_ms);
 
     // Packet loss listener for immediate notifications
     void set_packet_loss_listener(PacketLossListener* listener) { packet_loss_listener_ = listener; }
+
+    virtual void tap_init(int port);
+    virtual void tap_poll(uint64_t cur_ts);
+    virtual int tap_poll_timeout_ms(uint64_t cur_ts, int max_ms);
 
     // Make stats public for android userspace receiver
     void clear_stats(void)
@@ -219,11 +261,14 @@ private:
     Aggregator& operator=(const Aggregator&);
 
     void init_fec(int k, int n);
+    void setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch);
+    void swfec_set_deadline(uint8_t n); // param-only swfec deadline update (shared encrypted + plaintext)
     void deinit_fec(void);
+    void swfec_flush_reorder_out(std::vector<swfec::SwfecReorder::Out> &ro_out);
     void send_packet(int ring_idx, int fragment_idx);
     void apply_fec(int ring_idx);
     void log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi,
-                  const int8_t *noise, uint16_t freq, uint8_t mcs_index, uint8_t bandwidth);
+                  const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index, uint8_t bandwidth);
     int get_block_ring_idx(uint64_t block_idx);
     int rx_ring_push(void);
     // cppcheck-suppress unusedPrivateFunction
@@ -234,6 +279,14 @@ private:
     int fec_n;  // RS total number of fragments in block
     uint8_t session_hash[crypto_generichash_BYTES];
 
+    // --- swfec session state ---
+    bool session_is_swfec;
+    swfec::SwfecDecoder *swfec_dec;   // NULL unless swfec session active
+    swfec::SwfecReorder *swfec_ro;    // in-order release buffer; NULL unless swfec session active
+    uint8_t swfec_deadline_ms;        // current deadline, for param-only updates
+    // swfec loss is counted directly from the reorder buffer's abandoned-gap
+    // tally (count_p_lost += ro_skipped), so no seq-gap tracker state is needed.
+
     uint32_t seq;
     rx_ring_item_t rx_ring[RX_RING_SIZE];
     int rx_ring_front; // current packet
@@ -241,6 +294,7 @@ private:
     uint64_t last_known_block;  //id of last known block
     uint64_t epoch; // current epoch
     const uint32_t channel_id; // (link_id << 8) + port_number
+    const bool encrypted; // false when no keypair given (-K absent): plaintext mode
 
     // rx->tx keypair
     uint8_t rx_secretkey[crypto_box_SECRETKEYBYTES];
@@ -249,6 +303,14 @@ private:
 
     // Packet loss listener for immediate notifications
     PacketLossListener* packet_loss_listener_ = nullptr;
+
+    // dynlink tap: parallel 10 ms accumulation, cleared on each tap flush.
+    // antenna_stat and the :8103 path stay byte-identical.
+    static const int TAP_INTERVAL_MS = 10;
+    TapEmitter tap_;
+    rx_antenna_stat_t tap_stat;
+    tap_counters_t tap_counters;
+    uint64_t tap_next_flush_ms = 0;
 };
 
 

@@ -57,10 +57,13 @@ class FakeAntennaProtocol(object):
     def update_rx_stats(self, rx_id, packet_stats, ant_stats, session):
         log.msg('%s %r %r %r' % (rx_id, packet_stats, ant_stats, session))
 
-        for (((freq, mcs_index, bandwidth), ant_id),
-             (pkt_s,
-              rssi_min, rssi_avg, rssi_max,
-              snr_min, snr_avg, snr_max)) in ant_stats.items():
+        for (((freq, mcs_index, bandwidth), ant_id), v) in ant_stats.items():
+            (pkt_s,
+             rssi_min, rssi_avg, rssi_max,
+             snr_min, snr_avg, snr_max) = v[:7]
+            # wfb_rx appends EVM (evm_min/avg/max) after SNR. Synthetic test
+            # frames carry no radiotap lock_quality, so EVM is reported absent (-1).
+            evm_min, evm_avg, evm_max = v[7:10] if len(v) >= 10 else (-1, -1, -1)
 
             assert pkt_s >= 0
             assert freq == 4321
@@ -68,6 +71,7 @@ class FakeAntennaProtocol(object):
             assert bandwidth == 20
             assert rssi_min == rssi_avg == rssi_max == -42
             assert snr_min == snr_avg == snr_max == 28
+            assert evm_min == evm_avg == evm_max == -1
 
             host, port, wlan_idx, ant_id = struct.unpack('!IHBB', ant_id.to_bytes(8, byteorder='big'))
             assert host == 0x7f000001
@@ -324,6 +328,84 @@ class TXRXTestCase(unittest.TestCase):
 
 
     @defer.inlineCallbacks
+    def test_reconfig_old_straggler_poison(self):
+        # Regression: after a FEC reconfigure (new session -> RX resets
+        # last_known_block to -1), an OLD-session straggler data packet with a
+        # high block_idx that arrives AFTER the reset (normal under WiFi
+        # reordering / multi-card diversity aggregation) must not poison
+        # last_known_block. If it does, all new-session data (block_idx 0,1,2..)
+        # is rejected as "already processed" and the video freezes.
+        #
+        # Encrypted mode is immune: the straggler was sealed with the OLD session
+        # key and fails AEAD against the new key, so it is dropped before it can
+        # touch last_known_block. Plaintext data carries no session binding, so
+        # without an explicit guard the straggler is accepted -> this test fails.
+        OFF = 17  # sizeof(wrxfwd_t) prefix on -D debug-mirrored packets
+        def ptype(p):     return p[OFF]
+        def is_data(p):   return ptype(p) in (0x1, 0x3)
+        def is_sess(p):   return ptype(p) in (0x2, 0x4)
+        def nonce(p):     return int.from_bytes(p[OFF + 1:OFF + 9], 'big')
+        def blk(p):       return nonce(p) >> 8
+        def frag(p):      return nonce(p) & 0xff
+
+        # ---- Round 1: establish session 1 (default k=8/n=12), 8 full blocks ----
+        for i in range(64):
+            self.txp.send_msg(b'a%03d' % i)
+            yield df_sleep(0.003)
+        yield df_sleep(0.1)
+
+        round1 = list(self.txp.rxq); self.txp.rxq[:] = []
+        data1 = [p for p in round1 if is_data(p)]
+        sess1 = [p for p in round1 if is_sess(p)]
+        self.assertTrue(data1 and sess1)
+
+        # Hold back a high-block SOURCE fragment (frag_idx 0 < any future n) to
+        # replay after the reset. Source fragments are never FEC-only parity, so
+        # they survive the post-reset fragment_idx < fec_n guard.
+        src1 = [p for p in data1 if frag(p) == 0]
+        straggler = max(src1, key=blk)
+
+        self.rxp.send_msg(sess1[0])
+        for p in data1:
+            if p is not straggler:
+                self.rxp.send_msg(p)
+            yield df_sleep(0.001)
+        yield df_sleep(0.2)
+        self.assertGreaterEqual(len(self.rxp.rxq), 48)  # round-1 mostly delivered
+
+        # ---- Reconfigure FEC -> brand new session, RX resets last_known_block ----
+        yield self.cmdp.set_fec(4, 8)
+        yield df_sleep(0.1)
+        after = list(self.txp.rxq); self.txp.rxq[:] = []
+        new_sess = [p for p in after if is_sess(p)]
+        self.assertTrue(new_sess, 'no new session packet emitted by set_fec')
+
+        # New session packet first -> RX rebuilds decoder, last_known_block = -1.
+        self.rxp.send_msg(new_sess[0])
+        yield df_sleep(0.02)
+        # OLD straggler (high block_idx) arrives AFTER the reset.
+        self.rxp.send_msg(straggler)
+        yield df_sleep(0.02)
+
+        # ---- Round 2: new low-block_idx data must still be delivered ----
+        for i in range(12):
+            self.txp.send_msg(b'b%03d' % i)
+            yield df_sleep(0.003)
+        yield df_sleep(0.1)
+        round2 = list(self.txp.rxq); self.txp.rxq[:] = []
+        for p in round2:
+            if is_data(p):
+                self.rxp.send_msg(p)
+            yield df_sleep(0.001)
+        yield df_sleep(0.2)
+
+        delivered_b = [m for m in self.rxp.rxq if m[:1] == b'b']
+        self.assertEqual(delivered_b, [b'b%03d' % i for i in range(12)],
+                         'new-session data dropped: last_known_block poisoned '
+                         'by old straggler (block_idx=%d)' % blk(straggler))
+
+
+    @defer.inlineCallbacks
     def test_cmd_fec_invalid_args(self):
         self.assertEqual(len(self.txp.rxq), 0)
         for i in range(6):
@@ -435,6 +517,393 @@ class KeyDerivationTestCase(TXRXTestCase):
         self.assertNotEqual(keys[0], keys[1])
         self.assertEqual(hashlib.sha1(keys[0]).hexdigest(), 'cb8d52ca7602928f67daba6ba1f308f4cfc88aa7')
         self.assertEqual(hashlib.sha1(keys[1]).hexdigest(), '7a6ffb44cebc53b4538d20bdcaba8d70c9cf4095')
+
+
+class PlaintextTXOnlyTestCase(unittest.TestCase):
+    # wfb_tx with no -K must run in plaintext and emit the same packet
+    # structure as encrypted mode (1 session + (8 data + 4 fec) per block).
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        # NOTE: no -K -> plaintext
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        ap = FakeAntennaProtocol()
+        self.tx_pp = TXProtocol(ap, cmd_tx, 'debug tx')
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        self.tx_pp.transport.signalProcess('KILL')
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_plaintext_tx_emits(self):
+        self.assertEqual(len(self.txp.rxq), 0)
+        for i in range(16):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+        yield df_sleep(0.1)
+        # 1 session + (8 data + 4 fec) * 2 blocks, same as the encrypted test_txrx
+        self.assertEqual(len(self.txp.rxq), 25)
+
+
+class PlaintextTXRXTestCase(TXRXTestCase):
+    # Same end-to-end round-trip assertions as TXRXTestCase, but both
+    # wfb_tx and wfb_rx run with NO -K (plaintext). Inherits test_txrx,
+    # test_aggregation, test_fec_timeout, test_cmd_* unchanged.
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        yield self.setup_keys(bindir)  # keys generated but unused (no -K passed)
+
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.cmdp = TXCommandClient(('127.0.0.1', 7003))
+
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        self.cmd_ep = reactor.listenUDP(0, self.cmdp)
+
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        # NOTE: no -K on either side -> plaintext
+        cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-a', '10001', '-u', '10002',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000', '-C', '7003',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+
+        ap = FakeAntennaProtocol()
+        self.rx_pp = RXProtocol(ap, cmd_rx, 'debug rx')
+        self.tx_pp = TXProtocol(ap, cmd_tx, 'debug tx')
+
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        yield df_sleep(0.1)
+
+
+class PlaintextSafetyTestCase(unittest.TestCase):
+    # Core invariant: a plaintext TX (no -K) must NOT be decoded by an
+    # ENCRYPTED RX (-K). The encrypted RX rejects 0x3/0x4 -> no output.
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        yield call_and_check_rc(os.path.join(bindir, 'wfb_keygen'))
+
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-K', 'drone.key', '-a', '10001', '-u', '10002',  # ENCRYPTED rx
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000',  # PLAINTEXT tx
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+
+        ap = FakeAntennaProtocol()
+        self.rx_pp = RXProtocol(ap, cmd_rx, 'debug rx')
+        self.tx_pp = TXProtocol(ap, cmd_tx, 'debug tx')
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        self.rx_pp.transport.signalProcess('KILL')
+        self.tx_pp.transport.signalProcess('KILL')
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_encrypted_rx_rejects_plaintext(self):
+        for i in range(16):
+            self.txp.send_msg(b'm%d' % (i + 1,))
+        yield df_sleep(0.1)
+        self.assertEqual(len(self.txp.rxq), 25)  # plaintext tx still emits
+        for pkt in self.txp.rxq:                  # forward every packet to the ENCRYPTED rx
+            self.rxp.send_msg(pkt)
+        yield df_sleep(1.1)
+        self.assertEqual(self.rxp.rxq, [])        # ...which decodes nothing
+
+
+class PlaintextSwfecTestCase(unittest.TestCase):
+    # Plaintext swfec (-z, no -K) no-loss round-trip: every source message,
+    # forwarded without loss, is delivered in order through the reorder buffer.
+    @defer.inlineCallbacks
+    def setUp(self):
+        bindir = os.path.join(os.path.dirname(__file__), '../..')
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+
+        link_id = int.from_bytes(os.urandom(3), 'big')
+        epoch = int(time.time())
+        # swfec plaintext: -z, -k overhead_pct=20, -n deadline_ms=50, no -K
+        cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-a', '10001', '-u', '10002',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-z', '-k', '20', '-n', '50', '-u', '10003', '-D', '10004',
+                  '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+
+        ap = FakeAntennaProtocol()
+        self.rx_pp = RXProtocol(ap, cmd_rx, 'debug rx')
+        self.tx_pp = TXProtocol(ap, cmd_tx, 'debug tx')
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        self.rx_pp.transport.signalProcess('KILL')
+        self.tx_pp.transport.signalProcess('KILL')
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_swfec_plaintext_roundtrip(self):
+        msgs = [b'swfec-%03d' % i for i in range(10)]
+        for m in msgs:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)  # let each source packet flush
+        yield df_sleep(0.1)
+        self.assertGreater(len(self.txp.rxq), len(msgs))  # session(s) + source + repair packets
+        for pkt in self.txp.rxq:       # forward everything, in order, no loss
+            self.rxp.send_msg(pkt)
+            yield df_sleep(0.002)
+        yield df_sleep(0.3)            # > deadline so the reorder buffer drains
+        self.assertEqual(self.rxp.rxq, msgs)
+
+
+class PlaintextRestartTestCase(unittest.TestCase):
+    # A plaintext TX that restarts with UNCHANGED FEC params must recover at a
+    # long-running RX. The RX detects the new random session ID and rebuilds
+    # (resetting last_known_block / the swfec reorder cursor). Runs for both RS
+    # and swfec via the swfec flag on cmd_tx.
+    swfec = False
+
+    @defer.inlineCallbacks
+    def setUp(self):
+        self.bindir = os.path.join(os.path.dirname(__file__), '../..')
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        self.link_id = int.from_bytes(os.urandom(3), 'big')
+        cmd_rx = [os.path.join(self.bindir, 'wfb_rx'), '-a', '10001', '-u', '10002',
+                  '-i', str(self.link_id), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        self.rx_pp = RXProtocol(FakeAntennaProtocol(), cmd_rx, 'debug rx')
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp = None
+        self._start_tx()
+        yield df_sleep(0.2)
+
+    def _start_tx(self):
+        cmd_tx = [os.path.join(self.bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000',
+                  '-i', str(self.link_id), '-R', str(512 * 1024), '-s', str(512 * 1024)]
+        if self.swfec:
+            cmd_tx += ['-z', '-k', '20', '-n', '50']
+        cmd_tx.append('wlan0')
+        self.tx_pp = TXProtocol(FakeAntennaProtocol(), cmd_tx, 'debug tx')
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+
+    @defer.inlineCallbacks
+    def _drain_to_rx(self):
+        # forward everything the TX emitted (session first, in order) to the RX
+        for pkt in self.txp.rxq:
+            self.rxp.send_msg(pkt)
+            yield df_sleep(0.002)
+        self.txp.rxq[:] = []
+        yield df_sleep(0.3)
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        if self.tx_pp is not None:
+            self.tx_pp.transport.signalProcess('KILL')
+        self.rx_pp.transport.signalProcess('KILL')
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def test_restart_recovers(self):
+        # Round 1: push enough blocks that the RX's last_known_block / swfec
+        # cursor is well above 0, so a restarted (reset-to-0) stream would be
+        # rejected as "already processed" unless the RX rebuilds.
+        round1 = [b'a%03d' % i for i in range(40)]
+        for m in round1:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)            # session announce + final block/window flush
+        yield self._drain_to_rx()
+        self.assertEqual(self.rxp.rxq, round1)
+
+        # Restart the TX: fresh process -> new random session ID, sequence resets to 0.
+        self.tx_pp.transport.signalProcess('KILL')
+        yield df_sleep(0.4)            # let it die and release udp:10003
+        self.txp.rxq[:] = []
+        self._start_tx()
+        yield df_sleep(0.2)
+
+        # Round 2: the long-running RX must accept the restarted low-sequence stream.
+        round2 = [b'b%03d' % i for i in range(40)]
+        for m in round2:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)
+        yield self._drain_to_rx()
+        self.assertEqual(self.rxp.rxq, round1 + round2)
+
+
+class PlaintextRestartSwfecTestCase(PlaintextRestartTestCase):
+    swfec = True
+
+
+class PlaintextForgedEpochTestCase(unittest.TestCase):
+    """
+    Regression for Finding M-A: a forged SESSION_PLAIN with epoch=UINT64_MAX
+    (plus a fresh random session_key) triggers setup_session on the RX —
+    resetting last_known_block — and then sets the RX's internal epoch to MAX.
+    Under the old code the subsequent monotonic gate (epoch < current -> reject)
+    permanently latches out all legitimate SESSION_PLAIN with epoch=0, so the
+    session-ID restart-recovery mechanism is broken: a TX restart is invisible to
+    the RX and new data at block_idx=0 is refused as "already processed".
+    After the M-A fix (no epoch gate in the SESSION_PLAIN path) the forged epoch
+    has no lasting effect, and this test passes GREEN.
+
+    Byte-offset derivation for the forwarded packet in txp.rxq:
+      wrxfwd_t       = 17 bytes  (sizeof: wlan_idx+antenna[4]+rssi[4]+noise[4]+freq+mcs+bw)
+      wsession_hdr_t = 25 bytes  (1 type byte + 24-byte nonce)
+      wsession_data_t starts at offset 42:
+        epoch      at 42..49  (8 bytes, big-endian)
+        channel_id at 50..53  (kept unchanged)
+        fec_type   at 54      (kept)
+        k          at 55      (kept)
+        n          at 56      (kept)
+        session_key at 57..88 (32 bytes, overwritten with fresh random)
+    """
+
+    @defer.inlineCallbacks
+    def setUp(self):
+        self.bindir = os.path.join(os.path.dirname(__file__), '../..')
+        self.rxp = UDP_TXRX(('127.0.0.1', 10001))
+        self.txp = UDP_TXRX(('127.0.0.1', 10003))
+        self.rx_ep = reactor.listenUDP(10002, self.rxp)
+        self.tx_ep = reactor.listenUDP(10004, self.txp)
+        self.link_id = int.from_bytes(os.urandom(3), 'big')
+        # Plaintext RX: no -K, no -e (epoch defaults to 0)
+        cmd_rx = [os.path.join(self.bindir, 'wfb_rx'), '-a', '10001', '-u', '10002',
+                  '-i', str(self.link_id), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        self.rx_pp = RXProtocol(FakeAntennaProtocol(), cmd_rx, 'debug rx')
+        self.rx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+        self.tx_pp = None
+        self._start_tx()
+        yield df_sleep(0.2)
+
+    def _start_tx(self):
+        cmd_tx = [os.path.join(self.bindir, 'wfb_tx'), '-u', '10003', '-D', '10004', '-T', '30', '-F', '3000',
+                  '-i', str(self.link_id), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
+        self.tx_pp = TXProtocol(FakeAntennaProtocol(), cmd_tx, 'debug tx')
+        self.tx_pp.start().addErrback(lambda f: f.trap('twisted.internet.error.ProcessTerminated'))
+
+    @defer.inlineCallbacks
+    def tearDown(self):
+        if self.tx_pp is not None:
+            self.tx_pp.transport.signalProcess('KILL')
+        self.rx_pp.transport.signalProcess('KILL')
+        self.rx_ep.stopListening()
+        self.tx_ep.stopListening()
+        yield df_sleep(0.1)
+
+    @defer.inlineCallbacks
+    def _drain(self):
+        """Forward all buffered TX packets to the RX aggregator and clear the queue."""
+        for pkt in self.txp.rxq:
+            self.rxp.send_msg(pkt)
+            yield df_sleep(0.002)
+        self.txp.rxq[:] = []
+        yield df_sleep(0.3)
+
+    @defer.inlineCallbacks
+    def test_forged_epoch_does_not_latch(self):
+        # ── Round 1: establish a real session, advance last_known_block ─────────
+        round1 = [b'a%03d' % i for i in range(40)]
+        for m in round1:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)
+
+        # Capture a SESSION_PLAIN (type byte 0x04 at offset 17 in the forwarded
+        # frame) before draining so we have the real channel_id / fec params.
+        session_pkt = None
+        for pkt in self.txp.rxq:
+            if session_pkt is None and len(pkt) > 17 and pkt[17] == 0x04:
+                session_pkt = bytearray(pkt)
+
+        yield self._drain()
+        self.assertEqual(self.rxp.rxq, round1)
+        self.assertIsNotNone(session_pkt, 'no SESSION_PLAIN captured in round 1')
+
+        # ── Inject a forged SESSION_PLAIN ─────────────────────────────────────
+        # Overwrite epoch → UINT64_MAX and session_key → fresh random (so that
+        # memcmp detects a "new session" and calls setup_session, setting the RX
+        # internal epoch to MAX and resetting last_known_block).
+        EPOCH_OFF = 42   # sizeof(wrxfwd_t)=17 + sizeof(wsession_hdr_t)=25
+        SK_OFF    = 57   # EPOCH_OFF + epoch(8)+channel_id(4)+fec_type(1)+k(1)+n(1)
+        session_pkt[EPOCH_OFF:EPOCH_OFF + 8] = b'\xff' * 8   # epoch = UINT64_MAX
+        session_pkt[SK_OFF:SK_OFF + 32]      = os.urandom(32) # trigger new-session rebuild
+        self.rxp.send_msg(bytes(session_pkt))
+        yield df_sleep(0.05)
+        # RX has now: epoch=MAX, last_known_block=-1 (reset by setup_session)
+
+        # ── Round 2: same TX session, advance last_known_block again ──────────
+        # The TX continues sending with the same session_key (R1) and ascending
+        # block_idx. Under old code the real SESSION_PLAIN arriving in this batch
+        # is epoch-rejected (0 < MAX) and last_known_block is advanced only by the
+        # data packets. Under new code the real SESSION_PLAIN re-triggers
+        # setup_session at epoch=0 and data follows normally. Either way, round-2
+        # messages are delivered (plaintext data does not check session_key) and
+        # last_known_block ends up > 0 after this drain.
+        round2 = [b'b%03d' % i for i in range(16)]
+        for m in round2:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)
+        yield self._drain()
+
+        # ── Restart the TX ────────────────────────────────────────────────────
+        # New process → new random session_key (R2), block_idx resets to 0.
+        self.tx_pp.transport.signalProcess('KILL')
+        yield df_sleep(0.4)
+        self.txp.rxq[:] = []
+        self._start_tx()
+        yield df_sleep(0.2)
+
+        # ── Round 3: the RX must accept the restarted stream ─────────────────
+        round3 = [b'c%03d' % i for i in range(40)]
+        for m in round3:
+            self.txp.send_msg(m)
+            yield df_sleep(0.01)
+        yield df_sleep(1.1)
+        yield self._drain()
+
+        # M-A fix (new code): SESSION_PLAIN with epoch=0 accepted (no epoch gate);
+        # session_key change (R1→R2) detected → setup_session → last_known_block
+        # reset to -1 → block_idx=0 data accepted → round 3 delivered.
+        #
+        # Old code: SESSION_PLAIN with epoch=0 rejected (0 < UINT64_MAX);
+        # last_known_block stays > 0 (advanced by round-2 data) → block_idx=0
+        # "already processed" → round-3 messages silently dropped.
+        self.assertGreater(len(self.rxp.rxq), len(round1) + len(round2),
+                           'round-3 messages not received — epoch latch not fixed (M-A)')
 
 
 class UNIXTXRXTestCase(TXRXTestCase):

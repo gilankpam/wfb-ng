@@ -188,9 +188,19 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 // packet types
 #define WFB_PACKET_DATA    0x1
 #define WFB_PACKET_SESSION 0x2
+#define WFB_PACKET_DATA_PLAIN    0x3  // wblock_hdr  + raw fragment (no AEAD tag); -K absent
+#define WFB_PACKET_SESSION_PLAIN 0x4  // wsession_hdr + raw wsession_data (no crypto_box); -K absent
 
 // FEC types
 #define WFB_FEC_VDM_RS  0x1  //Reed-Solomon on Vandermonde matrix
+#define WFB_FEC_SWFEC   0x2  // sliding-window FEC (swfec); k=overhead_pct, n=deadline_ms
+
+// IPC stats contract version, emitted as SESSION trailing field #5
+// (epoch:fec_type:k:n:contract_version). v3: WFB_FEC_SWFEC (2) exists; for
+// swfec sessions the SESSION k/n slots carry overhead_pct/deadline_ms.
+// Bump on any stats-shape change — stats consumers are expected to
+// hard-fail on versions they don't know, by design.
+#define WFB_IPC_CONTRACT_VERSION 3
 
 // packet flags
 #define WFB_PACKET_FEC_ONLY 0x1
@@ -198,16 +208,39 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 #define SESSION_KEY_ANNOUNCE_MSEC 1000
 #define RX_ANT_MAX  4
 
+// Cluster forward proto v2: adds evm[]. Magic 0xA2 sits outside the realistic
+// wlan_idx range so a v1 packet (offset-0 byte = wlan_idx 0/1) can't match.
+#define WFB_FWD_VERSION 0xA2
+
 // Header for forwarding raw packets from RX host to Aggregator in UDP packets
 typedef struct {
-    uint8_t wlan_idx;
-    uint8_t antenna[RX_ANT_MAX]; //RADIOTAP_ANTENNA, list of antenna idx, 0xff for unused slot
-    int8_t rssi[RX_ANT_MAX]; //RADIOTAP_DBM_ANTSIGNAL, list of rssi for corresponding antenna idx
-    int8_t noise[RX_ANT_MAX]; //RADIOTAP_DBM_ANTNOISE, list of (rssi - snr) for corresponding antenna idx
-    uint16_t freq; //IEEE80211_RADIOTAP_CHANNEL -- channel frequency in MHz
-    uint8_t mcs_index;
-    uint8_t bandwidth;
+    uint8_t  version;                // == WFB_FWD_VERSION; absent in v1
+    uint8_t  wlan_idx;
+    uint8_t  antenna[RX_ANT_MAX];    // RADIOTAP_ANTENNA, 0xff for unused slot
+    int8_t   rssi[RX_ANT_MAX];       // RADIOTAP_DBM_ANTSIGNAL
+    int8_t   noise[RX_ANT_MAX];      // RADIOTAP_DBM_ANTNOISE (rssi - snr)
+    uint8_t  evm[RX_ANT_MAX];        // LOCK_QUALITY EVM%, 0xff = unused
+    uint16_t freq;                   // RADIOTAP_CHANNEL MHz
+    uint8_t  mcs_index;
+    uint8_t  bandwidth;
 } __attribute__ ((packed)) wrxfwd_t;
+
+// Validate a received cluster-forward datagram. Returns true for a well-formed
+// v2 packet and fills the header + payload slice; false (drop) on a short
+// packet or version/magic mismatch (stale node).
+static inline bool wrxfwd_parse(const uint8_t *buf, ssize_t rsize,
+                                const wrxfwd_t **hdr_out,
+                                const uint8_t **payload_out,
+                                size_t *payload_len_out)
+{
+    if (rsize < (ssize_t)sizeof(wrxfwd_t)) return false;
+    const wrxfwd_t *h = (const wrxfwd_t *)buf;
+    if (h->version != WFB_FWD_VERSION) return false;
+    *hdr_out = h;
+    *payload_out = buf + sizeof(wrxfwd_t);
+    *payload_len_out = (size_t)(rsize - sizeof(wrxfwd_t));
+    return true;
+}
 
 // Network packet headers. All numbers are in network (big endian) format
 // Encrypted packets can be either session key or data packet.
@@ -222,7 +255,7 @@ typedef struct {
 typedef struct {
     uint64_t epoch; // Drop session packets from old epoch
     uint32_t channel_id; // (link_id << 8) + port_number
-    uint8_t fec_type; // Now only supported type is WFB_FEC_VDM_RS
+    uint8_t fec_type; // WFB_FEC_VDM_RS or WFB_FEC_SWFEC
     uint8_t k;   // FEC k
     uint8_t n;   // FEC n
     uint8_t session_key[crypto_aead_chacha20poly1305_KEYBYTES];

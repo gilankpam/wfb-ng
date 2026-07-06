@@ -46,6 +46,7 @@ extern "C"
 
 #include <string>
 #include <memory>
+#include <algorithm>
 
 #include "wifibroadcast.hpp"
 #include "rx.hpp"
@@ -127,6 +128,7 @@ void Receiver::loop_iter(void)
         uint8_t antenna[RX_ANT_MAX];
         int8_t rssi[RX_ANT_MAX];
         int8_t noise[RX_ANT_MAX];
+        uint8_t evm[RX_ANT_MAX];
         uint8_t flags = 0;
         bool self_injected = false;
         uint8_t mcs_index = 0;
@@ -141,6 +143,8 @@ void Receiver::loop_iter(void)
         memset(rssi, SCHAR_MIN, sizeof(rssi));
         // Fill all noise slots with maximum value
         memset(noise, SCHAR_MAX, sizeof(noise));
+        // Fill all evm slots with 0xff (radiotap lock_quality field absent)
+        memset(evm, 0xff, sizeof(evm));
 
         while (ret == 0 && ant_idx < RX_ANT_MAX) {
             ret = ieee80211_radiotap_iterator_next(&iterator);
@@ -175,6 +179,12 @@ void Receiver::loop_iter(void)
 
             case IEEE80211_RADIOTAP_DBM_ANTNOISE:
                 noise[ant_idx] = *(int8_t*)(iterator.this_arg);
+                break;
+
+            case IEEE80211_RADIOTAP_LOCK_QUALITY:
+                // Realtek 88x2 carries per-antenna EVM% here (0..100, higher is
+                // better). __le16 field; the value fits in the low byte.
+                evm[ant_idx] = (uint8_t)(le16toh(*(uint16_t*)(iterator.this_arg)) & 0xff);
                 break;
 
             case IEEE80211_RADIOTAP_FLAGS:
@@ -258,7 +268,7 @@ void Receiver::loop_iter(void)
         if (pktlen > (int)sizeof(ieee80211_header))
         {
             agg->process_packet(pkt + sizeof(ieee80211_header), pktlen - sizeof(ieee80211_header),
-                                wlan_idx, antenna, rssi, noise, freq, mcs_index, bandwidth, NULL);
+                                wlan_idx, antenna, rssi, noise, evm, freq, mcs_index, bandwidth, NULL);
         } else {
             WFB_ERR("Short packet (ieee header)\n");
             continue;
@@ -270,28 +280,34 @@ void Receiver::loop_iter(void)
 Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
     count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-    fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
-    last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
+    fec_p(NULL), fec_k(-1), fec_n(-1),
+    session_is_swfec(false), swfec_dec(NULL), swfec_ro(NULL), swfec_deadline_ms(0),
+    seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
+    last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id),
+    encrypted(!keypair.empty())
 {
     memset(session_key, '\0', sizeof(session_key));
     memset(session_hash, '\0', sizeof(session_hash));
 
-    FILE *fp;
-    if((fp = fopen(keypair.c_str(), "r")) == NULL)
+    if (encrypted)
     {
-        throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
-    }
-    if (fread(rx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
-    {
+        FILE *fp;
+        if((fp = fopen(keypair.c_str(), "r")) == NULL)
+        {
+            throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
+        }
+        if (fread(rx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read rx secret key: %s", strerror(errno)));
+        }
+        if (fread(tx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
+        {
+            fclose(fp);
+            throw runtime_error(string_format("Unable to read tx public key: %s", strerror(errno)));
+        }
         fclose(fp);
-        throw runtime_error(string_format("Unable to read rx secret key: %s", strerror(errno)));
     }
-    if (fread(tx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
-    {
-        fclose(fp);
-        throw runtime_error(string_format("Unable to read tx public key: %s", strerror(errno)));
-    }
-    fclose(fp);
 }
 
 
@@ -301,6 +317,10 @@ Aggregator::~Aggregator()
     {
         deinit_fec();
     }
+    delete swfec_dec;
+    swfec_dec = NULL;
+    delete swfec_ro;
+    swfec_ro = NULL;
 }
 
 void Aggregator::init_fec(int k, int n)
@@ -336,6 +356,72 @@ void Aggregator::init_fec(int k, int n)
         rx_ring[ring_idx].fragment_map = new size_t[fec_n];
         memset(rx_ring[ring_idx].fragment_map, '\0', fec_n * sizeof(size_t));
     }
+}
+
+// (Re)build the RX decoder from session FEC params and emit the IPC SESSION line.
+// Shared by the encrypted session path (on session-key change) and the plaintext
+// session path (on param change). Does not touch session_key.
+void Aggregator::setup_session(uint8_t fec_type, uint8_t k, uint8_t n, uint64_t new_epoch)
+{
+    epoch = new_epoch;
+
+    if (fec_type == WFB_FEC_VDM_RS)
+    {
+        // Drop any active swfec decoder when switching to RS
+        delete swfec_dec;
+        swfec_dec = NULL;
+        delete swfec_ro;
+        swfec_ro = NULL;
+        session_is_swfec = false;
+
+        if (fec_p != NULL)
+        {
+            deinit_fec();
+        }
+
+        init_fec(k, n);
+
+        // Trailing field #5 (contract_version). 4-field-only parsers stay compatible.
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch,
+                (unsigned)WFB_FEC_VDM_RS, fec_k, fec_n, (unsigned)WFB_IPC_CONTRACT_VERSION);
+        IPC_MSG_SEND();
+    }
+    else // WFB_FEC_SWFEC
+    {
+        if (fec_p != NULL)
+        {
+            deinit_fec();
+        }
+
+        delete swfec_dec;
+        swfec_dec = NULL;
+        swfec_dec = new swfec::SwfecDecoder((uint64_t)n * 1000);
+        delete swfec_ro;
+        swfec_ro = new swfec::SwfecReorder((uint64_t)n * 1000);
+        session_is_swfec = true;
+        swfec_deadline_ms = n;
+
+        fec_k = k;   // swfec: overhead_pct rides the k slot
+        fec_n = n;   // swfec: deadline_ms rides the n slot
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", get_time_ms(), epoch,
+                (unsigned)WFB_FEC_SWFEC, fec_k, fec_n, (unsigned)WFB_IPC_CONTRACT_VERSION);
+        IPC_MSG_SEND();
+    }
+}
+
+// Param-only swfec deadline update (same session, deadline changed): no decoder
+// reset. Shared by the encrypted session path and the plaintext SESSION_PLAIN path.
+void Aggregator::swfec_set_deadline(uint8_t n)
+{
+    swfec_deadline_ms = n;
+    swfec_dec->set_deadline_us((uint64_t)n * 1000);
+    if (swfec_ro != NULL)
+        swfec_ro->set_deadline_us((uint64_t)n * 1000);
+    fec_n = n;
+    IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n",
+            get_time_ms(), epoch, (unsigned)WFB_FEC_SWFEC, fec_k, fec_n,
+            (unsigned)WFB_IPC_CONTRACT_VERSION);
+    IPC_MSG_SEND();
 }
 
 void Aggregator::deinit_fec(void)
@@ -384,10 +470,11 @@ Forwarder::Forwarder(const string &client_addr, int client_port, int snd_buf_siz
 
 
 void Forwarder::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
-                               const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
+                               const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                uint8_t bandwidth, sockaddr_in *sockaddr)
 {
-    wrxfwd_t fwd_hdr = { .wlan_idx = wlan_idx,
+    wrxfwd_t fwd_hdr = { .version = WFB_FWD_VERSION,
+                         .wlan_idx = wlan_idx,
                          .freq = htons(freq),
                          .mcs_index = mcs_index,
                          .bandwidth = bandwidth };
@@ -395,6 +482,7 @@ void Forwarder::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx
     memcpy(fwd_hdr.antenna, antenna, RX_ANT_MAX * sizeof(uint8_t));
     memcpy(fwd_hdr.rssi, rssi, RX_ANT_MAX * sizeof(int8_t));
     memcpy(fwd_hdr.noise, noise, RX_ANT_MAX * sizeof(int8_t));
+    memcpy(fwd_hdr.evm, evm, RX_ANT_MAX * sizeof(uint8_t));
 
     struct iovec iov[2] = {{ .iov_base = (void*)&fwd_hdr,
                              .iov_len = sizeof(fwd_hdr)},
@@ -485,6 +573,129 @@ int Aggregator::get_block_ring_idx(uint64_t block_idx)
     return ring_idx;
 }
 
+// Emit in-order packets released by the swfec reorder buffer, updating the
+// delivery/recovery counters. Shared by the packet fast path and the
+// quiet-gap poll so both account for output identically.
+void Aggregator::swfec_flush_reorder_out(std::vector<swfec::SwfecReorder::Out> &ro_out)
+{
+    for (size_t i = 0; i < ro_out.size(); i++)
+    {
+        send_to_socket(ro_out[i].payload.data(), (uint16_t)ro_out[i].payload.size());
+        count_p_outgoing += 1;
+        tap_counters.out += 1;
+        count_b_outgoing += (uint32_t)ro_out[i].payload.size();
+        if (ro_out[i].late)
+        {
+            count_p_fec_recovered += 1;
+            tap_counters.fec_rec += 1;
+        }
+    }
+}
+
+// Time-based drain with no new packet. The decoder delivers source packets on
+// arrival and recovered packets late, so the reorder buffer may hold packets
+// behind a gap waiting for the missing seq. On the loss-free path a new packet
+// always arrives to drive the drain, but if the stream goes quiet right after a
+// gap (e.g. end of a GOP) the held packets would otherwise stall until the next
+// packet. Calling this from the rx loop's idle tick releases them at the
+// deadline, matching the bounded latency of the RS-block path.
+void Aggregator::swfec_poll(void)
+{
+    if (!session_is_swfec || swfec_ro == NULL)
+        return;
+    uint64_t now_us = swfec::monotonic_us();
+    swfec_dec->tick(now_us);   // age out unrecoverable decoder state
+    std::vector<swfec::SwfecReorder::Out> ro_out;
+    uint32_t ro_skipped = 0;
+    swfec_ro->poll(now_us, ro_out, ro_skipped);
+    count_p_lost += ro_skipped;
+    tap_counters.lost += ro_skipped;
+    if (ro_skipped) tap_.note_loss(ro_skipped, 0, 0, get_time_ms()); // swfec: no seq context
+    swfec_flush_reorder_out(ro_out);
+}
+
+// Milliseconds until the next required quiet-gap drain, clamped to [0, max_ms],
+// or max_ms if nothing is pending. Used to bound the rx poll() timeout so the
+// drain fires near the deadline instead of at the next stats window.
+int Aggregator::swfec_poll_timeout_ms(int max_ms)
+{
+    if (!session_is_swfec || swfec_ro == NULL)
+        return max_ms;
+    uint64_t due_us = swfec_ro->next_drain_us();
+    if (due_us == 0)
+        return max_ms;
+    uint64_t now_us = swfec::monotonic_us();
+    if (due_us <= now_us)
+        return 0;
+    uint64_t wait_ms = (due_us - now_us + 999) / 1000;   // round up to not wake early
+    return wait_ms < (uint64_t)max_ms ? (int)wait_ms : max_ms;
+}
+
+void Aggregator::tap_init(int port)
+{
+    tap_.init(port);
+    tap_next_flush_ms = get_time_ms() + TAP_INTERVAL_MS;
+}
+
+void Aggregator::tap_poll(uint64_t cur_ts)
+{
+    if (!tap_.enabled()) return;
+    tap_.flush_loss(cur_ts);
+    if (cur_ts < tap_next_flush_ms) return;
+
+    std::vector<tap_bucket_t> buckets;
+    buckets.reserve(tap_stat.size());
+    for (auto it = tap_stat.begin(); it != tap_stat.end(); it++) {
+        const rxAntennaKey &k = it->first;
+        const rxAntennaItem &v = it->second;
+        if (v.count_all <= 0) continue;
+        tap_bucket_t b;
+        b.freq = k.freq;
+        b.mcs = k.mcs_index;
+        b.bw = k.bandwidth;
+        b.ant_id = k.antenna_id;
+        b.pkt_recv = (uint32_t)v.count_all;
+        b.rssi_min = v.rssi_min;
+        b.rssi_avg = (int8_t)(v.rssi_sum / v.count_all);
+        b.rssi_max = v.rssi_max;
+        b.snr_min = v.snr_min;
+        b.snr_avg = (int8_t)(v.snr_sum / v.count_all);
+        b.snr_max = v.snr_max;
+        if (v.evm_count > 0) {
+            b.evm_min = v.evm_min;
+            b.evm_avg = (int16_t)(v.evm_sum / v.evm_count);
+            b.evm_max = v.evm_max;
+        } else {
+            b.evm_min = b.evm_avg = b.evm_max = -1;
+        }
+        buckets.push_back(b);
+    }
+    // unordered_map order is nondeterministic — sort for a stable wire
+    std::sort(buckets.begin(), buckets.end(),
+              [](const tap_bucket_t &a, const tap_bucket_t &b) {
+                  if (a.freq != b.freq) return a.freq < b.freq;
+                  if (a.mcs != b.mcs) return a.mcs < b.mcs;
+                  if (a.bw != b.bw) return a.bw < b.bw;
+                  return a.ant_id < b.ant_id;
+              });
+
+    uint8_t buf[TAP_MICRO_HDR_SIZE + TAP_MAX_BUCKETS * TAP_MICRO_BUCKET_SIZE];
+    size_t len = tap_encode_micro(buf, sizeof(buf), tap_.take_seq(), cur_ts, tap_counters, buckets);
+    if (len) tap_.send_buf(buf, len); // emitted even when empty: heartbeat
+    tap_stat.clear();
+    tap_counters.clear();
+    tap_next_flush_ms = cur_ts + TAP_INTERVAL_MS - ((cur_ts - tap_next_flush_ms) % TAP_INTERVAL_MS);
+}
+
+int Aggregator::tap_poll_timeout_ms(uint64_t cur_ts, int max_ms)
+{
+    if (!tap_.enabled()) return max_ms;
+    int t = tap_next_flush_ms > cur_ts ? (int)(tap_next_flush_ms - cur_ts) : 0;
+    int ld = tap_.loss_deadline_ms(cur_ts);
+    if (ld >= 0 && ld < t) t = ld;
+    return t < max_ms ? t : max_ms;
+}
+
 void Aggregator::dump_stats(void)
 {
     //timestamp in ms
@@ -492,10 +703,27 @@ void Aggregator::dump_stats(void)
 
     for(auto it = antenna_stat.begin(); it != antenna_stat.end(); it++)
     {
-        IPC_MSG("%" PRIu64 "\tRX_ANT\t%u:%u:%u\t%" PRIx64 "\t%d" ":%d:%d:%d" ":%d:%d:%d\n",
+        IPC_MSG("%" PRIu64 "\tRX_ANT\t%u:%u:%u\t%" PRIx64 "\t%d" ":%d:%d:%d" ":%d:%d:%d" ":%d:%d:%d\n",
                 ts, it->first.freq, it->first.mcs_index, it->first.bandwidth, it->first.antenna_id, it->second.count_all,
                 it->second.rssi_min, it->second.rssi_sum / it->second.count_all, it->second.rssi_max,
-                it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
+                it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max,
+                it->second.evm_count ? (int)it->second.evm_min : -1,
+                it->second.evm_count ? it->second.evm_sum / it->second.evm_count : -1,
+                it->second.evm_count ? (int)it->second.evm_max : -1);
+    }
+
+    // swfec loss is accumulated into count_p_lost as the reorder buffer abandons
+    // gaps past the deadline (see swfec fast path / swfec_poll); nothing to
+    // compute here. count_p_lost is reset each window by clear_stats().
+
+    // Contract v3: re-emit SESSION once per stats window so a late-attached
+    // python parser learns the session without waiting for an on-change event.
+    // The python consumer dedups by last-seen values, so only genuine changes trigger downstream reactions.
+    if (fec_p != NULL || swfec_dec != NULL)
+    {
+        IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d:%u\n", ts, epoch,
+                (unsigned)(session_is_swfec ? WFB_FEC_SWFEC : WFB_FEC_VDM_RS), fec_k, fec_n,
+                (unsigned)WFB_IPC_CONTRACT_VERSION);
     }
 
     IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
@@ -523,8 +751,18 @@ void Aggregator::dump_stats(void)
 
 
 void Aggregator::log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const uint8_t *ant, const int8_t *rssi, const int8_t *noise,
-                          uint16_t freq, uint8_t mcs_index, uint8_t bandwidth)
+                          const uint8_t *evm, uint16_t freq, uint8_t mcs_index, uint8_t bandwidth)
 {
+    // EVM is a per-frame (per-stream) value, not per-antenna: ath9k measures it
+    // after the chains are combined and emits it once (aggregate radiotap
+    // LOCK_QUALITY -> evm[0]), leaving the other antenna slots absent (0xff).
+    // The frame was received on every listed antenna, so show its EVM on each
+    // row. Only ABSENT slots are filled, so a driver that reports genuine
+    // per-antenna EVM (e.g. Realtek) keeps its own values.
+    uint8_t frame_evm = 0xff;
+    for (int i = 0; i < RX_ANT_MAX && ant[i] != 0xff; i++)
+        if (evm[i] != 0xff) { frame_evm = evm[i]; break; }
+
     for(int i = 0; i < RX_ANT_MAX && ant[i] != 0xff; i++)
     {
         // antenna_id: addr + port + wlan_idx + ant
@@ -541,7 +779,9 @@ void Aggregator::log_rssi(const sockaddr_in *sockaddr, uint8_t wlan_idx, const u
 
         key.antenna_id |= ((uint64_t)wlan_idx << 8 | (uint64_t)ant[i]);
 
-        antenna_stat[key].log_rssi(rssi[i], noise[i]);
+        antenna_stat[key].log_rssi(rssi[i], noise[i], (evm[i] != 0xff) ? evm[i] : frame_evm);
+        if (tap_.enabled())
+            tap_stat[key].log_rssi(rssi[i], noise[i], (evm[i] != 0xff) ? evm[i] : frame_evm);
     }
 }
 
@@ -568,7 +808,7 @@ int Aggregator::get_tag(const void *buf, size_t size, uint8_t tag_id, void *valu
 }
 
 void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
-                                const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
+                                const int8_t *rssi, const int8_t *noise, const uint8_t *evm, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth, sockaddr_in *sockaddr)
 {
     uint8_t session_tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
@@ -578,6 +818,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     //size_t new_session_tags_size = 0;
 
     count_p_all += 1;
+    tap_counters.all += 1;
     count_b_all += size;
 
     if(size == 0) return;
@@ -592,6 +833,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     switch(buf[0])
     {
     case WFB_PACKET_DATA:
+        if (!encrypted)   // plaintext RX must not accept encrypted data
+        {
+            count_p_bad += 1;
+            return;
+        }
         if(size < sizeof(wblock_hdr_t) + crypto_aead_chacha20poly1305_ABYTES + sizeof(wpacket_hdr_t))
         {
             WFB_ERR("Short packet (fec header)\n");
@@ -600,7 +846,32 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
         }
         break;
 
+    case WFB_PACKET_DATA_PLAIN:
+        if (encrypted)   // encrypted RX must not accept plaintext data (downgrade guard)
+        {
+            count_p_bad += 1;
+            return;
+        }
+        if (size < sizeof(wblock_hdr_t) + sizeof(wpacket_hdr_t))
+        {
+            WFB_ERR("Short packet (plain fec header)\n");
+            count_p_bad += 1;
+            return;
+        }
+        if (size > sizeof(wblock_hdr_t) + MAX_FEC_PAYLOAD)  // no AEAD tag -> bound length explicitly
+        {
+            WFB_ERR("Long packet (plain fec payload)\n");
+            count_p_bad += 1;
+            return;
+        }
+        break;
+
     case WFB_PACKET_SESSION:
+        if (!encrypted)   // plaintext RX must not accept encrypted session
+        {
+            count_p_bad += 1;
+            return;
+        }
         new_session_data = (wsession_data_t*)session_tmp;
 
         if(size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES || \
@@ -656,53 +927,173 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             return;
         }
 
-        if (new_session_data->fec_type != WFB_FEC_VDM_RS)
+        if (new_session_data->fec_type == WFB_FEC_VDM_RS)
+        {
+            if (new_session_data->n < 1)
+            {
+                WFB_ERR("Invalid FEC N: %d\n", new_session_data->n);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            if (new_session_data->k < 1 || new_session_data->k > new_session_data->n)
+            {
+                WFB_ERR("Invalid FEC K: %d\n", new_session_data->k);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            count_p_session += 1;
+
+            // Ignore RSSI (and per-card rx counters) for session packets to simplify calculation
+            // of lost packets because session packets doesn't have any serial number and it is
+            // too hard to calculate number of unique session packets
+
+            if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
+            {
+                memcpy(session_key, new_session_data->session_key, sizeof(session_key));
+                setup_session(WFB_FEC_VDM_RS, new_session_data->k, new_session_data->n,
+                              be64toh(new_session_data->epoch));
+            }
+        }
+        else if (new_session_data->fec_type == WFB_FEC_SWFEC)
+        {
+            // swfec carries deadline_ms in the n slot; reject n==0 (a deadline-0
+            // decoder expires every packet immediately and the reorder buffer
+            // drops everything), mirroring the RS branch's FEC-N guard. swfec k
+            // is overhead_pct, which RX ignores, so it needs no validation.
+            if (new_session_data->n < 1)
+            {
+                WFB_ERR("Invalid swfec deadline_ms (n): %d\n", new_session_data->n);
+                count_p_dec_err += 1;
+                return;
+            }
+
+            count_p_session += 1;
+
+            if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
+            {
+                // New swfec session: (re)build decoder
+                memcpy(session_key, new_session_data->session_key, sizeof(session_key));
+                setup_session(WFB_FEC_SWFEC, new_session_data->k, new_session_data->n,
+                              be64toh(new_session_data->epoch));
+            }
+            else if (session_is_swfec && new_session_data->n != swfec_deadline_ms)
+            {
+                // Param-only update: deadline changed, same key — no reset
+                swfec_set_deadline(new_session_data->n);
+            }
+        }
+        else
         {
             WFB_ERR("Unsupported FEC codec type: %d\n", new_session_data->fec_type);
             count_p_dec_err += 1;
             return;
         }
 
-        if (new_session_data->n < 1)
+        // Cache already processed session
+        memcpy(session_hash, new_session_hash, sizeof(session_hash));
+
+        return;
+
+    case WFB_PACKET_SESSION_PLAIN:
+    {
+        if (encrypted)   // encrypted RX must not accept plaintext session (downgrade guard)
         {
-            WFB_ERR("Invalid FEC N: %d\n", new_session_data->n);
-            count_p_dec_err += 1;
+            count_p_bad += 1;
             return;
         }
 
-        if (new_session_data->k < 1 || new_session_data->k > new_session_data->n)
+        // Plaintext validation failures below are counted as count_p_bad (not the
+        // encrypted path's count_p_dec_err): there is no decrypt step, and an
+        // invalid plaintext session is unauthenticated / likely hostile, so the
+        // "bad packet" bucket fits better than "decode error". Deliberate.
+        if (size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) || size > MAX_SESSION_PACKET_SIZE)
         {
-            WFB_ERR("Invalid FEC K: %d\n", new_session_data->k);
-            count_p_dec_err += 1;
+            WFB_ERR("Invalid plain session packet\n");
+            count_p_bad += 1;
+            return;
+        }
+
+        // Dedup identical re-announces (same generichash over body + nonce).
+        if (crypto_generichash(new_session_hash, sizeof(new_session_hash),
+                               buf + sizeof(wsession_hdr_t), size - sizeof(wsession_hdr_t),
+                               ((wsession_hdr_t*)buf)->session_nonce,
+                               sizeof(((wsession_hdr_t*)buf)->session_nonce)) != 0)
+        {
+            assert(0);
+        }
+        if (memcmp(session_hash, new_session_hash, sizeof(session_hash)) == 0)
+        {
+            count_p_session += 1;
+            return;
+        }
+
+        const wsession_data_t* sd = (const wsession_data_t*)(buf + sizeof(wsession_hdr_t));
+
+        // No epoch gate in plaintext: the epoch field is unauthenticated here, so
+        // honoring "epoch < current -> reject" would let one forged session with a
+        // huge epoch permanently latch the RX into rejecting all legitimate
+        // (epoch == 0) sessions — a persistent freeze that defeats the session-ID
+        // restart recovery below. The session-ID memcmp is the sole authority for
+        // session changes in plaintext; an unauthenticated epoch buys no real
+        // replay protection. (setup_session still records the announced epoch for
+        // the IPC SESSION line; a forged value is overwritten by the next session.)
+        if (be32toh(sd->channel_id) != channel_id)
+        {
+            WFB_ERR("Session channel_id doesn't match: %u != %u\n", be32toh(sd->channel_id), channel_id);
+            count_p_bad += 1;
+            return;
+        }
+        if (sd->fec_type == WFB_FEC_VDM_RS)
+        {
+            if (sd->n < 1 || sd->k < 1 || sd->k > sd->n)
+            {
+                WFB_ERR("Invalid FEC K/N: %d/%d\n", sd->k, sd->n);
+                count_p_bad += 1;
+                return;
+            }
+        }
+        else if (sd->fec_type == WFB_FEC_SWFEC)
+        {
+            if (sd->n < 1)
+            {
+                WFB_ERR("Invalid swfec deadline_ms (n): %d\n", sd->n);
+                count_p_bad += 1;
+                return;
+            }
+        }
+        else
+        {
+            WFB_ERR("Unsupported FEC codec type: %d\n", sd->fec_type);
+            count_p_bad += 1;
             return;
         }
 
         count_p_session += 1;
 
-        // Ignore RSSI (and per-card rx counters) for session packets to simplify calculation
-        // of lost packets because session packets doesn't have any serial number and it is
-        // too hard to calculate number of unique session packets
-
-        if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0)
+        // Plaintext carries the TX's fresh-per-session random session_key as an
+        // opaque session ID (not used for any cipher). Detect a new session — a
+        // TX (re)start or an RS reconfigure, both of which call init_session()
+        // and mint a new ID — exactly as the encrypted path does: by a change in
+        // that field. A swfec live param tweak keeps the same ID (swfec_set_params
+        // does not call init_session), so it falls to the deadline-only update.
+        // This recovers a long-running RX from a TX restart with no clock/epoch
+        // dependency. The RX session_key member starts memset to 0, so the first
+        // real session (random ID) always differs and triggers the initial build.
+        if (memcmp(session_key, sd->session_key, sizeof(session_key)) != 0)
         {
-            epoch = be64toh(new_session_data->epoch);
-            memcpy(session_key, new_session_data->session_key, sizeof(session_key));
-
-            if (fec_p != NULL)
-            {
-                deinit_fec();
-            }
-
-            init_fec(new_session_data->k, new_session_data->n);
-
-            IPC_MSG("%" PRIu64 "\tSESSION\t%" PRIu64 ":%u:%d:%d\n", get_time_ms(), epoch, WFB_FEC_VDM_RS, fec_k, fec_n);
-            IPC_MSG_SEND();
+            memcpy(session_key, sd->session_key, sizeof(session_key));
+            setup_session(sd->fec_type, sd->k, sd->n, be64toh(sd->epoch));
+        }
+        else if (sd->fec_type == WFB_FEC_SWFEC && session_is_swfec && sd->n != swfec_deadline_ms)
+        {
+            swfec_set_deadline(sd->n);  // param-only deadline update, shared helper (Task 2)
         }
 
-        // Cache already processed session
         memcpy(session_hash, new_session_hash, sizeof(session_hash));
-
         return;
+    }
 
     default:
         WFB_ERR("Unknown packet type 0x%x\n", buf[0]);
@@ -714,7 +1105,13 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     unsigned long long decrypted_len;
     wblock_hdr_t *block_hdr = (wblock_hdr_t*)buf;
 
-    if (crypto_aead_chacha20poly1305_decrypt(decrypted, &decrypted_len,
+    if (buf[0] == WFB_PACKET_DATA_PLAIN)
+    {
+        // size was bounded to <= sizeof(wblock_hdr_t) + MAX_FEC_PAYLOAD in the switch
+        decrypted_len = size - sizeof(wblock_hdr_t);
+        memcpy(decrypted, buf + sizeof(wblock_hdr_t), decrypted_len);
+    }
+    else if (crypto_aead_chacha20poly1305_decrypt(decrypted, &decrypted_len,
                                              NULL,
                                              buf + sizeof(wblock_hdr_t), size - sizeof(wblock_hdr_t),
                                              buf,
@@ -727,7 +1124,41 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     }
 
     count_p_data += 1;
-    log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, freq, mcs_index, bandwidth);
+    tap_counters.data += 1;
+    log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, evm, freq, mcs_index, bandwidth);
+
+    // --- swfec fast path: feed raw wire packet to sliding-window decoder ---
+    if (session_is_swfec)
+    {
+        assert(swfec_dec != NULL);
+
+        uint64_t now_us = swfec::monotonic_us();
+        std::vector<swfec::Delivered> out;
+        swfec_dec->push(decrypted, decrypted_len, now_us, out);
+
+        // The decoder delivers sources on arrival and recovered packets late,
+        // i.e. out of order. Pass everything through the in-order reorder buffer
+        // so the consumer (e.g. pixelpilot --rtp-jitter-ms 0) sees a strictly
+        // ordered stream, matching the RS-block path. A gap is held up to the
+        // deadline; if unfilled it is skipped (never emitted). The reorder buffer
+        // reports those abandoned-past-deadline gaps in ro_skipped — the
+        // authoritative loss count, anchored to the first seq this RX saw — which
+        // feeds count_p_lost (reset each stats window by clear_stats).
+        std::vector<swfec::SwfecReorder::Out> ro_out;
+        uint32_t ro_skipped = 0;
+        for (size_t i = 0; i < out.size(); i++)
+        {
+            assert(out[i].payload.size() <= MAX_FEC_PAYLOAD);
+            swfec_ro->push(out[i].seq, out[i].late, out[i].payload.data(),
+                           out[i].payload.size(), now_us, ro_out, ro_skipped);
+        }
+        count_p_lost += ro_skipped;
+        tap_counters.lost += ro_skipped;
+        if (ro_skipped) tap_.note_loss(ro_skipped, 0, 0, get_time_ms()); // swfec: no seq context
+        swfec_flush_reorder_out(ro_out);
+        return;   // RS ring logic is not applicable for swfec
+    }
+    // --- end swfec fast path ---
 
     assert(decrypted_len >= sizeof(wpacket_hdr_t));
     assert(decrypted_len <= MAX_FEC_PAYLOAD);
@@ -837,6 +1268,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                 if(fec_count)
                 {
                     count_p_fec_recovered += fec_count;
+                    tap_counters.fec_rec += fec_count;
                     WFB_DBG("FEC recovered %u packets\n", fec_count);
                 }
                 break;
@@ -869,6 +1301,8 @@ void Aggregator::send_packet(int ring_idx, int fragment_idx)
         uint32_t lost_count = packet_seq - seq - 1;
         ANDROID_IPC_MSG("PKT_LOST\t%d", lost_count);
         count_p_lost += lost_count;
+        tap_counters.lost += lost_count;
+        tap_.note_loss(lost_count, seq, packet_seq, get_time_ms());
 
         // Immediate packet loss notification
         if (packet_loss_listener_ != NULL)
@@ -888,6 +1322,7 @@ void Aggregator::send_packet(int ring_idx, int fragment_idx)
     {
         send_to_socket(payload, packet_size);
         count_p_outgoing += 1;
+        tap_counters.out += 1;
         count_b_outgoing += packet_size;
     }
 }
@@ -1021,7 +1456,11 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
     for(;;)
     {
         uint64_t cur_ts = get_time_ms();
-        int rc = poll(fds, nfds, log_send_ts > cur_ts ? log_send_ts - cur_ts : 0);
+        int poll_timeout = log_send_ts > cur_ts ? log_send_ts - cur_ts : 0;
+        // Wake early enough to drain a held swfec gap at its deadline.
+        poll_timeout = agg->swfec_poll_timeout_ms(poll_timeout);
+        poll_timeout = agg->tap_poll_timeout_ms(cur_ts, poll_timeout);
+        int rc = poll(fds, nfds, poll_timeout);
 
         if (rc < 0){
             if (errno == EINTR || errno == EAGAIN) continue;
@@ -1034,6 +1473,10 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
             agg->dump_stats();
             log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
         }
+
+        // Release swfec packets held behind a gap whose deadline has passed.
+        agg->swfec_poll();
+        agg->tap_poll(get_time_ms());
 
         if (rc == 0) continue; // timeout expired
 
@@ -1053,9 +1496,8 @@ void radio_loop(int argc, char* const *argv, int optind, uint32_t channel_id, un
 
 void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interval, int rcv_buf_size)
 {
-    wrxfwd_t fwd_hdr;
     struct sockaddr_in sockaddr;
-    uint8_t buf[MAX_FORWARDER_PACKET_SIZE];
+    uint8_t buf[sizeof(wrxfwd_t) + MAX_FORWARDER_PACKET_SIZE];
 
     uint64_t log_send_ts = get_time_ms();
     struct pollfd fds[1];
@@ -1068,7 +1510,11 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
     for(;;)
     {
         uint64_t cur_ts = get_time_ms();
-        int rc = poll(fds, 1, log_send_ts > cur_ts ? log_send_ts - cur_ts : 0);
+        int poll_timeout = log_send_ts > cur_ts ? log_send_ts - cur_ts : 0;
+        // Wake early enough to drain a held swfec gap at its deadline.
+        poll_timeout = agg->swfec_poll_timeout_ms(poll_timeout);
+        poll_timeout = agg->tap_poll_timeout_ms(cur_ts, poll_timeout);
+        int rc = poll(fds, 1, poll_timeout);
 
         if (rc < 0){
             if (errno == EINTR || errno == EAGAIN) continue;
@@ -1081,6 +1527,10 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
             agg->dump_stats();
             log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
         }
+
+        // Release swfec packets held behind a gap whose deadline has passed.
+        agg->swfec_poll();
+        agg->tap_poll(get_time_ms());
 
         if (rc == 0) continue; // timeout expired
 
@@ -1096,15 +1546,12 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
             {
                 memset((void*)&sockaddr, '\0', sizeof(sockaddr));
 
-                struct iovec iov[2] = {{ .iov_base = (void*)&fwd_hdr,
-                                         .iov_len = sizeof(fwd_hdr)},
-                                       { .iov_base = (void*)buf,
-                                         .iov_len = sizeof(buf) }};
-
+                struct iovec iov = { .iov_base = (void*)buf,
+                                     .iov_len  = sizeof(buf) };
                 struct msghdr msghdr = { .msg_name = (void*)&sockaddr,
                                          .msg_namelen = sizeof(sockaddr),
-                                         .msg_iov = iov,
-                                         .msg_iovlen = 2,
+                                         .msg_iov = &iov,
+                                         .msg_iovlen = 1,
                                          .msg_control = NULL,
                                          .msg_controllen = 0,
                                          .msg_flags = 0};
@@ -1115,14 +1562,17 @@ void network_loop(int srv_port, unique_ptr<BaseAggregator> &agg, int log_interva
                     break;
                 }
 
-                if (rsize < (ssize_t)sizeof(wrxfwd_t))
+                const wrxfwd_t *h;
+                const uint8_t *payload;
+                size_t payload_len;
+                if (!wrxfwd_parse(buf, rsize, &h, &payload, &payload_len))
                 {
-                    continue;
+                    continue;   // short packet or stale/unknown version -> drop
                 }
-                agg->process_packet(buf, rsize - sizeof(wrxfwd_t),
-                                    fwd_hdr.wlan_idx, fwd_hdr.antenna,
-                                    fwd_hdr.rssi, fwd_hdr.noise, ntohs(fwd_hdr.freq),
-                                    fwd_hdr.mcs_index, fwd_hdr.bandwidth, &sockaddr);
+                agg->process_packet((uint8_t*)payload, payload_len,
+                                    h->wlan_idx, h->antenna,
+                                    h->rssi, h->noise, h->evm, ntohs(h->freq),
+                                    h->mcs_index, h->bandwidth, &sockaddr);
             }
             if(errno != EWOULDBLOCK) throw runtime_error(string_format("Error receiving packet: %s", strerror(errno)));
         }
@@ -1138,6 +1588,7 @@ int main(int argc, char* const *argv)
     uint32_t link_id = 0;
     uint64_t epoch = 0;
     int log_interval = 1000;
+    int dynlink_tap_port = 0;
     int client_port = 5600;
     int srv_port = 0;
     string client_addr = "127.0.0.1";
@@ -1145,10 +1596,10 @@ int main(int argc, char* const *argv)
     int rcv_buf = 0;
     int snd_buf = 0;
 
-    string keypair = "rx.key";
+    string keypair = "";
     string unix_socket = "";
 
-    while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:")) != -1) {
+    while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:D:")) != -1) {
         switch (opt) {
         case 'K':
             keypair = optarg;
@@ -1187,10 +1638,13 @@ int main(int argc, char* const *argv)
         case 'e':
             epoch = atoll(optarg);
             break;
+        case 'D':
+            dynlink_tap_port = atoi(optarg);
+            break;
         default: /* '?' */
         show_usage:
             WFB_INFO("Local RX: %s [-K rx_key] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-p radio_port]\n"
-                     "             [-R rcv_buf] [-s snd_buf] [-l log_interval] [-e epoch] [-i link_id] interface1 [interface2] ...\n", argv[0]);
+                     "             [-R rcv_buf] [-s snd_buf] [-l log_interval] [-e epoch] [-i link_id] [-D dynlink_tap_port] interface1 [interface2] ...\n", argv[0]);
             WFB_INFO("RX forwarder: %s -f [-c client_addr] [-u client_port] [-p radio_port]  [-R rcv_buf] [-s snd_buf]\n"
                      "                    [-i link_id] interface1 [interface2] ...\n", argv[0]);
             WFB_INFO("RX aggregator: %s -a server_port [-K rx_key] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-R rcv_buf]\n"
@@ -1227,6 +1681,10 @@ int main(int argc, char* const *argv)
     {
         uint32_t channel_id = (link_id << 8) + radio_port;
 
+        if (rx_mode != FORWARDER && keypair.empty()) {
+            WFB_ERR("WARNING: no -K given — running UNENCRYPTED on radio_port %d\n", radio_port);
+        }
+
         // WiFi interface(s) are required for all modes except aggregator
         if(rx_mode == AGGREGATOR)
         {
@@ -1259,6 +1717,11 @@ int main(int argc, char* const *argv)
 
         default:
             throw runtime_error(string_format("Unknown rx_mode=%d", rx_mode));
+        }
+
+        if (dynlink_tap_port > 0)
+        {
+            agg->tap_init(dynlink_tap_port);
         }
 
         if(rx_mode == AGGREGATOR)

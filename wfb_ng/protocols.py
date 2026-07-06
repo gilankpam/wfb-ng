@@ -42,7 +42,7 @@ class WFBFlags(object):
     LINK_JAMMED = 2
 
 
-fec_types = {1: 'VDM_RS'}
+fec_types = {1: 'VDM_RS', 2: 'swfec'}
 
 class StatisticsMsgPackProtocol(Int32StringReceiver):
     def connectionMade(self):
@@ -94,7 +94,8 @@ class StatisticsJSONProtocol(LineReceiver):
 
         if data['type'] == 'rx':
             ka = ('ant', 'freq', 'mcs', 'bw')
-            va = ('pkt_recv', 'rssi_min', 'rssi_avg', 'rssi_max', 'snr_min', 'snr_avg', 'snr_max')
+            va = ('pkt_recv', 'rssi_min', 'rssi_avg', 'rssi_max', 'snr_min', 'snr_avg', 'snr_max',
+                  'evm_min', 'evm_avg', 'evm_max')
             data['rx_ant_stats'] = list(dict(zip(ka + va, (ant_id,) + k + v))
                                         for (k, ant_id), v in data.pop('rx_ant_stats').items())
         elif data['type'] == 'tx':
@@ -216,10 +217,13 @@ class AntStatsAndSelector(object):
         stats_agg = {}
 
         for ant_stats in ant_stats_by_rx.values():
-            for (((freq, mcs_index, bandwidth), ant_id),
-                 (pkt_s,
-                  rssi_min, rssi_avg, rssi_max,
-                  snr_min, snr_avg, snr_max)) in ant_stats.items():
+            for (((freq, mcs_index, bandwidth), ant_id), v) in ant_stats.items():
+                # Newer wfb_rx appends EVM (evm_min/avg/max) to the RX_ANT tuple.
+                # This aggregation feeds TX-antenna selection + mavlink RSSI only,
+                # which don't use EVM, so take the stock 7-field prefix.
+                (pkt_s,
+                 rssi_min, rssi_avg, rssi_max,
+                 snr_min, snr_avg, snr_max) = v[:7]
 
                 if ant_id not in stats_agg:
                     stats_agg[ant_id] = (pkt_s,
@@ -411,7 +415,11 @@ class RXAntennaProtocol(LineReceiver):
 
                 k_tuple = ('all', 'all_bytes', 'dec_err', 'session', 'data', 'uniq', 'fec_rec', 'lost', 'bad', 'out', 'out_bytes')
                 counters = tuple(int(i) for i in cols[2].split(':'))
-                assert len(counters) == len(k_tuple)
+                # Tolerate newer wfb_rx emitting extra trailing counters;
+                # reject lines shorter than the stock 11-field layout.
+                if len(counters) < len(k_tuple):
+                    raise BadTelemetry()
+                counters = counters[:len(k_tuple)]
 
                 if not self.count_all:
                     self.count_all = counters
@@ -430,12 +438,28 @@ class RXAntennaProtocol(LineReceiver):
                 if len(cols) != 3:
                     raise BadTelemetry()
 
-                epoch, fec_type, fec_k, fec_n = list(int(i) for i in cols[2].split(':'))
-                self.session = dict(fec_type=fec_types.get(fec_type, 'Unknown'), fec_k=fec_k, fec_n=fec_n, epoch=epoch)
-                log.msg('New session detected [%s]: FEC=%s K=%d, N=%d, epoch=%d' % (self.rx_id, fec_types.get(fec_type, 'Unknown'), fec_k, fec_n, epoch))
+                # Contract v3 emits 5 fields (epoch:fec_type:k:n:
+                # contract_version); stock emitted 4. Accept either;
+                # a missing trailing field defaults to v1.
+                # For fec_type 'swfec', k/n carry overhead_pct/deadline_ms.
+                parts = list(int(i) for i in cols[2].split(':'))
+                if len(parts) < 4:
+                    raise BadTelemetry()
+                epoch, fec_type, fec_k, fec_n = parts[:4]
+                contract_version = parts[4] if len(parts) > 4 else 1
 
-                if self.ant_stat_cb is not None:
-                    self.ant_stat_cb.process_new_session(self.rx_id, self.session)
+                new_session = dict(fec_type=fec_types.get(fec_type, 'Unknown'),
+                                   fec_k=fec_k, fec_n=fec_n, epoch=epoch,
+                                   contract_version=contract_version)
+
+                # SESSION arrives on-change AND once per stats window;
+                # only log + notify aggregators on a real change.
+                if new_session != self.session:
+                    self.session = new_session
+                    log.msg('New session detected [%s]: FEC=%s K=%d, N=%d, epoch=%d' % (self.rx_id, new_session['fec_type'], fec_k, fec_n, epoch))
+
+                    if self.ant_stat_cb is not None:
+                        self.ant_stat_cb.process_new_session(self.rx_id, self.session)
             else:
                 raise BadTelemetry()
         except BadTelemetry:

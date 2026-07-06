@@ -19,6 +19,7 @@
 #
 
 import sys
+import locale
 import curses
 import msgpack
 import tempfile
@@ -53,10 +54,22 @@ def ignore_curses_err(f):
     return _f
 
 
+def _addch(window, y, x, c, *attrs):
+    try:
+        window.addch(y, x, c, *attrs)
+    except OverflowError:
+        # addch() packs the char into a chtype, so it only accepts chars that
+        # encode to a single byte in the terminal encoding. Multibyte chars
+        # (e.g. UTF-8 '°') raise OverflowError. addstr() writes the encoded
+        # bytes directly and works on both narrow and wide curses builds
+        # (add_wch() is absent on narrow ncurses, e.g. the OpenIPC GS).
+        window.addstr(y, x, c, *attrs)
+
+
 @ignore_curses_err
 def addstr_noerr(window, y, x, s, *attrs):
     for i, c in enumerate(s, x):
-        window.addch(y, i, c, *attrs)
+        _addch(window, y, i, c, *attrs)
 
 
 def addstr_centered(window, s, attrs=0):
@@ -86,7 +99,7 @@ def addstr_markup(window, y, x, s, attrs=0):
             attrs &= ~curses.A_REVERSE
             continue
 
-        window.addch(y, x, c, attrs)
+        _addch(window, y, x, c, attrs)
         x += 1
 
 def rectangle(win, uly, ulx, lry, lrx):
@@ -210,19 +223,24 @@ class AntennaStat(Int32StringReceiver):
                 lpad = ''
                 rpad = ''
 
-            addstr_markup(window, 2, 20, '{Freq MCS BW %s[ANT]%s pkt/s dloss}     {RSSI} [dBm]        {SNR} [dB]' % (lpad, rpad))
+            addstr_markup(window, 2, 20, '{Freq MCS BW %s[ANT]%s pkt/s dloss}     {RSSI} [dBm]        {SNR} [dB]        {EVM} [dB]' % (lpad, rpad))
+            # EVM (radiotap LOCK_QUALITY): |EVM| in dB, higher=better, per stream-0.
+            # The aggregator sends -1 for an antenna that carried no measurable EVM.
+            fmt_evm = lambda x: '--' if x is None or x < 0 else '%d' % x
             for y, (((freq, mcs_index, bandwidth), ant_id), v) in enumerate(sorted(stats_d.items()), 3):
-                pkt_s, rssi_min, rssi_avg, rssi_max, snr_min, snr_avg, snr_max = v
+                pkt_s, rssi_min, rssi_avg, rssi_max, snr_min, snr_avg, snr_max = v[:7]
+                evm_min, evm_avg, evm_max = (tuple(v[7:10]) + (-1, -1, -1))[:3]
                 if y < ymax:
                     active_tx = ((ant_id >> 8) == tx_wlan)
                     diff_loss = max(p['uniq'][0] - pkt_s, 0)
-                    addstr_markup(window, y, 20, '%04d %3d %2d %s%s%s  %4d  %s%4d%s  %3d < {%3d} < %3d  %3d < {%3d} < %3d' % \
+                    addstr_markup(window, y, 20, '%04d %3d %2d %s%s%s  %4d  %s%4d%s  %3d < {%3d} < %3d  %3d < {%3d} < %3d  %3s < {%3s} < %3s' % \
                            (freq, mcs_index, bandwidth,
                             '{' if active_tx else '', format_ant(ant_id), '}' if active_tx else '',
                             1000 * pkt_s // self.log_interval,
                             '{' if diff_loss else '', 1000 * diff_loss // self.log_interval, '}' if diff_loss else '',
                             rssi_min, rssi_avg, rssi_max,
-                            snr_min, snr_avg, snr_max), 0 if active_tx else curses.A_DIM)
+                            snr_min, snr_avg, snr_max,
+                            fmt_evm(evm_min), fmt_evm(evm_avg), fmt_evm(evm_max)), 0 if active_tx else curses.A_DIM)
         else:
             addstr_noerr(window, 2, 20, '[No data]', curses.A_REVERSE)
 
@@ -440,6 +458,9 @@ def main():
 
     fd = tempfile.TemporaryFile(mode='w+', encoding='utf-8')
     log.startLogging(fd)
+
+    # Required for curses add_wch() to render non-ASCII (e.g. '°') correctly.
+    locale.setlocale(locale.LC_ALL, '')
 
     stdscr = curses.initscr()
     try:

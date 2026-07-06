@@ -54,6 +54,12 @@ def hash_link_domain(link_domain):
     return int.from_bytes(hashlib.sha1(link_domain.encode('utf-8')).digest()[:3], 'big')
 
 
+def key_arg(cfg):
+    # '-K <conf_dir>/<keypair>' for an encrypted stream, or '' when keypair is
+    # None/unset (plaintext). Templates are .split() before exec, so '' vanishes.
+    return ('-K %s' % os.path.join(settings.path.conf_dir, cfg.keypair)) if cfg.keypair else ''
+
+
 def parse_services(profile_name, udp_port_allocator):
     res = []
     for stream in getattr(settings, profile_name).streams:
@@ -100,7 +106,7 @@ def init_udp_direct_tx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
         raise Exception('%s: unsupported peer address: %s' % (service_name, cfg.peer))
 
 
-    cmd = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d %(conn_str)s -K %(key)s '\
+    cmd = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d %(conn_str)s %(key_arg)s '\
            '-B %(bw)d -G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
            '%(mirror)s%(force_vht)s%(qdisc)s '\
            '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d '\
@@ -112,7 +118,7 @@ def init_udp_direct_tx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
                 stream=cfg.stream_tx,
                 conn_str=conn_str,
                 control_port = cfg.control_port,
-                key=os.path.join(settings.path.conf_dir, cfg.keypair),
+                key_arg=key_arg(cfg),
                 bw=cfg.bandwidth,
                 force_vht=' -V' if cfg.force_vht else '',
                 qdisc=' -Q -P %d' % (cfg.fwmark,) if cfg.use_qdisc else '',
@@ -163,16 +169,21 @@ def init_udp_direct_rx(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster,
     else:
         raise Exception('%s: unsupported peer address: %s' % (service_name, cfg.peer))
 
-    cmd = ('%(cmd)s%(cluster)s -p %(stream)d %(conn_str)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+    # dynlink tap (fpvd): optional per-stream attr; 0/absent = no tap.
+    # getattr keeps vanilla configs (no such key) working unchanged.
+    tap_port = int(getattr(cfg, 'dynlink_tap_port', 0) or 0)
+
+    cmd = ('%(cmd)s%(cluster)s -p %(stream)d %(conn_str)s %(key_arg)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d%(tap)s' % \
            dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                 cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                 stream=cfg.stream_rx,
                 conn_str=conn_str,
-                key=os.path.join(settings.path.conf_dir, cfg.keypair),
+                key_arg=key_arg(cfg),
                 rcv_buf_size=settings.common.tx_rcv_buf_size,
                 snd_buf_size=settings.common.rx_snd_buf_size,
                 log_interval=settings.common.log_interval,
-                link_id=link_id)).split() + (wlans if not is_cluster else [])
+                link_id=link_id,
+                tap=' -D %d' % tap_port if tap_port else '')).split() + (wlans if not is_cluster else [])
 
     df = RXProtocol(ant_sel_f, cmd, '%s rx' % (service_name,)).start()
 
@@ -247,19 +258,19 @@ def init_mavlink(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_on
     rx_socket = reactor.listenUNIXDatagram(b'\0' + rx_socket_path.encode(), p_rx)
     sockets = [rx_socket]
 
-    cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+    cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s %(key_arg)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
               dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                    cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                    stream=cfg.stream_rx,
                    unix_socket=rx_socket_path,
-                   key=os.path.join(settings.path.conf_dir, cfg.keypair),
+                   key_arg=key_arg(cfg),
                    rcv_buf_size=settings.common.tx_rcv_buf_size,
                    snd_buf_size=settings.common.rx_snd_buf_size,
                    log_interval=settings.common.log_interval,
                    link_id=link_id)).split() + (wlans if not is_cluster else [])
 
     tx_socket_path = '%s-tx-%s' % (service_name, os.urandom(4).hex())
-    cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d '\
+    cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s %(key_arg)s -B %(bw)d '\
               '-G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
               '%(mirror)s%(force_vht)s%(qdisc)s '\
               '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
@@ -269,7 +280,7 @@ def init_mavlink(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_on
                    stream=cfg.stream_tx,
                    unix_socket=tx_socket_path,
                    control_port=cfg.control_port,
-                   key=os.path.join(settings.path.conf_dir, cfg.keypair),
+                   key_arg=key_arg(cfg),
                    bw=cfg.bandwidth,
                    force_vht=' -V' if cfg.force_vht else '',
                    qdisc=' -Q -P %d' % (cfg.fwmark,) if cfg.use_qdisc else '',
@@ -361,19 +372,19 @@ def init_tunnel(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_onl
     rx_socket = reactor.listenUNIXDatagram(b'\0' + rx_socket_path.encode(), p_rx)
     sockets = [rx_socket]
 
-    cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+    cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s %(key_arg)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
               dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                    cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                    stream=cfg.stream_rx,
                    unix_socket=rx_socket_path,
-                   key=os.path.join(settings.path.conf_dir, cfg.keypair),
+                   key_arg=key_arg(cfg),
                    rcv_buf_size=settings.common.tx_rcv_buf_size,
                    snd_buf_size=settings.common.rx_snd_buf_size,
                    log_interval=settings.common.log_interval,
                    link_id=link_id)).split() + (wlans if not is_cluster else [])
 
     tx_socket_path = '%s-tx-%s' % (service_name, os.urandom(4).hex())
-    cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d -G %(gi)s '\
+    cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s %(key_arg)s -B %(bw)d -G %(gi)s '\
               '-S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
               '%(mirror)s%(force_vht)s%(qdisc)s '\
               '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
@@ -383,7 +394,7 @@ def init_tunnel(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_onl
                    stream=cfg.stream_tx,
                    unix_socket=tx_socket_path,
                    control_port=cfg.control_port,
-                   key=os.path.join(settings.path.conf_dir, cfg.keypair),
+                   key_arg=key_arg(cfg),
                    bw=cfg.bandwidth,
                    force_vht=' -V' if cfg.force_vht else '',
                    qdisc=' -Q -P %d' % (cfg.fwmark,) if cfg.use_qdisc else '',
@@ -480,12 +491,12 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
         rx_socket_path = '%s-rx-%s' % (service_name, os.urandom(4).hex())
         rx_socket = reactor.listenUNIXDatagram(b'\0' + rx_socket_path.encode(), p_rx)
         sockets = [rx_socket]
-        cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s -K %(key)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
+        cmd_rx = ('%(cmd)s%(cluster)s -p %(stream)d -U %(unix_socket)s %(key_arg)s -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -i %(link_id)d' % \
                   dict(cmd=os.path.join(settings.path.bin_dir, 'wfb_rx'),
                        cluster=' -a %d' % (cfg.udp_port_auto,) if is_cluster else '',
                        stream=cfg.stream_rx,
                        unix_socket=rx_socket_path,
-                       key=os.path.join(settings.path.conf_dir, cfg.keypair),
+                       key_arg=key_arg(cfg),
                        rcv_buf_size=settings.common.tx_rcv_buf_size,
                        snd_buf_size=settings.common.rx_snd_buf_size,
                        log_interval=settings.common.log_interval,
@@ -496,7 +507,7 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
 
     if cfg.stream_tx is not None:
         tx_socket_path = '%s-tx-%s' % (service_name, os.urandom(4).hex())
-        cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s -K %(key)s -B %(bw)d '\
+        cmd_tx = ('%(cmd)s%(cluster)s -f %(frame_type)s -p %(stream)d -U %(unix_socket)s %(key_arg)s -B %(bw)d '\
                   '-G %(gi)s -S %(stbc)d -L %(ldpc)d -M %(mcs)d'\
                   '%(mirror)s%(force_vht)s%(qdisc)s '\
                   '-k %(fec_k)d -n %(fec_n)d -T %(fec_timeout)d -F %(fec_delay)d -i %(link_id)d -R %(rcv_buf_size)d -s %(snd_buf_size)d -l %(log_interval)d -C %(control_port)d' % \
@@ -506,7 +517,7 @@ def init_udp_proxy(service_name, cfg, wlans, link_id, ant_sel_f, is_cluster, rx_
                        stream=cfg.stream_tx,
                        unix_socket=tx_socket_path,
                        control_port=cfg.control_port,
-                       key=os.path.join(settings.path.conf_dir, cfg.keypair),
+                       key_arg=key_arg(cfg),
                        bw=cfg.bandwidth,
                        force_vht=' -V' if cfg.force_vht else '',
                        qdisc=' -Q -P %d' % (cfg.fwmark,) if cfg.use_qdisc else '',
